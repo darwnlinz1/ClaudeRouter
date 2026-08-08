@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Orchestrator // Command Center</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body class="dashboard-mode h-screen w-screen overflow-hidden bg-[#03050a] text-gray-200" style="font-family: 'JetBrains Mono', monospace;">
+
+    <div class="crt-overlay"></div>
+
+    <div id="app" class="flex h-screen w-screen">
+
+        <!-- PANEL TRÁI: ĐIỀU KHIỂN & NHẬP LIỆU -->
+        <div id="panel-left" class="flex flex-col bg-[#050810] border-r border-white/5 p-5 space-y-4 overflow-y-auto relative">
+
+            <!-- LOGO + HUD ACCENT BAR -->
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-500 to-cyan-500 flex items-center justify-center shadow-[0_0_20px_rgba(16,185,129,0.4)]">
+                    <i class="fa-solid fa-terminal text-black text-lg"></i>
+                </div>
+                <div>
+                    <h1 class="text-sm font-extrabold tracking-widest text-white uppercase leading-none">AI Orchestrator</h1>
+                    <p class="text-[10px] text-gray-600 tracking-[0.2em] uppercase mt-1">Command Center v2.0</p>
+                </div>
+            </div>
+            <div class="hud-accent-bar h-[2px] w-full bg-gradient-to-r from-emerald-500 via-cyan-500 to-transparent shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
+
+            <div id="dashboard-home" class="flex flex-col flex-1 min-h-0">
+                <div class="flex items-center justify-between mb-3">
+                    <div>
+                        <p class="text-[9px] text-gray-600 uppercase tracking-[0.25em]">// all_tasks</p>
+                        <h2 class="text-base font-bold text-gray-100 mt-1">Tất cả công việc</h2>
+                    </div>
+                    <button type="button" onclick="openTaskSettings()" class="px-3 py-2 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-[10px] font-bold hover:bg-cyan-500/20">
+                        <i class="fa-solid fa-plus mr-1"></i> TASK
+                    </button>
+                </div>
+                <div id="task-dashboard-list" class="flex-1 overflow-y-auto pr-1" aria-live="polite">
+                    <div class="text-[10px] text-gray-600 italic text-center mt-8">Đang tải danh sách task...</div>
+                </div>
+                <button type="button" onclick="refreshTaskDashboard()" class="mt-3 text-[9px] text-gray-600 hover:text-cyan-400 uppercase tracking-widest">
+                    <i class="fa-solid fa-rotate mr-1"></i> Refresh dashboard
+                </button>
+            </div>
+
+            <div id="task-settings-drawer" class="hidden flex-col flex-1 min-h-0 overflow-y-auto space-y-4 pr-1">
+                <div class="flex items-center justify-between sticky top-0 bg-[#050810] z-20 py-1">
+                    <div>
+                        <p class="text-[9px] text-cyan-500 uppercase tracking-[0.25em]">// task_settings</p>
+                        <h2 class="text-xs font-bold text-white">Tạo công việc mới</h2>
+                    </div>
+                    <button type="button" onclick="closeTaskSettings()" class="w-8 h-8 rounded-lg border border-white/10 text-gray-500 hover:text-white" aria-label="Đóng task settings">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+                <input type="text" id="task-name" class="w-full bg-black/60 border border-cyan-500/20 rounded-lg p-2.5 text-xs text-white outline-none" placeholder="Tên công việc (tự sinh nếu để trống)">
+
+            <!-- MODE SELECTOR -->
+            <div class="bg-black/60 p-1.5 rounded-xl border border-white/10 flex text-xs font-bold shadow-inner">
+                <label class="flex-1 text-center cursor-pointer">
+                    <input type="radio" name="mode" value="orchestrator" checked class="peer hidden">
+                    <div class="py-2 rounded-lg text-gray-600 peer-checked:bg-cyan-500/10 peer-checked:text-cyan-300 peer-checked:border peer-checked:border-cyan-500/40 peer-checked:shadow-[0_0_12px_rgba(6,182,212,0.25)] border border-transparent transition-all">🛠️ VÁ CODE</div>
+                </label>
+                <label class="flex-1 text-center cursor-pointer">
+                    <input type="radio" name="mode" value="chat" class="peer hidden">
+                    <div class="py-2 rounded-lg text-gray-600 peer-checked:bg-emerald-500/10 peer-checked:text-emerald-300 peer-checked:border peer-checked:border-emerald-500/40 peer-checked:shadow-[0_0_12px_rgba(16,185,129,0.25)] border border-transparent transition-all">💬 CHAT</div>
+                </label>
+            </div>
+
+            <div id="project-mode-settings" class="orchestrator-only space-y-2">
+                <p class="console-label text-[9px] text-gray-600 uppercase tracking-[0.25em] font-bold">// project_mode</p>
+                <select id="project-mode" onchange="updateProjectModeUI()" class="w-full bg-black/60 border border-cyan-500/20 rounded-lg p-2.5 text-xs text-gray-300 outline-none">
+                    <option value="edit">Edit Existing Project</option>
+                    <option value="new_project">Create New Project</option>
+                </select>
+                <div id="artifact-options" class="hidden grid grid-cols-2 gap-2 text-[10px] text-gray-400">
+                    <label class="flex items-center gap-2"><input id="auto-apply" type="checkbox" checked> Auto apply</label>
+                    <label class="flex items-center gap-2"><input id="create-zip" type="checkbox" checked> Backup ZIP</label>
+                </div>
+            </div>
+
+            <!-- SELECTS: console-label + chevron FA -->
+            <div class="space-y-3">
+                <div>
+                    <p class="console-label text-[9px] text-gray-600 uppercase tracking-[0.25em] font-bold mb-1 pl-0.5">// account_mode</p>
+                    <div class="relative">
+                        <select id="account-mode" class="w-full bg-black/60 border border-white/10 rounded-lg p-2.5 pr-8 text-xs text-gray-300 focus:ring-1 focus:ring-emerald-500 focus:border-emerald-500/50 outline-none transition shadow-inner appearance-none">
+                            <option value="sticky">📌 STICKY — Giữ 1 tài khoản, nối chat</option>
+                            <option value="router">🔄 ROUTER — Xoay tua ngẫu nhiên</option>
+                        </select>
+                        <i class="fa-solid fa-chevron-down absolute right-3 top-1/2 -translate-y-1/2 text-emerald-500/60 text-[10px] pointer-events-none"></i>
+                    </div>
+                </div>
+
+                <div class="flex space-x-3">
+                    <div class="flex-1">
+                        <p id="primary-model-label" class="console-label text-[9px] text-emerald-600 uppercase tracking-[0.25em] font-bold mb-1 pl-0.5">// worker_model</p>
+                        <div class="relative">
+                            <select id="model" onchange="updateEffortOptions()" class="w-full bg-black/60 border border-white/10 rounded-lg p-2.5 pr-8 text-xs text-gray-300 focus:ring-1 focus:ring-cyan-500 focus:border-cyan-500/50 outline-none transition shadow-inner appearance-none">
+                                <option value="claude-sonnet-5">Sonnet 5</option>
+                                <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                            </select>
+                            <i class="fa-solid fa-chevron-down absolute right-3 top-1/2 -translate-y-1/2 text-cyan-500/60 text-[10px] pointer-events-none"></i>
+                        </div>
+                    </div>
+                    <div class="flex-1">
+                        <p id="primary-effort-label" class="console-label text-[9px] text-emerald-600 uppercase tracking-[0.25em] font-bold mb-1 pl-0.5">// worker_effort</p>
+                        <div class="relative">
+                            <select id="effort" class="w-full bg-black/60 border border-white/10 rounded-lg p-2.5 pr-8 text-xs text-gray-300 focus:ring-1 focus:ring-cyan-500 focus:border-cyan-500/50 outline-none transition shadow-inner appearance-none">
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                                <option value="xhigh" id="opt-xhigh">Extra</option>
+                                <option value="max" selected>Max</option>
+                            </select>
+                            <i class="fa-solid fa-chevron-down absolute right-3 top-1/2 -translate-y-1/2 text-cyan-500/60 text-[10px] pointer-events-none"></i>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex space-x-3 orchestrator-only">
+                    <div class="flex-1">
+                        <p class="console-label text-[9px] text-purple-500 uppercase tracking-[0.2em] font-bold mb-1 pl-0.5">// supervisor_model</p>
+                        <select id="supervisor-model" class="w-full bg-black/60 border border-purple-500/20 rounded-lg p-2 text-xs text-gray-300 outline-none">
+                            <option value="claude-sonnet-5">Sonnet 5</option>
+                            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <p class="console-label text-[9px] text-purple-500 uppercase tracking-[0.2em] font-bold mb-1 pl-0.5">// supervisor_effort</p>
+                        <select id="supervisor-effort" class="w-full bg-black/60 border border-purple-500/20 rounded-lg p-2 text-xs text-gray-300 outline-none">
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="max" selected>Max</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="flex space-x-3 orchestrator-only">
+                    <div class="flex-1">
+                        <p class="console-label text-[9px] text-amber-500 uppercase tracking-[0.2em] font-bold mb-1 pl-0.5">// tester_model</p>
+                        <select id="reviewer-model" class="w-full bg-black/60 border border-amber-500/20 rounded-lg p-2 text-xs text-gray-300 outline-none">
+                            <option value="claude-sonnet-5">Sonnet 5</option>
+                            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <p class="console-label text-[9px] text-amber-500 uppercase tracking-[0.2em] font-bold mb-1 pl-0.5">// tester_effort</p>
+                        <select id="reviewer-effort" class="w-full bg-black/60 border border-amber-500/20 rounded-lg p-2 text-xs text-gray-300 outline-none">
+                            <option value="medium">Medium</option>
+                            <option value="high" selected>High</option>
+                            <option value="max">Max</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <!-- FILE PICKER -->
+            <div id="project-context-settings" class="space-y-2.5 pt-3 border-t border-white/5">
+                <button type="button" onclick="openProjectPicker()" class="w-full group bg-black/60 hover:bg-emerald-500/5 border border-white/10 hover:border-emerald-500/40 text-gray-300 py-2.5 rounded-lg transition-all shadow-inner flex items-center justify-center space-x-2">
+                    <i class="fa-regular fa-folder-open text-amber-500 group-hover:text-emerald-400 transition"></i>
+                    <span id="project-picker-label" class="text-xs font-bold tracking-wide">CHỌN THƯ MỤC CODE...</span>
+                </button>
+
+                <div class="mini-terminal-dots flex items-center space-x-1.5 pt-1 pl-0.5">
+                    <span class="w-1.5 h-1.5 rounded-full bg-rose-500/50"></span>
+                    <span class="w-1.5 h-1.5 rounded-full bg-amber-500/50"></span>
+                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-500/50"></span>
+                    <span id="source-files-hint" class="text-[9px] text-gray-600 uppercase tracking-[0.2em] font-bold ml-1">// folder_only · agent tự nạp file</span>
+                </div>
+
+                <div class="flex flex-col space-y-2">
+                    <input type="text" id="root" class="bg-black/80 border border-white/5 rounded-lg p-2 text-[11px] text-gray-600 font-mono shadow-inner" placeholder="// root path" readonly>
+                    <input type="text" id="files" class="bg-black/60 border border-white/10 rounded-lg p-2 text-[11px] text-cyan-400 font-mono shadow-inner focus:border-cyan-500/50 outline-none" placeholder="// (tuỳ chọn) seed files — để trống = agent tự nạp từ folder">
+                    <input type="text" id="test-cmd" class="bg-black/60 border border-white/10 rounded-lg p-2 text-[11px] text-amber-300 font-mono shadow-inner focus:border-amber-500/50 outline-none" placeholder="// test command, ví dụ: python -m pytest -q">
+                    <label class="orchestrator-only flex items-center justify-between gap-3 bg-black/40 border border-white/10 rounded-lg p-2">
+                        <span class="text-[9px] text-purple-400 uppercase tracking-widest">// max_turns</span>
+                        <input type="number" id="max-turns" value="25" min="1" max="500" step="1" class="w-24 bg-black/60 border border-purple-500/20 rounded p-1.5 text-xs text-purple-200 text-right outline-none" aria-label="Số lượt tối đa">
+                    </label>
+                    <label class="orchestrator-only flex items-center justify-between gap-3 bg-black/40 border border-white/10 rounded-lg p-2 text-[10px] text-gray-400">
+                        <span><i class="fa-solid fa-rotate text-cyan-400 mr-2"></i>Tự tiếp tục khi hết Max Turns</span>
+                        <input type="checkbox" id="auto-continue" class="accent-cyan-500">
+                    </label>
+                </div>
+            </div>
+
+            <!-- CHAT INPUT & RUN BUTTON -->
+            <div class="flex flex-col flex-1 pb-2">
+                <textarea id="task" class="w-full flex-1 min-h-[130px] bg-black/70 border border-emerald-500/20 rounded-xl p-4 text-gray-100 text-sm resize-none outline-none focus:border-emerald-400/60 focus:shadow-[0_0_0_1px_rgba(16,185,129,0.3),0_0_20px_rgba(16,185,129,0.15)] transition-all shadow-[inset_0_2px_10px_rgba(0,0,0,0.5)] mb-4" placeholder="> Nhập yêu cầu vào đây...&#10;> (Shift+Enter để xuống dòng)"></textarea>
+
+                <button id="btn-run" onclick="handleRunClick()" aria-label="Khởi chạy AI" class="w-full bg-gradient-to-r from-emerald-600 to-cyan-500 hover:from-emerald-500 hover:to-cyan-400 text-black font-extrabold text-sm tracking-wide py-3.5 rounded-xl transition-all shadow-[0_0_20px_rgba(16,185,129,0.35)] hover:shadow-[0_0_30px_rgba(16,185,129,0.55)] active:scale-[0.98]">
+                    <i class="fa-solid fa-bolt mr-2"></i> KÍCH HOẠT AI
+                </button>
+                <button id="btn-stop" onclick="stopCurrentTask()" aria-label="Ép dừng task hiện tại" class="hidden w-full kill-switch text-white font-extrabold text-sm tracking-widest py-3.5 rounded-xl transition-all active:scale-[0.98]">
+                    <i class="fa-solid fa-triangle-exclamation mr-2"></i> ÉP DỪNG KHẨN CẤP
+                </button>
+            </div>
+            </div>
+        </div>
+
+        <!-- PANEL GIỮA: THE WORKER ARENA -->
+        <div id="panel-center" class="flex flex-col bg-[#03050a] relative overflow-hidden">
+            <div class="h-11 bg-black/70 border-b border-white/5 flex items-center justify-between px-4 text-[11px] font-mono z-10 shadow-lg backdrop-blur-sm">
+                <div class="flex space-x-3 items-center">
+                    <button id="btn-back-dashboard" onclick="showCleanDashboard()" class="hidden text-gray-500 hover:text-cyan-300" title="Quay lại All Tasks" aria-label="Quay lại All Tasks">
+                        <i class="fa-solid fa-arrow-left mr-1"></i><span class="text-[10px] font-bold">ALL TASKS</span>
+                    </button>
+                    <span id="arena-title" class="text-gray-500"><i class="fa-solid fa-terminal mr-1.5 text-emerald-500"></i>WORKER ARENA</span>
+                    <div class="h-4 w-px bg-white/10"></div>
+                    <!-- ĐÈN LED TRẠNG THÁI AGENT -->
+                    <div id="agent-led-group" class="flex space-x-4 ml-2">
+                        <span id="led-sup-container" class="flex items-center text-gray-500 transition-colors">
+                            <span id="led-sup" class="w-2.5 h-2.5 rounded-full bg-gray-700 mr-1.5 led-indicator"></span>🧠 QUẢN LÝ
+                        </span>
+                        <span id="led-work-container" class="flex items-center text-gray-500 transition-colors">
+                            <span id="led-work" class="w-2.5 h-2.5 rounded-full bg-gray-700 mr-1.5 led-indicator"></span>👷 THỢ CODE
+                        </span>
+                        <span id="led-review-container" class="flex items-center text-gray-500 transition-colors">
+                            <span id="led-review" class="w-2.5 h-2.5 rounded-full bg-gray-700 mr-1.5 led-indicator"></span>🧪 TESTER
+                        </span>
+                    </div>
+                    <div class="h-4 w-px bg-white/10 ml-2"></div>
+                    <span class="live-badge px-1.5 py-0.5 bg-rose-500/10 border border-rose-500/40 rounded text-[9px] text-rose-400 font-bold uppercase tracking-wider shadow-[0_0_8px_rgba(225,29,72,0.3)] flex items-center space-x-1">
+                        <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse pulse-dot"></span><span>LIVE</span>
+                    </span>
+                    <span class="px-2 py-0.5 bg-black/60 rounded text-gray-400 border border-white/10 shadow-inner" id="current-task-id">ID: ---</span>
+                </div>
+                <div class="flex space-x-4 text-gray-400 items-center">
+                    <!-- Nút Ẩn/Hiện Panel được thêm vào đây -->
+                    <button onclick="togglePanels()" id="btn-toggle-panels" class="hover:text-cyan-400 transition flex items-center justify-center mr-2" title="Focus Mode">
+                        <i class="fa-solid fa-expand text-gray-400 hover:text-cyan-300 transition-colors text-sm"></i>
+                    </button>
+                    <!-- Bộ đếm Account -->
+                    <span class="flex items-center" title="Số lượng tài khoản đã sử dụng"><i class="fa-solid fa-key text-amber-400 mr-1.5"></i>ACC: <span id="acc-counter" class="text-amber-300 font-bold ml-1">0</span></span>
+                    <span><i class="fa-solid fa-gauge-high text-emerald-400 mr-1"></i><span id="token-speed" class="text-emerald-300 font-bold">0 T/s</span></span>
+                    <span><i class="fa-solid fa-coins text-cyan-400 mr-1"></i>TOKENS: <span id="token-counter" class="text-cyan-300 font-bold">0</span></span>
+                    <span><i class="fa-regular fa-clock text-emerald-400 mr-1"></i><span id="timer" class="text-emerald-300">00:00</span></span>
+                </div>
+            </div>
+
+            <!-- SYSTEM TICKER BAR -->
+            <div class="h-7 bg-cyan-950/30 border-b border-cyan-500/20 flex items-center px-4 text-[10px] font-mono text-cyan-400 flex-shrink-0 shadow-inner z-10">
+                <i class="fa-solid fa-satellite-dish mr-2 animate-pulse text-cyan-500"></i>
+                <span id="system-ticker" class="truncate tracking-widest uppercase">SYSTEM: IDLE | AWAITING COMMAND...</span>
+            </div>
+
+            <div id="selected-task-summary" class="hidden px-4 py-3 border-b border-white/5 bg-slate-950/80">
+                <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                        <h2 id="selected-task-name" class="text-xs font-bold text-white truncate"></h2>
+                        <p id="selected-task-meta" class="text-[9px] text-gray-500 mt-1"></p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <a id="artifact-download-link" class="hidden text-[9px] text-emerald-400 hover:text-emerald-200" href="#" download>
+                            <i class="fa-solid fa-download mr-1"></i>ZIP
+                        </a>
+                        <button type="button" onclick="openSelectedTaskSettings()" class="text-[9px] text-gray-500 hover:text-cyan-300" title="Xem hoặc nhân bản settings">
+                            <i class="fa-solid fa-sliders"></i>
+                        </button>
+                        <span id="selected-task-status" class="task-status-badge"></span>
+                    </div>
+                </div>
+                <div id="selected-task-files" class="mt-2 flex flex-wrap gap-2"></div>
+            </div>
+
+            <div id="execution-result-panel" class="hidden orchestrator-only px-4 py-3 border-b border-white/5 bg-black/40" aria-live="polite">
+                <div class="flex items-center justify-between gap-3">
+                    <span id="execution-result-badge" class="text-[10px] font-bold uppercase tracking-widest"></span>
+                    <span id="execution-result-file" class="text-[10px] text-gray-500 truncate"></span>
+                </div>
+                <p id="worker-feedback-text" class="mt-2 text-[11px] text-gray-300 whitespace-pre-wrap"></p>
+                <pre id="execution-result-detail" class="mt-2 hidden text-[10px] text-rose-300 whitespace-pre-wrap overflow-auto"></pre>
+            </div>
+
+            <!-- NỘI DUNG TERMINAL WORKER -->
+            <div id="live-stream" aria-live="polite" class="flex-1 overflow-y-auto p-6 scroll-smooth bg-[#03050a] font-mono text-xs relative">
+                <div class="space-y-1.5 opacity-70">
+                    <p><span class="text-emerald-600">[boot]</span> ai_orchestrator_core.sys ... <span class="text-emerald-500">OK</span></p>
+                    <p><span class="text-emerald-600">[boot]</span> loading account_pool ... <span class="text-emerald-500">OK</span></p>
+                    <p><span class="text-cyan-600">[boot]</span> mounting multi_agent_engine ... <span class="text-cyan-500">OK</span></p>
+                    <p><span class="text-cyan-600">[boot]</span> initializing diff_renderer ... <span class="text-cyan-500">OK</span></p>
+                    <p class="pt-3 text-gray-600 italic text-sm"><span class="neon-text-emerald text-emerald-700">$</span>&nbsp;Hệ thống đã sẵn sàng. Hãy đưa ra yêu cầu...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- PANEL PHẢI: BA LUỒNG AGENT & SYSTEM LOGS -->
+        <div id="panel-right" class="flex flex-col bg-[#050810] border-l border-white/5 overflow-hidden relative z-10 shadow-[-4px_0_30px_rgba(0,0,0,0.6)]">
+            <div id="agent-stream-grid" class="agent-stream-grid">
+                <section class="agent-lane agent-lane-supervisor">
+                    <div class="agent-lane-header">
+                        <span><i class="fa-solid fa-chess-knight mr-2"></i>Supervisor</span>
+                        <span id="supervisor-stage-badge" class="agent-stage-badge">IDLE</span>
+                    </div>
+                    <div id="sup-thinking-box" aria-live="polite" class="agent-lane-stream">
+                        <div class="agent-idle">Đang chờ checkpoint...</div>
+                    </div>
+                    <div id="sup-todo-box" class="hidden p-2 border-t border-purple-500/20 bg-black/40 max-h-[100px] overflow-y-auto">
+                        <div class="text-[9px] text-purple-300 font-bold uppercase tracking-widest mb-1">Current plan</div>
+                        <div id="todo-list-content"></div>
+                    </div>
+                </section>
+
+                <section class="agent-lane agent-lane-worker">
+                    <div class="agent-lane-header">
+                        <span><i class="fa-solid fa-code mr-2"></i>Worker</span>
+                        <span id="worker-stage-badge" class="agent-stage-badge">IDLE</span>
+                    </div>
+                    <div id="worker-thinking-box" aria-live="polite" class="agent-lane-stream">
+                        <div class="agent-idle">Đang chờ ticket từ Supervisor...</div>
+                    </div>
+                </section>
+
+                <section class="agent-lane agent-lane-reviewer">
+                    <div class="agent-lane-header">
+                        <span><i class="fa-solid fa-flask-vial mr-2"></i>Reviewer</span>
+                        <span id="reviewer-verdict-badge" class="agent-stage-badge">IDLE</span>
+                    </div>
+                    <div id="reviewer-stream" aria-live="polite" class="agent-lane-stream">
+                        <div class="agent-idle">Đang chờ patch vượt machine gate...</div>
+                    </div>
+                    <div id="reviewer-result-box" class="hidden p-2 border-t border-amber-500/20 bg-black/40">
+                        <div id="reviewer-file" class="text-[9px] text-amber-500 truncate"></div>
+                        <p id="reviewer-feedback" class="mt-1 text-[10px] text-gray-300 whitespace-pre-wrap"></p>
+                        <p id="reviewer-next-instructions" class="mt-1 text-[10px] text-cyan-300 whitespace-pre-wrap"></p>
+                    </div>
+                </section>
+            </div>
+
+            <!-- EXECUTION LOGS -->
+            <div class="system-log-panel flex flex-col bg-[#1a0505]">
+                <div class="h-9 bg-[#2a0808] border-b border-rose-500/30 flex items-center px-4 shadow-md">
+                    <i class="fa-solid fa-server mr-2 text-rose-400"></i>
+                    <span class="text-[10px] font-bold uppercase tracking-widest text-rose-300">System Audit Logs</span>
+                </div>
+                <div id="sys-audit-logs" aria-live="polite" class="flex-1 overflow-y-auto p-3 bg-black/40 flex flex-col">
+                    <!-- Timeline sẽ chạy ở đây -->
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        function updateEffortOptions() {
+            const model = document.getElementById('model').value;
+            const xhighOpt = document.getElementById('opt-xhigh');
+            if(model === 'claude-sonnet-4-6') {
+                xhighOpt.style.display = 'none';
+                if(document.getElementById('effort').value === 'xhigh') {
+                    document.getElementById('effort').value = 'max';
+                }
+            } else {
+                xhighOpt.style.display = 'block';
+            }
+        }
+
+        function updateProjectModeUI() {
+            const isNew = document.getElementById('project-mode')?.value === 'new_project';
+            document.getElementById('artifact-options')?.classList.toggle('hidden', !isNew);
+            const files = document.getElementById('files');
+            if (files) {
+                files.classList.toggle('hidden', isNew);
+                if (isNew) files.value = '';
+            }
+            const hint = document.getElementById('source-files-hint');
+            if (hint) {
+                hint.textContent = isNew
+                    ? '// staging · tạo file mới'
+                    : '// folder_only · agent tự nạp file';
+            }
+            const label = document.getElementById('project-picker-label');
+            if (label) label.textContent = isNew
+                ? 'CHỌN THƯ MỤC ĐÍCH TRỐNG...'
+                : 'CHỌN THƯ MỤC CODE...';
+        }
+
+        async function openProjectPicker() {
+            try {
+                const isNew = document.getElementById('project-mode')?.value === 'new_project';
+                // Edit mode: chỉ cần folder. Local file agent nạp file khi agent yêu cầu.
+                const res = await fetch('/api/pick-folder');
+                const data = await res.json();
+                if(data.root) {
+                    document.getElementById('root').value = data.root;
+                    if (!isNew) {
+                        // Không bắt chọn từng file; seed list để trống.
+                        document.getElementById('files').value = '';
+                    } else {
+                        document.getElementById('files').value = '';
+                    }
+                }
+            } catch (e) {
+                console.error("Lỗi khi mở File Picker:", e);
+            }
+        }
+    </script>
+
+    <script src="https://cdn.jsdelivr.net/npm/split.js/dist/split.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="/api.js"></script>
+    <script src="/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+cookies/
+.env
+.env.*
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+state.json
+logs/
