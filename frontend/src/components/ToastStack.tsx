@@ -1,3 +1,5 @@
+import { X } from 'lucide-react';
+
 interface Toast {
   id: string;
   message: string;
@@ -17,8 +19,14 @@ export function ToastStack({ toasts, onDismiss }: ToastStackProps) {
       {toasts.map((toast) => (
         <div key={toast.id} className={`toast toast-${toast.tone ?? 'info'}`}>
           <span>{toast.message}</span>
-          <button type="button" aria-label="Dismiss" onClick={() => onDismiss(toast.id)}>
-            ×
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Dismiss"
+            title="Dismiss notification"
+            onClick={() => onDismiss(toast.id)}
+          >
+            <X size={14} />
           </button>
         </div>
       ))}

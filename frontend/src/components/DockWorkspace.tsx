@@ -10,10 +10,11 @@ import {
 import {
   DockviewReact,
   type DockviewApi,
+  type IDockviewPanelHeaderProps,
   type DockviewReadyEvent,
   type SerializedDockview,
 } from 'dockview-react';
-import { Focus, LayoutDashboard, PanelTopOpen, RotateCcw } from 'lucide-react';
+import { Focus, LayoutDashboard, PanelTopOpen, RotateCcw, X } from 'lucide-react';
 import type { AgentInstance, WorkspaceState } from '../types';
 import { AgentWindow } from './AgentWindow';
 import { WorkspaceProvider } from './WorkspaceContext';
@@ -41,10 +42,42 @@ interface StoredLayout {
 const storageKey = (taskId: string) => `orchestrator:dock-layout:v${LAYOUT_VERSION}:${taskId}`;
 const panelId = (agentId: string) => `agent:${agentId}`;
 
+function AgentDockTab({ api }: IDockviewPanelHeaderProps) {
+  const [title, setTitle] = useState(api.title);
+
+  useEffect(() => {
+    setTitle(api.title);
+    const disposable = api.onDidTitleChange(() => setTitle(api.title));
+    return () => disposable.dispose();
+  }, [api]);
+
+  return (
+    <div className="agent-dock-tab" title={title} aria-label={title}>
+      <span>{title}</span>
+      <button
+        type="button"
+        aria-label={`Close ${title}`}
+        title={`Close ${title}`}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onClick={(event) => {
+          event.stopPropagation();
+          api.close();
+        }}
+      >
+        <X size={11} />
+      </button>
+    </div>
+  );
+}
+
 export const DockWorkspace = forwardRef<DockWorkspaceHandle, DockWorkspaceProps>(
   function DockWorkspace({ taskId, state, onFocusAgent, onConfigureAgent }, ref) {
     const apiRef = useRef<DockviewApi | undefined>(undefined);
     const [focusMode, setFocusMode] = useState(false);
+    const [groupMaximized, setGroupMaximized] = useState(false);
 
     const saveLayout = useCallback(() => {
       const api = apiRef.current;
@@ -58,58 +91,64 @@ export const DockWorkspace = forwardRef<DockWorkspaceHandle, DockWorkspaceProps>
       localStorage.setItem(storageKey(taskId), JSON.stringify(stored));
     }, [taskId]);
 
-    const openAgent = useCallback((agent: AgentInstance) => {
-      const api = apiRef.current;
-      if (!api) return;
-      const id = panelId(agent.id);
-      const existing = api.getPanel(id);
-      if (existing) {
-        existing.api.setActive();
-        return;
-      }
+    const openAgent = useCallback(
+      (agent: AgentInstance) => {
+        const api = apiRef.current;
+        if (!api) return;
+        const id = panelId(agent.id);
+        const existing = api.getPanel(id);
+        if (existing) {
+          existing.api.setActive();
+          return;
+        }
 
-      const managerPanel =
-        agent.managerId && agent.role !== 'manager'
-          ? api.getPanel(panelId(agent.managerId))
+        const managerPanel =
+          agent.managerId && agent.role !== 'manager'
+            ? api.getPanel(panelId(agent.managerId))
+            : undefined;
+        const directorPanel = state.directorId
+          ? api.getPanel(panelId(state.directorId))
           : undefined;
-      const directorPanel = state.directorId
-        ? api.getPanel(panelId(state.directorId))
-        : undefined;
-      const referencePanel = managerPanel ?? directorPanel;
+        const referencePanel = managerPanel ?? directorPanel;
 
-      api.addPanel({
-        id,
-        component: 'agent',
-        title: agent.title,
-        params: { agentId: agent.id },
-        ...(referencePanel
-          ? {
-              position: {
-                referencePanel,
-                direction: managerPanel ? ('within' as const) : ('right' as const),
-              },
-            }
-          : {}),
-      });
-    }, [state.directorId]);
+        api.addPanel({
+          id,
+          component: 'agent',
+          title: agent.title,
+          params: { agentId: agent.id },
+          ...(referencePanel
+            ? {
+                position: {
+                  referencePanel,
+                  direction: managerPanel ? ('within' as const) : ('right' as const),
+                },
+              }
+            : {}),
+        });
+      },
+      [state.directorId],
+    );
 
     useImperativeHandle(ref, () => ({ openAgent }), [openAgent]);
 
-    const onReady = useCallback((event: DockviewReadyEvent) => {
-      apiRef.current = event.api;
-      const raw = localStorage.getItem(storageKey(taskId));
-      if (raw) {
-        try {
-          const stored = JSON.parse(raw) as StoredLayout;
-          if (stored.version === LAYOUT_VERSION && stored.taskId === taskId) {
-            event.api.fromJSON(stored.layout);
+    const onReady = useCallback(
+      (event: DockviewReadyEvent) => {
+        apiRef.current = event.api;
+        const raw = localStorage.getItem(storageKey(taskId));
+        if (raw) {
+          try {
+            const stored = JSON.parse(raw) as StoredLayout;
+            if (stored.version === LAYOUT_VERSION && stored.taskId === taskId) {
+              event.api.fromJSON(stored.layout);
+            }
+          } catch {
+            localStorage.removeItem(storageKey(taskId));
           }
-        } catch {
-          localStorage.removeItem(storageKey(taskId));
         }
-      }
-      event.api.onDidLayoutChange(saveLayout);
-    }, [saveLayout, taskId]);
+        event.api.onDidLayoutChange(saveLayout);
+      },
+      [saveLayout, taskId],
+    );
 
     useEffect(() => {
       const api = apiRef.current;
@@ -135,8 +174,10 @@ export const DockWorkspace = forwardRef<DockWorkspaceHandle, DockWorkspaceProps>
       if (!api) return;
       if (api.hasMaximizedGroup()) {
         api.exitMaximizedGroup();
+        setGroupMaximized(false);
       } else if (api.activePanel) {
         api.maximizeGroup(api.activePanel);
+        setGroupMaximized(true);
       }
     };
 
@@ -155,17 +196,25 @@ export const DockWorkspace = forwardRef<DockWorkspaceHandle, DockWorkspaceProps>
           <header className="dock-toolbar">
             <div>
               <span className="eyebrow">Agent workspace</span>
-              <strong>{Object.keys(state.agents).length} live instances</strong>
+              <strong title={`${Object.keys(state.agents).length} live instances`}>
+                {Object.keys(state.agents).length} live instances
+              </strong>
             </div>
             <div className="compact-agent-picker">
               {Object.values(state.agents).map((agent) => (
-                <button type="button" key={agent.id} onClick={() => openAgent(agent)}>
+                <button
+                  type="button"
+                  key={agent.id}
+                  onClick={() => openAgent(agent)}
+                  title={agent.title}
+                  aria-label={`Open ${agent.title}`}
+                >
                   <span className={`status-dot status-${agent.status}`} />
-                  {agent.title}
+                  <span className="compact-agent-title">{agent.title}</span>
                 </button>
               ))}
             </div>
-            <div className="dock-actions">
+            <div className="dock-actions" role="toolbar" aria-label="Agent workspace controls">
               <button
                 type="button"
                 onClick={() => {
@@ -176,38 +225,62 @@ export const DockWorkspace = forwardRef<DockWorkspaceHandle, DockWorkspaceProps>
                     .forEach((agent) => openAgent(agent));
                 }}
                 title="Director + managers layout"
+                aria-label="Open Director and managers layout"
               >
-                <LayoutDashboard size={13} /> Dir+Mgr
+                <LayoutDashboard size={13} /> <span>Director + managers</span>
               </button>
               <button
                 type="button"
                 onClick={() => {
                   Object.values(state.agents)
-                    .filter((agent) => agent.role === 'worker' || agent.role === 'tester' || agent.role === 'reviewer')
+                    .filter(
+                      (agent) =>
+                        agent.role === 'worker' ||
+                        agent.role === 'tester' ||
+                        agent.role === 'reviewer',
+                    )
                     .forEach((agent) => openAgent(agent));
                 }}
                 title="Open worker/tester grid"
+                aria-label="Open worker and tester grid"
               >
-                <LayoutDashboard size={13} /> Workers
+                <LayoutDashboard size={13} /> <span>Workers</span>
               </button>
               <button
                 type="button"
                 onClick={() => setFocusMode((value) => !value)}
                 disabled={!apiRef.current?.activePanel}
                 title={focusMode ? 'Exit full workspace focus' : 'Focus active workspace'}
+                aria-label={focusMode ? 'Exit full workspace focus' : 'Focus active workspace'}
+                aria-pressed={focusMode}
               >
-                <Focus size={13} /> {focusMode ? 'Exit focus' : 'Focus'}
+                <Focus size={13} /> <span>{focusMode ? 'Exit focus' : 'Focus'}</span>
               </button>
               <button
                 type="button"
                 onClick={toggleMaximize}
                 disabled={!apiRef.current?.activePanel}
-                title="Maximize the active dock group"
+                title={
+                  groupMaximized
+                    ? 'Restore the active dock group'
+                    : 'Maximize the active dock group'
+                }
+                aria-label={
+                  groupMaximized
+                    ? 'Restore the active dock group'
+                    : 'Maximize the active dock group'
+                }
+                aria-pressed={groupMaximized}
               >
-                <PanelTopOpen size={13} /> Maximize
+                <PanelTopOpen size={13} /> <span>{groupMaximized ? 'Restore' : 'Maximize'}</span>
               </button>
-              <button type="button" onClick={resetLayout} title="Restore the default agent layout">
-                <RotateCcw size={13} /> Reset
+              <button
+                type="button"
+                onClick={resetLayout}
+                title="Restore the default agent layout"
+                aria-label="Restore the default agent layout"
+              >
+                <RotateCcw size={13} /> <span>Reset</span>
               </button>
             </div>
           </header>
@@ -216,6 +289,7 @@ export const DockWorkspace = forwardRef<DockWorkspaceHandle, DockWorkspaceProps>
               key={taskId}
               className="dockview-theme-abyss"
               components={{ agent: AgentWindow }}
+              defaultTabComponent={AgentDockTab}
               onReady={onReady}
               watermarkComponent={() => (
                 <div className="dock-watermark">

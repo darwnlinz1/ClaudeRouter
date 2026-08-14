@@ -4,10 +4,7 @@ import 'dockview-react/dist/styles/dockview.css';
 import App from './App';
 import './styles.css';
 
-class WorkspaceErrorBoundary extends Component<
-  { children: ReactNode },
-  { error?: Error }
-> {
+class WorkspaceErrorBoundary extends Component<{ children: ReactNode }, { error?: Error }> {
   state: { error?: Error } = {};
 
   static getDerivedStateFromError(error: Error) {
@@ -24,7 +21,13 @@ class WorkspaceErrorBoundary extends Component<
         <main className="workspace-crash">
           <strong>Workspace render failed</strong>
           <code>{this.state.error.message}</code>
-          <button type="button" onClick={() => window.location.reload()}>Reload workspace</button>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => window.location.reload()}
+          >
+            Reload workspace
+          </button>
         </main>
       );
     }

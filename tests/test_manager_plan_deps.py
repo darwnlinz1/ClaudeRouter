@@ -19,7 +19,7 @@ def test_manager_plan_worker_slots_follow_item_count():
         "submit_work_item_plan",
         {
             "summary": "three items",
-            "requested_worker_count": 1,
+            "requested_worker_count": 3,
             "work_items": [
                 {
                     "id": "a",
@@ -63,18 +63,14 @@ def test_manager_plan_worker_slots_follow_item_count():
     )
     assert planned.requested_worker_count == 3
     assert len(planned.work_items) == 3
-    capped = _manager_stream_from_result(
-        result, stream, SchedulerLimits(max_workers_per_manager=2)
-    )
-    # One child-agent slot is reserved for the workstream Tester.
-    assert len(capped.work_items) == 3
-    assert capped.requested_worker_count == 1
-    with pytest.raises(RuntimeError, match="expected exactly 1"):
+    # One child-agent slot is reserved for the workstream Tester. Plans above
+    # the remaining Coder cap are rejected instead of silently trimmed.
+    with pytest.raises(RuntimeError, match="exceeds maximum 1"):
         _manager_stream_from_result(
             result,
             stream,
             SchedulerLimits(max_workers_per_manager=2),
-            required_coder_count=1,
+            max_coder_count=1,
         )
 
 
@@ -101,11 +97,20 @@ def test_manager_plan_package_includes_all_write_scope_files():
                     "instructions": "Implement auth package",
                     "acceptance_criteria": ["login works"],
                     "dependencies": [],
+                    "contract_id": "auth-contract",
+                    "contract_version": 2,
+                    "input_artifacts": ["docs/auth.md"],
+                    "expected_outputs": ["working auth package"],
+                    "read_scopes": ["docs/auth.md"],
                     "write_scopes": [
                         "backend/nexus/auth/service.py",
                         "backend/nexus/auth/router.py",
                         "backend/nexus/auth/models.py",
                     ],
+                    "evidence_requirements": ["pytest auth passes"],
+                    "consumers": ["api-router"],
+                    "risk_level": "high",
+                    "priority": 7,
                     "test_focus": "pytest auth",
                 }
             ],
@@ -119,7 +124,24 @@ def test_manager_plan_package_includes_all_write_scope_files():
         "backend/nexus/auth/router.py",
         "backend/nexus/auth/models.py",
     ]
+    assert item.contract.id == "auth-contract"
+    assert item.contract.version == 2
+    assert item.contract.risk_level.value == "high"
+    assert item.priority == 7
     assert _package_files(item) == item.metadata["package_files"]
+    assert planned.metadata["fanout"] == {
+        "selected": 1,
+        "max": 3,
+        "reason": "auth package",
+        "execution_slots": 3,
+    }
+    with pytest.raises(RuntimeError, match="execution slots"):
+        _manager_stream_from_result(
+            result,
+            stream,
+            SchedulerLimits(),
+            max_coder_count=2,
+        )
 
 
 def test_manager_plan_drops_unknown_dependencies():

@@ -1,0 +1,7 @@
+dist
+node_modules
+.pytest_cache
+test-results
+playwright-report
+src/generated
+*.tsbuildinfo

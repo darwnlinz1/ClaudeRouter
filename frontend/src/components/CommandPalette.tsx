@@ -93,13 +93,23 @@ export function CommandPalette({ open, onClose, commands }: CommandPaletteProps)
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Type a command…"
             aria-label="Filter commands"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded="true"
+            aria-controls="command-palette-list"
+            aria-activedescendant={
+              filtered[highlight] ? `command-option-${filtered[highlight].id}` : undefined
+            }
           />
         </div>
-        <ul className="command-palette-list">
+        <ul className="command-palette-list" id="command-palette-list" role="listbox">
           {filtered.map((command, index) => (
-            <li key={command.id}>
+            <li key={command.id} role="presentation">
               <button
                 type="button"
+                id={`command-option-${command.id}`}
+                role="option"
+                aria-selected={index === highlight}
                 className={index === highlight ? 'active' : ''}
                 disabled={command.disabled}
                 onMouseEnter={() => setHighlight(index)}

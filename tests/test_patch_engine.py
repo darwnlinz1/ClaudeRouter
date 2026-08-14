@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from orchestrator import patch_engine
+from orchestrator import patch_engine, project_workspace
 
 
 def _patch(search: str, replace: str) -> str:
@@ -87,6 +88,8 @@ def test_rejects_missing_anchor(project: Path):
 
 
 def test_successful_unique_patch_applies(project: Path):
+    target = project / "src" / "foo.py"
+    before_hash = hashlib.sha256(target.read_bytes()).hexdigest()
     result = patch_engine.apply_patch(
         project,
         "src/foo.py",
@@ -94,9 +97,11 @@ def test_successful_unique_patch_applies(project: Path):
         frozenset({"src/foo.py"}),
     )
     assert result.occurrences_before == 1
-    new_content = (project / "src" / "foo.py").read_text(encoding="utf-8")
+    new_content = target.read_text(encoding="utf-8")
     assert "return 42" in new_content
     assert "def b():\n    return 1" in new_content  # untouched
+    assert result.before_sha256 == before_hash
+    assert result.after_sha256 == hashlib.sha256(target.read_bytes()).hexdigest()
 
 
 def test_rejects_path_traversal_outside_root(project: Path, tmp_path: Path):
@@ -132,3 +137,93 @@ def test_new_file_requires_empty_search_block(project: Path):
             _patch("invented old code", "VALUE = 42"),
             frozenset({"src/new_module.py"}),
         )
+
+
+def test_normalized_empty_search_applies_after_llm_canonicalization(project: Path):
+    from orchestrator.llm_client import _normalize_patch_grammar
+
+    normalized = _normalize_patch_grammar(
+        "<<<< SEARCH\n====\nVALUE = 42\n>>>> REPLACE"
+    )
+    result = patch_engine.apply_patch(
+        project,
+        "src/new_module.py",
+        normalized,
+        frozenset({"src/new_module.py"}),
+    )
+
+    assert result.occurrences_before == 0
+    assert (project / "src" / "new_module.py").read_text(encoding="utf-8") == "VALUE = 42"
+
+
+def test_replace_failure_preserves_original_and_cleans_temp(
+    monkeypatch, project: Path
+):
+    target = project / "src" / "foo.py"
+    original = target.read_bytes()
+    real_replace = project_workspace.os.replace
+
+    def crash_before_replace(source, destination):
+        if Path(destination) == target:
+            raise OSError("injected replace crash")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(project_workspace.os, "replace", crash_before_replace)
+
+    with pytest.raises(OSError, match="injected replace crash"):
+        patch_engine.apply_patch(
+            project,
+            "src/foo.py",
+            _patch("def a():\n    return 1", "def a():\n    return 99"),
+            frozenset({"src/foo.py"}),
+        )
+
+    assert target.read_bytes() == original
+    assert list(target.parent.glob("*.orchestrator-tmp")) == []
+    assert list(target.parent.glob(".*.orchestrator-tmp")) == []
+
+
+def test_external_write_race_is_rejected_and_temp_is_cleaned(
+    monkeypatch, project: Path
+):
+    target = project / "src" / "foo.py"
+    real_commit = project_workspace.commit_prepared_file
+
+    def race_commit(prepared, **kwargs):
+        target.write_text("external writer won\n", encoding="utf-8")
+        return real_commit(prepared, **kwargs)
+
+    monkeypatch.setattr(project_workspace, "commit_prepared_file", race_commit)
+
+    with pytest.raises(patch_engine.FileChangedError, match="changed before commit"):
+        patch_engine.apply_patch(
+            project,
+            "src/foo.py",
+            _patch("def a():\n    return 1", "def a():\n    return 99"),
+            frozenset({"src/foo.py"}),
+        )
+
+    assert target.read_text(encoding="utf-8") == "external writer won\n"
+    assert list(target.parent.glob(".*.orchestrator-tmp")) == []
+
+
+def test_new_file_requires_target_to_remain_absent(monkeypatch, project: Path):
+    target = project / "src" / "new_module.py"
+    real_commit = project_workspace.commit_prepared_file
+
+    def race_commit(prepared, **kwargs):
+        target.write_text("created externally\n", encoding="utf-8")
+        return real_commit(prepared, **kwargs)
+
+    monkeypatch.setattr(project_workspace, "commit_prepared_file", race_commit)
+
+    with pytest.raises(patch_engine.FileChangedError, match="expected absence"):
+        patch_engine.apply_patch(
+            project,
+            "src/new_module.py",
+            "<patch>\n<<<< SEARCH\n====\nVALUE = 42\n>>>> REPLACE\n</patch>",
+            frozenset({"src/new_module.py"}),
+        )
+
+    assert target.read_text(encoding="utf-8") == "created externally\n"
+    assert list(target.parent.glob(".*.orchestrator-tmp")) == []

@@ -18,6 +18,33 @@ def test_build_project_tree_lists_files_and_skips_noise(tmp_path: Path):
     assert "node_modules" not in tree
 
 
+def test_project_tree_is_deterministic_and_bounded(tmp_path: Path):
+    for name in ("c.py", "a.py", "b.py"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+    deep = tmp_path / "nested" / "too-deep"
+    deep.mkdir(parents=True)
+    (deep / "hidden.py").write_text("x", encoding="utf-8")
+    (tmp_path / ("x" * 40 + ".py")).write_text("x", encoding="utf-8")
+
+    tree = build_project_tree(
+        tmp_path,
+        max_entries=2,
+        max_depth=1,
+        max_path_length=32,
+    )
+
+    assert tree.splitlines()[:2] == ["a.py", "b.py"]
+    assert "đã cắt bớt" in tree
+    constrained = build_project_tree(
+        tmp_path,
+        max_entries=10,
+        max_depth=1,
+        max_path_length=32,
+    )
+    assert "hidden.py" not in constrained
+    assert "x" * 40 not in constrained
+
+
 def test_authorize_existing_file(tmp_path: Path):
     target = tmp_path / "a.py"
     target.write_text("x = 1\n", encoding="utf-8")

@@ -504,7 +504,6 @@ def test_nonunique_anchor_increments_consecutive_error_count_then_resets_on_succ
 
     assert result.turns[0].accepted is False
     assert result.turns[1].accepted is False
-    paths = state_store.ProjectPaths.for_root(project)
     # After the two identical failures, consecutive_error_count should have
     # reached 2 before the successful third turn reset it to 0.
     assert result.turns[2].accepted is True

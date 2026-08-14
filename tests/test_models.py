@@ -5,6 +5,7 @@ import pytest
 from orchestrator.models import (
     AgentInstance,
     AgentRole,
+    Attempt,
     EventEnvelope,
     TaskPlan,
     WorkerAssignment,
@@ -113,3 +114,26 @@ def test_assignment_and_agent_round_trip():
 
     assert worker_assignment_from_dict(to_dict(assignment)) == assignment
     assert agent_instance_from_dict(to_dict(agent)) == agent
+
+
+def test_execution_attempt_ids_cannot_alias_logical_agent_ids():
+    with pytest.raises(ValueError, match="distinct"):
+        Attempt(
+            id="worker-logical",
+            task_id="task-1",
+            workstream_id="stream-1",
+            work_item_id="item-1",
+            number=1,
+            worker_agent_id="worker-logical",
+        )
+
+    with pytest.raises(ValueError, match="distinct"):
+        WorkerAssignment(
+            id="assignment-1",
+            task_id="task-1",
+            workstream_id="stream-1",
+            work_item_id="item-1",
+            worker_agent_id="worker-logical",
+            attempt_id="worker-logical",
+            write_scopes=("src",),
+        )
