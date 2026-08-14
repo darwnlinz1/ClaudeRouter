@@ -34,7 +34,9 @@ export function HierarchyPreview({ managers, workersPerManager }: HierarchyPrevi
                   <span>W</span>
                 </div>
               ))}
-              <div className="hierarchy-org-worker hierarchy-org-tester"><span>T</span></div>
+              <div className="hierarchy-org-worker hierarchy-org-tester">
+                <span>T</span>
+              </div>
               {hiddenWorkers > 0 && <div className="hierarchy-org-more">+{hiddenWorkers}</div>}
             </div>
           </div>

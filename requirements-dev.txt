@@ -1,0 +1,9 @@
+-r requirements.lock
+ruff
+mypy
+types-requests
+hypothesis
+pip-audit
+cyclonedx-bom
+build
+pip-tools

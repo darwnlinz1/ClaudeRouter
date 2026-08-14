@@ -1,0 +1,1005 @@
+{
+  "event_schema_version": 1,
+  "events": {
+    "account_invalidated": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "reason": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "account_rate_limited": {
+      "fields": {
+        "account": "string",
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "cooldown_seconds": "number",
+        "provider": "string",
+        "reason": "string",
+        "retry_after_seconds": "number",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "account_switch": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "from_account": "string",
+        "logical_request_id": "string",
+        "reason": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "to_account": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "reason"
+      ],
+      "version": 1
+    },
+    "agent_failed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "error": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "error",
+        "role"
+      ],
+      "version": 1
+    },
+    "agent_message": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "signal_type": "string",
+        "source_agent_id": "string",
+        "summary": "string",
+        "target_agent_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "source_agent_id",
+        "target_agent_id"
+      ],
+      "version": 1
+    },
+    "agent_progress": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "message": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "stage": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role"
+      ],
+      "version": 1
+    },
+    "agent_started": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role"
+      ],
+      "version": 1
+    },
+    "approval_decided": {
+      "fields": {
+        "agent_instance_id": "string",
+        "approval_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "decision": "string",
+        "reason": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "approval_id",
+        "decision"
+      ],
+      "version": 1
+    },
+    "approval_requested": {
+      "fields": {
+        "agent_instance_id": "string",
+        "approval_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "kind": "string",
+        "reason": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "target": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "approval_id",
+        "kind",
+        "reason",
+        "status",
+        "target"
+      ],
+      "version": 1
+    },
+    "budget_exceeded": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "budget": "object",
+        "call_id": "string",
+        "logical_request_id": "string",
+        "reason": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "budget",
+        "reason"
+      ],
+      "version": 1
+    },
+    "budget_updated": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "budget": "object",
+        "call_id": "string",
+        "logical_request_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "budget"
+      ],
+      "version": 1
+    },
+    "completion_reconciliation": {
+      "fields": {
+        "agent_instance_id": "string",
+        "agents": "object",
+        "attempt_id": "string",
+        "balanced": "boolean",
+        "call_id": "string",
+        "calls": "object",
+        "errors": "array",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "work_items": "object",
+        "workstream_id": "string",
+        "workstreams": "object"
+      },
+      "required": [
+        "balanced"
+      ],
+      "version": 1
+    },
+    "director_replan_created": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "reason": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "effect_applied": {
+      "fields": {
+        "after_sha256": "string",
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "before_sha256": "string",
+        "call_id": "string",
+        "effect_id": "string",
+        "effect_kind": "string",
+        "file_path": "string",
+        "idempotency_key": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "effect_id"
+      ],
+      "version": 1
+    },
+    "error": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "data": "any",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "execution_result": {
+      "fields": {
+        "accepted": "boolean",
+        "additions": "integer",
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "deletions": "integer",
+        "execution_result": "any",
+        "file_path": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "worker_feedback": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "accepted"
+      ],
+      "version": 1
+    },
+    "fanout_selected": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "level": "string",
+        "maximum": "integer",
+        "reason": "string",
+        "selected": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "unused_capacity": "integer",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "level",
+        "selected"
+      ],
+      "version": 1
+    },
+    "finish_chat_turn": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "hierarchy_completed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "verdict": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "hierarchy_failed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "verdict": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "hierarchy_fanout_planned": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "child_agent_count": "integer",
+        "coder_count": "integer",
+        "manager_count": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "tester_count": "integer",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "integration_result": {
+      "fields": {
+        "accepted": "boolean",
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "manager_plan_created": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "requested_worker_count": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "work_items": "array",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "model_request_aborted": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "error": "string",
+        "logical_request_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role"
+      ],
+      "version": 1
+    },
+    "model_request_completed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "latency_ms": "number",
+        "logical_request_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role"
+      ],
+      "version": 1
+    },
+    "model_request_failed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "error": "string",
+        "logical_request_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "error",
+        "role"
+      ],
+      "version": 1
+    },
+    "model_request_replayed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "logical_request_id": "string",
+        "replayed": "boolean",
+        "request_revision": "integer",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "logical_request_id",
+        "role"
+      ],
+      "version": 1
+    },
+    "model_request_started": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "logical_request_id": "string",
+        "replayed": "boolean",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role"
+      ],
+      "version": 1
+    },
+    "plan.created": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "revision": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "revision"
+      ],
+      "version": 1
+    },
+    "plan_created": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "requested_manager_count": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string",
+        "workstreams": "array"
+      },
+      "required": [],
+      "version": 1
+    },
+    "plan_preflight_failed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "issues": "array",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "worker_calls_started": "integer",
+        "workstream_id": "string"
+      },
+      "required": [
+        "issues"
+      ],
+      "version": 1
+    },
+    "planner_count_rejected": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "level": "string",
+        "maximum": "integer",
+        "requested": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "project_lease_acquired": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "fencing_token": "integer",
+        "isolation_level": "string",
+        "project_key": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "fencing_token",
+        "project_key"
+      ],
+      "version": 1
+    },
+    "project_lease_lost": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "error": "string",
+        "project_key": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "error"
+      ],
+      "version": 1
+    },
+    "protocol_retry": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "error": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "resume": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "turn_count": "integer",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "resume_checkpoint_loaded": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "checkpoint": "object",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "review_result": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "reviewer_feedback": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "verdict": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "verdict"
+      ],
+      "version": 1
+    },
+    "status": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "data": "any",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "task.started": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "test_result": {
+      "fields": {
+        "accepted": "boolean",
+        "actual_isolation": "string",
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "command": "string",
+        "detail": "string",
+        "isolation_details": "string",
+        "output_truncated": "boolean",
+        "passed": "boolean",
+        "requested_isolation": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "thinking": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "text": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "token": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "text": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "turn_phase": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "phase": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "phase"
+      ],
+      "version": 1
+    },
+    "turn_start": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "phase": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "turn": "integer",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "workstream_completed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "workstream_failed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    },
+    "workstream_started": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 1
+    }
+  },
+  "routes": {
+    "/api/session": [
+      "get"
+    ],
+    "/api/health": [
+      "get"
+    ],
+    "/assets/{asset_path}": [
+      "get"
+    ],
+    "/favicon.svg": [
+      "get"
+    ],
+    "/favicon.ico": [
+      "get"
+    ],
+    "/": [
+      "get"
+    ],
+    "/api/pick-files": [
+      "get"
+    ],
+    "/api/pick-folder": [
+      "get"
+    ],
+    "/api/chat/{task_id}": [
+      "post"
+    ],
+    "/api/run": [
+      "post"
+    ],
+    "/api/tasks": [
+      "get"
+    ],
+    "/api/tasks/{task_id}": [
+      "delete",
+      "get"
+    ],
+    "/api/tasks/{task_id}/plan": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/timeline": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/attempts": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/effects": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/observability": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/approvals": [
+      "get",
+      "post"
+    ],
+    "/api/tasks/{task_id}/approvals/{approval_id}/decision": [
+      "post"
+    ],
+    "/api/accounts": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/agents/{agent_id}/config": [
+      "put"
+    ],
+    "/api/tasks/{task_id}/resume": [
+      "post"
+    ],
+    "/api/tasks/{task_id}/artifacts": [
+      "delete",
+      "get"
+    ],
+    "/api/tasks/{task_id}/artifacts/download": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/artifacts/files/{file_path}": [
+      "get"
+    ],
+    "/api/tasks/{task_id}/artifacts/retention": [
+      "patch"
+    ],
+    "/api/stop/{task_id}": [
+      "post"
+    ],
+    "/api/stream/{task_id}": [
+      "get"
+    ]
+  }
+}

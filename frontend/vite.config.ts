@@ -13,10 +13,34 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
-    sourcemap: true,
+    sourcemap: false,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'graph',
+              test: /node_modules[\\/]@xyflow[\\/]/,
+            },
+            {
+              name: 'dock',
+              test: /node_modules[\\/]dockview/,
+            },
+            {
+              name: 'icons',
+              test: /node_modules[\\/]lucide-react/,
+            },
+            {
+              name: 'react-vendor',
+              test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+            },
+          ],
+        },
+      },
+    },
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 });

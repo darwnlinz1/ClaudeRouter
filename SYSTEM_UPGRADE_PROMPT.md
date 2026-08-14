@@ -25,6 +25,9 @@ Biến hệ thống thành một Auto-Coder local an toàn, có thể quan sát,
 15. Chat mode phải hoạt động độc lập không cần project root, đồng thời ẩn toàn bộ cấu hình và panel chỉ dành cho Orchestrator.
 16. Dashboard phải lưu task bền vững ngoài target repository, hiển thị danh sách dọc, phase/status, cấu hình riêng và thống kê file đã được duyệt theo số dòng thêm/xóa.
 17. New Project phải chạy trong artifact staging ngoài destination, hỗ trợ nhiều file bằng `is_final_ticket`, chỉ auto-apply sau machine Pass + Reviewer approved, và tạo ZIP tải về khi được cấu hình.
+18. Mọi hierarchy limit là giới hạn trên, không phải quota bắt buộc: Director/Manager chọn fan-out theo số gói độc lập nhưng phải khai báo count khớp plan và không vượt cap.
+19. Mỗi work item phải có Typed Work Contract versioned gồm input/output, read/write scope, acceptance, evidence, consumer và risk; resume/revision phải giữ được provenance.
+20. Task chỉ được kết thúc sau completion reconciliation chứng minh mọi workstream, work item, logical agent và model call đều có đúng một terminal outcome.
 
 ## Luồng lý tưởng
 
@@ -32,13 +35,13 @@ Biến hệ thống thành một Auto-Coder local an toàn, có thể quan sát,
 2. Backend xác thực root/file, tạo task ID không đoán được và khởi tạo stream.
 3. Supervisor đọc task, rules, decisions, state và source context đã giới hạn kích thước.
 4. Supervisor gọi `request_context` hoặc `delegate_task`.
-5. Backend kiểm tra capability của target trước khi gọi Worker.
-6. Worker nhận đúng một file, trả `<patch>` và `worker_feedback`.
+5. Backend kiểm tra Typed Work Contract, capability và fan-out cap trước khi gọi Worker.
+6. Worker nhận đúng contract/scope được giao, trả `<patch>`, typed evidence và `worker_feedback`.
 7. Backend snapshot local, áp dụng patch, chạy syntax/test và rollback khi lỗi.
 8. Nếu machine gate Pass, Reviewer kiểm tra đúng yêu cầu, phạm vi, edge case và bảo mật.
 9. Backend lưu feedback của Worker, kết quả máy, verdict/feedback của Reviewer và phát event SSE có cấu trúc.
 10. Nếu Reviewer yêu cầu revise, backend rollback target; lượt Supervisor tiếp theo đối chiếu cả ba nguồn để giao lại việc.
-11. Khi machine gate Pass và Reviewer approved, backend phát summary; UI đóng stream và hiển thị toàn bộ kết quả.
+11. Khi machine gate Pass và Reviewer approved, backend chạy completion reconciliation; chỉ phát summary thành công khi invariant cân bằng, sau đó UI đóng stream và hiển thị toàn bộ kết quả.
 
 ## Tiêu chí hoàn thành
 
@@ -46,6 +49,7 @@ Biến hệ thống thành một Auto-Coder local an toàn, có thể quan sát,
 - Không retry vô hạn.
 - Không render HTML chưa sanitize.
 - Tất cả task đều kết thúc ở trạng thái rõ ràng.
+- Planned/called/completed/skipped/blocked/failed/preflight-failed luôn reconcile.
 - Feedback và execution result hiển thị trong UI.
 - Test hiện có và test mới đều pass.
 - Không commit hoặc push tự động khi thực hiện prompt nâng cấp này.

@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import {
   Background,
   BaseEdge,
@@ -9,6 +9,7 @@ import {
   Position,
   ReactFlow,
   getBezierPath,
+  getSmoothStepPath,
   useEdgesState,
   useNodesState,
   useReactFlow,
@@ -18,7 +19,15 @@ import {
   type NodeProps,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Bot, Crosshair, GitBranch, LayoutGrid, Maximize2, Minimize2, Waypoints } from 'lucide-react';
+import {
+  Bot,
+  Crosshair,
+  GitBranch,
+  LayoutGrid,
+  Maximize2,
+  Minimize2,
+  Waypoints,
+} from 'lucide-react';
 import type { AgentInstance, ManagerNode, WorkspaceState } from '../types';
 
 interface DagOverviewProps {
@@ -29,6 +38,25 @@ interface DagOverviewProps {
 }
 
 type LayoutMode = 'tree' | 'swimlane' | 'radial';
+const LAYOUTS: LayoutMode[] = ['tree', 'swimlane', 'radial'];
+
+const moveLayoutFocus = (
+  event: KeyboardEvent<HTMLButtonElement>,
+  index: number,
+  onSelect: (layout: LayoutMode) => void,
+) => {
+  let nextIndex: number | undefined;
+  if (event.key === 'ArrowRight') nextIndex = (index + 1) % LAYOUTS.length;
+  else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + LAYOUTS.length) % LAYOUTS.length;
+  else if (event.key === 'Home') nextIndex = 0;
+  else if (event.key === 'End') nextIndex = LAYOUTS.length - 1;
+  if (nextIndex == null) return;
+  event.preventDefault();
+  const controls =
+    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]');
+  onSelect(LAYOUTS[nextIndex]);
+  controls?.[nextIndex]?.focus();
+};
 
 type AgentNodeData = {
   role: string;
@@ -36,17 +64,19 @@ type AgentNodeData = {
   status: string;
   dimmed: boolean;
   heat: number;
+  contract?: string;
+  requestContext?: string;
 };
 
 const CHILD_ROLES = new Set(['worker', 'tester', 'reviewer']);
 const LEGACY_MANAGER_ID = 'manager:legacy';
 
 const signalColor = (type: string) => {
-  if (type.includes('assign') || type.includes('delegate')) return '#38d7e8';
-  if (type.includes('patch') || type.includes('approve')) return '#4ee0a1';
-  if (type.includes('review') || type.includes('ask') || type.includes('result')) return '#f3ba63';
-  if (type.includes('error') || type.includes('fail') || type.includes('reject')) return '#ff6b7a';
-  return '#9b8cff';
+  if (type.includes('assign') || type.includes('delegate')) return '#4f8bd6';
+  if (type.includes('patch') || type.includes('approve')) return '#45a675';
+  if (type.includes('review') || type.includes('ask') || type.includes('result')) return '#c58a35';
+  if (type.includes('error') || type.includes('fail') || type.includes('reject')) return '#d85b67';
+  return '#6f8fb8';
 };
 
 const heatOpacity = (agent: AgentInstance) => {
@@ -60,19 +90,43 @@ const AgentFlowNode = memo(function AgentFlowNode({ data }: NodeProps) {
   const node = data as unknown as AgentNodeData;
   return (
     <>
-      <Handle type="target" position={Position.Top} id="in" className="flow-handle" isConnectable={false} />
+      <Handle
+        type="target"
+        position={Position.Top}
+        id="in"
+        className="flow-handle"
+        isConnectable={false}
+      />
       <div
         className={`flow-agent-label role-${node.role} status-${node.status} ${node.dimmed ? 'dimmed' : ''}`}
         style={{ opacity: node.dimmed ? 0.28 : node.heat }}
+        title={`${node.title} · ${node.role} · ${node.status}`}
+        aria-label={`${node.title}, ${node.role}, ${node.status}`}
       >
         <span>{node.role.slice(0, 2).toUpperCase()}</span>
         <div>
           <small>{node.role}</small>
-          <strong>{node.title}</strong>
+          <strong title={node.title}>{node.title}</strong>
+          {node.contract && (
+            <span className="flow-agent-meta" title={node.contract}>
+              {node.contract}
+            </span>
+          )}
+          {node.requestContext && (
+            <span className="flow-agent-meta" title={node.requestContext}>
+              {node.requestContext}
+            </span>
+          )}
         </div>
         <i />
       </div>
-      <Handle type="source" position={Position.Bottom} id="out" className="flow-handle" isConnectable={false} />
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        id="out"
+        className="flow-handle"
+        isConnectable={false}
+      />
     </>
   );
 });
@@ -97,36 +151,59 @@ function LinkEdge({
   markerEnd,
   data,
 }: EdgeProps) {
-  const [path] = getBezierPath({
-    sourceX,
-    sourceY,
-    targetX,
-    targetY,
-    sourcePosition,
-    targetPosition,
-  });
   const link = (data ?? {}) as LinkEdgeData;
   const hierarchy = link.kind !== 'signal';
   const pulse = Boolean(link.pulse);
-  const color = link.color ?? (hierarchy ? '#5b7c96' : '#9b8cff');
+  const color = link.color ?? (hierarchy ? '#60758c' : '#7094bf');
+  const [path] = hierarchy
+    ? getSmoothStepPath({
+        sourceX,
+        sourceY,
+        targetX,
+        targetY,
+        sourcePosition,
+        targetPosition,
+        borderRadius: 18,
+        offset: 26,
+      })
+    : getBezierPath({
+        sourceX,
+        sourceY,
+        targetX,
+        targetY,
+        sourcePosition,
+        targetPosition,
+        curvature: 0.32,
+      });
+  const strokeWidth = pulse ? 2.6 : hierarchy ? 1.8 : 1.65;
 
   return (
     <g className={`flow-link-edge kind-${link.kind ?? 'hierarchy'}${pulse ? ' is-live' : ''}`}>
+      <BaseEdge
+        id={`${id}:casing`}
+        path={path}
+        style={{
+          stroke: '#080d13',
+          strokeWidth: strokeWidth + 4,
+          opacity: hierarchy ? 0.72 : 0.86,
+        }}
+        className="flow-link-edge-casing"
+      />
       <BaseEdge
         id={id}
         path={path}
         markerEnd={markerEnd}
         style={{
           stroke: color,
-          strokeWidth: pulse ? 3 : hierarchy ? 2.25 : 2,
-          strokeDasharray: pulse || !hierarchy ? '8 5' : undefined,
-          opacity: 1,
+          strokeWidth,
+          strokeDasharray: hierarchy ? undefined : pulse ? '7 6' : '3 7',
+          opacity: pulse ? 1 : hierarchy ? 0.82 : 0.72,
         }}
         className="flow-link-edge-path"
       />
       {pulse && (
-        <circle r={5} fill={color} className="signal-packet">
-          <animateMotion dur="0.95s" repeatCount="indefinite" path={path} />
+        <circle r={4} fill="#080d13" stroke={color} strokeWidth={2} className="signal-packet">
+          <animateMotion dur="1.15s" repeatCount="indefinite" path={path} />
         </circle>
       )}
     </g>
@@ -203,8 +280,7 @@ function buildGraph(
         (manager.agentId != null &&
           (column.manager.agentId === manager.agentId || column.manager.id === manager.agentId)) ||
         (manager.workstreamId != null && column.manager.workstreamId === manager.workstreamId) ||
-        (agent != null &&
-          (column.manager.agentId === agent.id || column.manager.id === agent.id)),
+        (agent != null && (column.manager.agentId === agent.id || column.manager.id === agent.id)),
     );
     if (existing) {
       existing.manager = {
@@ -227,9 +303,7 @@ function buildGraph(
 
   for (const manager of state.managers) {
     if (manager.id === LEGACY_MANAGER_ID) continue;
-    const agent = manager.agentId
-      ? state.agents[manager.agentId]
-      : state.agents[manager.id];
+    const agent = manager.agentId ? state.agents[manager.agentId] : state.agents[manager.id];
     pushColumn(manager, agent);
   }
 
@@ -280,6 +354,17 @@ function buildGraph(
       status: agent.status,
       dimmed: !inFocus(agent),
       heat: heatOpacity(agent),
+      contract: agent.workContract
+        ? `${agent.workContract.id} · v${agent.workContract.version}`
+        : undefined,
+      requestContext:
+        agent.logicalRequestId || agent.replayCount > 0
+          ? `${agent.logicalRequestId?.slice(-10) ?? 'request'}${
+              agent.replayCount
+                ? ` · ${agent.replayCount} replay${agent.replayCount === 1 ? '' : 's'}`
+                : ''
+            }${agent.account ? ` · ${agent.account}` : ''}`
+          : undefined,
     } satisfies AgentNodeData,
     sourcePosition: Position.Bottom,
     targetPosition: Position.Top,
@@ -288,6 +373,9 @@ function buildGraph(
     }`,
   });
 
+  const showDirectorSlot =
+    !director && (managerColumns.length > 0 || state.fanout.plannedManagers > 0);
+  const directorNodeId = director?.id ?? (showDirectorSlot ? 'director:planned' : undefined);
   if (director) {
     graphNodes.push(
       toNode(director, {
@@ -295,6 +383,25 @@ function buildGraph(
         y: layout === 'radial' ? 140 : 10,
       }),
     );
+  } else if (directorNodeId) {
+    graphNodes.push({
+      id: directorNodeId,
+      type: 'agent',
+      position: {
+        x: width / 2 - 90,
+        y: layout === 'radial' ? 140 : 10,
+      },
+      data: {
+        role: 'director',
+        title: 'Director plan',
+        status: 'queued',
+        dimmed: false,
+        heat: 0.7,
+      } satisfies AgentNodeData,
+      sourcePosition: Position.Bottom,
+      targetPosition: Position.Top,
+      className: 'flow-agent-node',
+    });
   }
 
   const placedChildIds = new Set<string>();
@@ -335,15 +442,15 @@ function buildGraph(
       });
     }
 
-    if (director && parentId) {
+    if (directorNodeId && parentId) {
       graphEdges.push({
-        id: `base:${director.id}:${parentId}`,
-        source: director.id,
+        id: `base:${directorNodeId}:${parentId}`,
+        source: directorNodeId,
         sourceHandle: 'out',
         target: parentId,
         targetHandle: 'in',
         type: 'link',
-        markerEnd: { type: MarkerType.ArrowClosed, color: '#5b7c96', width: 14, height: 14 },
+        markerEnd: { type: MarkerType.ArrowClosed, color: '#60758c', width: 11, height: 11 },
         data: { kind: 'hierarchy' } satisfies LinkEdgeData,
         zIndex: 2,
       });
@@ -382,7 +489,7 @@ function buildGraph(
           target: agent.id,
           targetHandle: 'in',
           type: 'link',
-          markerEnd: { type: MarkerType.ArrowClosed, color: '#5b7c96', width: 14, height: 14 },
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#60758c', width: 11, height: 11 },
           data: { kind: 'hierarchy' } satisfies LinkEdgeData,
           zIndex: 2,
         });
@@ -396,15 +503,15 @@ function buildGraph(
       const x = 40 + (index % 4) * 120;
       const y = (managerColumns.length ? 260 : 130) + Math.floor(index / 4) * 90;
       graphNodes.push(toNode(agent, { x, y }, true));
-      if (director) {
+      if (directorNodeId) {
         graphEdges.push({
-          id: `base:${director.id}:${agent.id}`,
-          source: director.id,
+          id: `base:${directorNodeId}:${agent.id}`,
+          source: directorNodeId,
           sourceHandle: 'out',
           target: agent.id,
           targetHandle: 'in',
           type: 'link',
-          markerEnd: { type: MarkerType.ArrowClosed, color: '#5b7c96', width: 14, height: 14 },
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#60758c', width: 11, height: 11 },
           data: { kind: 'hierarchy' } satisfies LinkEdgeData,
           zIndex: 2,
         });
@@ -444,7 +551,7 @@ function buildGraph(
         signalType: signal.signalType,
       } satisfies LinkEdgeData;
       if (pulse) {
-        existing.markerEnd = { type: MarkerType.ArrowClosed, color, width: 16, height: 16 };
+        existing.markerEnd = { type: MarkerType.ArrowClosed, color, width: 12, height: 12 };
         existing.zIndex = 8;
       }
       continue;
@@ -457,7 +564,7 @@ function buildGraph(
       target: signal.targetAgentId,
       targetHandle: 'in',
       type: 'link',
-      markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
+      markerEnd: { type: MarkerType.ArrowClosed, color, width: 12, height: 12 },
       data: {
         kind: 'signal',
         pulse,
@@ -471,17 +578,28 @@ function buildGraph(
   return {
     nodes: graphNodes,
     edges: graphEdges,
-    structureKey: graphNodes.map((node) => node.id).sort().join('|'),
+    structureKey: graphNodes
+      .map((node) => node.id)
+      .sort()
+      .join('|'),
   };
 }
 
-export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpand }: DagOverviewProps) {
+export function DagOverview({
+  state,
+  onOpenAgent,
+  expanded = false,
+  onToggleExpand,
+}: DagOverviewProps) {
   const [layout, setLayout] = useState<LayoutMode>('tree');
   const [focusManagerId, setFocusManagerId] = useState<string | null>(null);
 
   const layouted = useMemo(
     () => buildGraph(state, layout, focusManagerId),
-    [state, layout, focusManagerId],
+    // Stream-only state changes retain the graph revision, so token and
+    // thinking frames do not reconstruct every React Flow node and edge.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state.graphRevision, layout, focusManagerId],
   );
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
@@ -495,13 +613,15 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
       const pos = new Map(current.map((node) => [node.id, node.position]));
       return layouted.nodes.map((node) => ({
         ...node,
-        position: layoutChanged ? node.position : pos.get(node.id) ?? node.position,
+        position: layoutChanged ? node.position : (pos.get(node.id) ?? node.position),
       }));
     });
     setEdges(layouted.edges);
   }, [layout, layouted, setEdges, setNodes]);
 
-  const leafCount = Object.values(state.agents).filter((agent) => CHILD_ROLES.has(agent.role)).length;
+  const leafCount = Object.values(state.agents).filter((agent) =>
+    CHILD_ROLES.has(agent.role),
+  ).length;
 
   return (
     <section className="dag-overview" aria-label="Agent hierarchy">
@@ -511,14 +631,41 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
           <h2>Director orchestration</h2>
         </div>
         <div className="dag-heading-actions">
-          <div className="layout-toggle" role="group" aria-label="Graph layout">
-            <button type="button" className={layout === 'tree' ? 'active' : ''} onClick={() => setLayout('tree')} title="Tree">
+          <div className="layout-toggle" role="tablist" aria-label="Graph layout">
+            <button
+              type="button"
+              role="tab"
+              className={layout === 'tree' ? 'active' : ''}
+              aria-selected={layout === 'tree'}
+              tabIndex={layout === 'tree' ? 0 : -1}
+              onClick={() => setLayout('tree')}
+              onKeyDown={(event) => moveLayoutFocus(event, 0, setLayout)}
+              title="Tree"
+            >
               <GitBranch size={12} />
             </button>
-            <button type="button" className={layout === 'swimlane' ? 'active' : ''} onClick={() => setLayout('swimlane')} title="Swimlane">
+            <button
+              type="button"
+              role="tab"
+              className={layout === 'swimlane' ? 'active' : ''}
+              aria-selected={layout === 'swimlane'}
+              tabIndex={layout === 'swimlane' ? 0 : -1}
+              onClick={() => setLayout('swimlane')}
+              onKeyDown={(event) => moveLayoutFocus(event, 1, setLayout)}
+              title="Swimlane"
+            >
               <LayoutGrid size={12} />
             </button>
-            <button type="button" className={layout === 'radial' ? 'active' : ''} onClick={() => setLayout('radial')} title="Radial">
+            <button
+              type="button"
+              role="tab"
+              className={layout === 'radial' ? 'active' : ''}
+              aria-selected={layout === 'radial'}
+              tabIndex={layout === 'radial' ? 0 : -1}
+              onClick={() => setLayout('radial')}
+              onKeyDown={(event) => moveLayoutFocus(event, 2, setLayout)}
+              title="Radial"
+            >
               <Waypoints size={12} />
             </button>
           </div>
@@ -528,6 +675,7 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
             onClick={() => setFocusManagerId(null)}
             disabled={!focusManagerId}
             title="Clear manager focus"
+            aria-pressed={focusManagerId != null}
           >
             <Crosshair size={12} /> Clear focus
           </button>
@@ -537,6 +685,8 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
               className={`ghost-chip ${expanded ? 'active' : ''}`}
               onClick={onToggleExpand}
               title={expanded ? 'Exit full graph' : 'Expand graph'}
+              aria-pressed={expanded}
+              aria-expanded={expanded}
             >
               {expanded ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
               {expanded ? 'Exit full' : 'Full graph'}
@@ -544,7 +694,14 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
           )}
           <span className="graph-count">
             <GitBranch size={13} />
-            {state.managers.length} workstreams · {leafCount} leaf · {state.signals.length} signals
+            {state.managers.length} workstreams · {state.fanout.plannedChildren || leafCount}{' '}
+            planned
+            {' · '}
+            {state.fanout.calledAgentIds.length} called
+            {' · '}
+            {state.fanout.requestAttempts} requests
+            {' · '}
+            {state.fanout.replayedRequests} replays
           </span>
         </div>
       </div>
@@ -586,11 +743,11 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
             nodeColor={(node) => {
               const agent = state.agents[node.id];
               const role = agent?.role ?? (node.data as AgentNodeData | undefined)?.role;
-              if (role === 'director') return '#f3ba63';
-              if (role === 'manager') return '#38d7e8';
-              if (role === 'tester' || role === 'reviewer') return '#4ee0a1';
-              if (role === 'worker') return '#718096';
-              return '#243447';
+              if (role === 'director') return '#b98438';
+              if (role === 'manager') return '#4f8bd6';
+              if (role === 'tester' || role === 'reviewer') return '#45a675';
+              if (role === 'worker') return '#7b8ea5';
+              return '#4e6074';
             }}
           />
           <Controls showInteractive={false} />
@@ -604,11 +761,21 @@ export function DagOverview({ state, onOpenAgent, expanded = false, onToggleExpa
         )}
 
         <div className="graph-legend" aria-hidden="true">
-          <span><i className="lg-director" /> Director</span>
-          <span><i className="lg-manager" /> Manager</span>
-          <span><i className="lg-worker" /> Worker</span>
-          <span><i className="lg-tester" /> Tester</span>
-          <span><i className="lg-signal" /> Signal</span>
+          <span>
+            <i className="lg-director" /> Director
+          </span>
+          <span>
+            <i className="lg-manager" /> Manager
+          </span>
+          <span>
+            <i className="lg-worker" /> Worker
+          </span>
+          <span>
+            <i className="lg-tester" /> Tester
+          </span>
+          <span>
+            <i className="lg-signal" /> Signal
+          </span>
         </div>
       </div>
     </section>

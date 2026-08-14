@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-orchestrator-local"
+version = "0.4.0"
+description = "Local-first hierarchical AI orchestration with durable coordination"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+dependencies = [
+  "fastapi",
+  "httpx",
+  "pydantic",
+  "requests>=2.31",
+  "uvicorn[standard]",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build",
+  "cyclonedx-bom",
+  "hypothesis",
+  "mypy",
+  "pip-audit",
+  "pip-tools",
+  "pytest>=7",
+  "ruff",
+  "types-requests",
+]
+
+[project.scripts]
+ai-orchestrator = "orchestrator.cli:main"
+
+[tool.setuptools]
+py-modules = ["server"]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["orchestrator"]
+namespaces = false
+
+[tool.setuptools.package-data]
+orchestrator = [
+  "frontend_dist/*",
+  "frontend_dist/assets/*",
+]
+
+[tool.setuptools.exclude-package-data]
+"*" = [
+  "*.map",
+  "frontend_dist/*.map",
+  "frontend_dist/assets/*.map",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [
+  ".git",
+  ".pytest_cache",
+  "__pycache__",
+  "frontend",
+  "logs",
+  "orchestrator/llm_client2.py",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "SIM"]
+ignore = [
+  "E501",
+  "B008",
+  "B009",
+  "B904",
+  "B905",
+  "SIM102",
+  "SIM105",
+  "SIM108",
+  "SIM117",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = false
+exclude = [
+  "frontend",
+  "logs",
+  "orchestrator/llm_client2.py",
+]

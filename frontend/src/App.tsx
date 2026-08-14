@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
   Activity,
   Bot,
@@ -14,10 +14,13 @@ import {
   Gauge,
   KeyRound,
   Layers3,
+  Maximize2,
   MoreHorizontal,
+  Minimize2,
   Pin,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   Search,
   Settings2,
@@ -30,19 +33,21 @@ import {
 } from 'lucide-react';
 import { api } from './api/client';
 import { CommandPalette, type CommandItem } from './components/CommandPalette';
-import { DagOverview } from './components/DagOverview';
 import { DockWorkspace, type DockWorkspaceHandle } from './components/DockWorkspace';
 import { EventConsole } from './components/EventConsole';
 import { HierarchyPreview } from './components/HierarchyPreview';
 import { InterventionBanner } from './components/InterventionBanner';
 import { PhaseStepper } from './components/PhaseStepper';
+import { TaskDashboard } from './components/TaskDashboard';
 import { ToastStack } from './components/ToastStack';
+import { WorkspaceSplitter } from './components/WorkspaceSplitter';
 import { mockTask } from './data/mockWorkspace';
 import { useWorkspace } from './hooks/useWorkspace';
 import { isActiveStatus, statusTone } from './lib/phases';
 import { loadPrefs, savePrefs, type UiPrefs } from './lib/preferences';
 import { shortTaskTitle, taskProjectKey } from './lib/taskTitle';
 import type {
+  AccountHealth,
   AgentInstance,
   AgentProfile,
   ConfigurableRole,
@@ -52,9 +57,14 @@ import type {
 
 const SETTINGS_KEY = 'orchestrator:workspace-settings:v2';
 const DEFAULT_SETTINGS: WorkspaceSettings = {
+  maxManagers: 4,
   maxParallelManagers: 4,
   maxWorkersPerManager: 5,
+  maxParallelWorkersPerManager: undefined,
   maxParallelWorkers: 8,
+  maxModelCalls: 200,
+  maxWallClockSeconds: 7_200,
+  maxEstimatedInputTokens: 2_000_000,
   mockWhenUnavailable: false,
   roleProfiles: {
     director: { model: 'claude-sonnet-5', effort: 'max' },
@@ -64,30 +74,78 @@ const DEFAULT_SETTINGS: WorkspaceSettings = {
   },
 };
 
+const QUALITY_PRESETS: Array<{
+  id: 'low-cost' | 'balanced' | 'max-quality';
+  label: string;
+  profiles: WorkspaceSettings['roleProfiles'];
+}> = [
+  {
+    id: 'low-cost',
+    label: 'Low cost',
+    profiles: {
+      director: { model: 'claude-sonnet-4-6', effort: 'medium' },
+      manager: { model: 'claude-sonnet-4-6', effort: 'medium' },
+      worker: { model: 'claude-sonnet-4-6', effort: 'low' },
+      tester: { model: 'claude-sonnet-4-6', effort: 'medium' },
+    },
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    profiles: {
+      director: { model: 'claude-sonnet-5', effort: 'high' },
+      manager: { model: 'claude-sonnet-5', effort: 'high' },
+      worker: { model: 'claude-sonnet-5', effort: 'medium' },
+      tester: { model: 'claude-sonnet-5', effort: 'high' },
+    },
+  },
+  {
+    id: 'max-quality',
+    label: 'Max quality',
+    profiles: DEFAULT_SETTINGS.roleProfiles,
+  },
+];
+
 const TEMPLATES = [
   {
     id: 'bugfix',
     label: 'Bugfix',
     name: 'Bugfix',
     goal: 'Investigate and fix the reported bug. Keep the change minimal, add or update tests, and verify the failing case passes.',
+    managers: 2,
+    workersPerManager: 4,
+    testCmd: 'python -m pytest -q',
+    projectMode: 'edit',
   },
   {
     id: 'feature',
     label: 'Feature slice',
     name: 'Feature slice',
     goal: 'Implement one vertical feature slice end-to-end with clear module boundaries, tests, and a short summary of files touched.',
+    managers: 4,
+    workersPerManager: 5,
+    testCmd: 'python -m pytest -q',
+    projectMode: 'edit',
   },
   {
     id: 'refactor',
     label: 'Refactor + tests',
     name: 'Refactor + tests',
     goal: 'Refactor the targeted area for clarity and safety without behavior changes. Strengthen unit/integration coverage around the risk surface.',
+    managers: 3,
+    workersPerManager: 4,
+    testCmd: 'python -m pytest -q',
+    projectMode: 'edit',
   },
   {
     id: 'greenfield',
     label: 'Greenfield',
     name: 'Greenfield scaffold',
     goal: 'Scaffold a new project structure with baseline config, entrypoints, and a first passing test harness.',
+    managers: 4,
+    workersPerManager: 5,
+    testCmd: 'python -m pytest -q',
+    projectMode: 'new_project',
   },
 ] as const;
 
@@ -95,10 +153,27 @@ type Toast = { id: string; message: string; tone?: 'info' | 'success' | 'error' 
 
 const loadSettings = (): WorkspaceSettings => {
   try {
-    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') as Partial<WorkspaceSettings>;
+    const stored = JSON.parse(
+      localStorage.getItem(SETTINGS_KEY) ?? '{}',
+    ) as Partial<WorkspaceSettings>;
+    const maxManagers =
+      stored.maxManagers ?? stored.maxParallelManagers ?? DEFAULT_SETTINGS.maxManagers;
+    const maxWorkersPerManager =
+      stored.maxWorkersPerManager ?? DEFAULT_SETTINGS.maxWorkersPerManager;
+    const perManagerSlots = stored.maxParallelWorkersPerManager;
     return {
       ...DEFAULT_SETTINGS,
       ...stored,
+      maxManagers,
+      maxParallelManagers: Math.min(
+        maxManagers,
+        stored.maxParallelManagers ?? DEFAULT_SETTINGS.maxParallelManagers,
+      ),
+      maxWorkersPerManager,
+      maxParallelWorkersPerManager:
+        perManagerSlots == null
+          ? undefined
+          : Math.min(Math.max(1, maxWorkersPerManager - 1), perManagerSlots),
       roleProfiles: {
         ...DEFAULT_SETTINGS.roleProfiles,
         ...(stored.roleProfiles ?? {}),
@@ -135,12 +210,27 @@ const formatElapsed = (startedAt?: string | null, finishedAt?: string | null, no
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 };
 
+const sentenceStatus = (value: string) => {
+  const normalized = value.replaceAll('_', ' ').trim().toLowerCase();
+  return normalized ? normalized[0].toUpperCase() + normalized.slice(1) : 'Unknown';
+};
+
 const matchesRailFilter = (task: TaskSummary, filter: UiPrefs['railFilter']) => {
   const status = task.status.toUpperCase();
   if (filter === 'all') return true;
   if (filter === 'active') return isActiveStatus(status);
   if (filter === 'failed') return status === 'FAILED' || status === 'ERROR';
   return ['COMPLETED', 'DONE', 'STOPPED', 'CANCELLED'].includes(status);
+};
+
+const routedTaskId = () => {
+  const value = new URLSearchParams(window.location.hash.slice(1)).get('task');
+  return value?.trim() || undefined;
+};
+
+type ConfirmationRequest = {
+  kind: 'stop' | 'delete';
+  task: TaskSummary;
 };
 
 export default function App() {
@@ -158,66 +248,102 @@ export default function App() {
   const [menuTaskId, setMenuTaskId] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [accountHealth, setAccountHealth] = useState<AccountHealth[]>([]);
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest>();
   const [graphExpanded, setGraphExpanded] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const dockRef = useRef<DockWorkspaceHandle>(null);
+  const appShellRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const { state, dispatch } = useWorkspace(selectedTask);
+  const taskStatusRef = useRef<Map<string, string>>(new Map());
+  const taskRequestRef = useRef<AbortController | null>(null);
+  const { state, dispatch, approvals, markApprovalDecision } = useWorkspace(selectedTask);
+  const selectedTaskId = selectedTask?.id;
+  const selectedQualityPreset = QUALITY_PRESETS.find(({ profiles }) =>
+    (Object.keys(profiles) as ConfigurableRole[]).every(
+      (role) =>
+        profiles[role].model === settings.roleProfiles[role].model &&
+        profiles[role].effort === settings.roleProfiles[role].effort,
+    ),
+  )?.id;
 
   const pushToast = useCallback((message: string, tone: Toast['tone'] = 'info') => {
     const id = `${Date.now()}:${Math.random().toString(16).slice(2)}`;
     setToasts((current) => [...current.slice(-4), { id, message, tone }]);
   }, []);
+  const selectTask = useCallback((task: TaskSummary, pushHistory = true) => {
+    setSelectedTask(task);
+    const nextHash = `#task=${encodeURIComponent(task.id)}`;
+    if (window.location.hash === nextHash) return;
+    if (pushHistory) window.history.pushState(null, '', nextHash);
+    else window.history.replaceState(null, '', nextHash);
+  }, []);
 
   const handleFocusAgent = useCallback(
     (agentId: string) => dispatch({ type: 'focus-agent', agentId }),
-    [],
+    [dispatch],
   );
   const handleConfigureAgent = useCallback(
     async (agentId: string, model: string, effort: string) => {
-      if (!selectedTask) throw new Error('No active task.');
-      await api.updateAgentConfig(selectedTask.id, agentId, model, effort);
+      if (!selectedTaskId) throw new Error('No active task.');
+      await api.updateAgentConfig(selectedTaskId, agentId, model, effort);
       dispatch({ type: 'agent-configured', agentId, model, effort });
       pushToast('Agent override saved for next call', 'success');
     },
-    [pushToast, selectedTask?.id],
+    [dispatch, pushToast, selectedTaskId],
   );
 
   const updatePrefs = useCallback((partial: Partial<UiPrefs>) => {
     setPrefs(savePrefs(partial));
   }, []);
 
-  const refreshTasks = useCallback(async (preserveSelection = true) => {
-    try {
-      const next = await api.listTasks();
-      setOffline(false);
-      setTasks(next);
-      setSelectedTask((current) => {
-        if (preserveSelection && current) {
-          return next.find((task) => task.id === current.id);
+  const refreshTasks = useCallback(
+    async (preserveSelection = true) => {
+      taskRequestRef.current?.abort();
+      const controller = new AbortController();
+      taskRequestRef.current = controller;
+      try {
+        const next = await api.listTasks(controller.signal);
+        if (controller.signal.aborted) return;
+        setOffline(false);
+        setTasks(next);
+        setSelectedTask((current) => {
+          if (preserveSelection && current) {
+            const preserved = next.find((task) => task.id === current.id);
+            if (preserved) return preserved;
+          }
+          const routeId = routedTaskId();
+          if (routeId) {
+            const routed = next.find((task) => task.id === routeId);
+            if (routed) return routed;
+          }
+          return next[0];
+        });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setOffline(true);
+        if (!preserveSelection) {
+          pushToast(
+            error instanceof Error ? error.message : 'The orchestrator API is unavailable.',
+            'error',
+          );
         }
-        return next[0];
-      });
-    } catch (error) {
-      setOffline(true);
-      if (!preserveSelection) {
-        pushToast(
-          error instanceof Error ? error.message : 'The orchestrator API is unavailable.',
-          'error',
-        );
+        if (settings.mockWhenUnavailable) {
+          setTasks([mockTask]);
+          setSelectedTask((current) => current ?? mockTask);
+        } else {
+          setTasks([]);
+          setSelectedTask((current) => (current?.id === mockTask.id ? undefined : current));
+        }
+      } finally {
+        if (taskRequestRef.current === controller) {
+          taskRequestRef.current = null;
+          setLoading(false);
+        }
       }
-      if (settings.mockWhenUnavailable) {
-        setTasks([mockTask]);
-        setSelectedTask((current) => current ?? mockTask);
-      } else {
-        setTasks([]);
-        setSelectedTask((current) =>
-          current?.id === mockTask.id ? undefined : current,
-        );
-      }
-    } finally {
-      setLoading(false);
-    }
-  }, [pushToast, settings.mockWhenUnavailable]);
+    },
+    [pushToast, settings.mockWhenUnavailable],
+  );
 
   useEffect(() => {
     if (!toasts.length) return undefined;
@@ -227,23 +353,111 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toasts]);
 
+  useEffect(
+    () => () => {
+      const request = taskRequestRef.current;
+      taskRequestRef.current = null;
+      request?.abort();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const previous = taskStatusRef.current;
+    if (!previous.size) {
+      taskStatusRef.current = new Map(tasks.map((task) => [task.id, task.status.toUpperCase()]));
+      return;
+    }
+    for (const task of tasks) {
+      const status = task.status.toUpperCase();
+      const before = previous.get(task.id);
+      if (before && before !== status) {
+        if (status === 'WAITING_INPUT') {
+          pushToast(`${shortTaskTitle(task)} needs your input`, 'info');
+        } else if (['FAILED', 'ERROR'].includes(status)) {
+          pushToast(`${shortTaskTitle(task)} failed`, 'error');
+        } else if (['COMPLETED', 'DONE'].includes(status)) {
+          pushToast(`${shortTaskTitle(task)} completed`, 'success');
+        }
+      }
+      previous.set(task.id, status);
+    }
+  }, [pushToast, tasks]);
+
   useEffect(() => {
     void refreshTasks(false);
-    const timer = window.setInterval(() => void refreshTasks(true), 12_000);
-    return () => window.clearInterval(timer);
   }, [refreshTasks]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const schedule = () => {
+      if (timer) window.clearInterval(timer);
+      timer = undefined;
+      if (document.visibilityState === 'hidden') return;
+      const hasActiveTask = tasks.some((task) => isActiveStatus(task.status));
+      timer = window.setInterval(() => void refreshTasks(true), hasActiveTask ? 8_000 : 30_000);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') void refreshTasks(true);
+      schedule();
+    };
+    schedule();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      if (timer) window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [refreshTasks, tasks]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }, [settings]);
 
   useEffect(() => {
+    const syncRoute = () => {
+      const routeId = routedTaskId();
+      if (!routeId) return;
+      const routed = tasks.find((task) => task.id === routeId);
+      if (routed) setSelectedTask(routed);
+    };
+    window.addEventListener('hashchange', syncRoute);
+    window.addEventListener('popstate', syncRoute);
+    return () => {
+      window.removeEventListener('hashchange', syncRoute);
+      window.removeEventListener('popstate', syncRoute);
+    };
+  }, [tasks]);
+
+  useEffect(() => {
+    if (!selectedTaskId || window.location.hash) return;
+    window.history.replaceState(null, '', `#task=${encodeURIComponent(selectedTaskId)}`);
+  }, [selectedTaskId]);
+
+  useEffect(() => {
+    const syncFullscreen = () => setFullscreen(document.fullscreenElement != null);
+    document.addEventListener('fullscreenchange', syncFullscreen);
+    return () => document.removeEventListener('fullscreenchange', syncFullscreen);
+  }, []);
+
+  useEffect(() => {
     if (!settingsOpen) return undefined;
+    const controller = new AbortController();
+    void api
+      .listAccountHealth(controller.signal)
+      .then((items) => {
+        if (!controller.signal.aborted) setAccountHealth(items);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setAccountHealth([]);
+      });
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') setSettingsOpen(false);
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      controller.abort();
+      window.removeEventListener('keydown', onKeyDown);
+    };
   }, [settingsOpen]);
 
   useEffect(() => {
@@ -269,17 +483,33 @@ export default function App() {
     dockRef.current?.openAgent(agent);
   }, []);
 
+  const toggleFullscreen = useCallback(async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else if (appShellRef.current?.requestFullscreen) {
+        await appShellRef.current.requestFullscreen();
+      }
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : 'Fullscreen is unavailable.', 'error');
+    }
+  }, [pushToast]);
+
   const displayedTask = state.task ?? selectedTask;
   const realAgents = Object.values(state.agents).filter(
     (agent) => !agent.id.endsWith(':root') && !agent.id.endsWith(':anon'),
   );
-  const runningAgents = realAgents.filter(
-    (agent) => agent.status === 'running' || agent.status === 'waiting',
-  ).length;
+  const runningAgents = realAgents.filter((agent) => agent.status === 'running').length;
+  const waitingAgents = realAgents.filter((agent) => agent.status === 'waiting').length;
   const agentCount = realAgents.length;
+  const plannedChildren =
+    state.fanout.plannedChildren ||
+    realAgents.filter((agent) => ['worker', 'tester', 'reviewer'].includes(agent.role)).length;
+  const calledChildren = state.fanout.calledAgentIds.length;
   const changedFiles = Object.keys(displayedTask?.changed_files ?? {}).length;
   const taskIsActive = displayedTask ? isActiveStatus(displayedTask.status) : false;
   const waitingInput = displayedTask?.status?.toUpperCase() === 'WAITING_INPUT';
+  const pendingApproval = approvals.find((approval) => approval.status === 'pending');
   const accountsUsed = useMemo(() => {
     const accounts = new Set(state.usedAccounts);
     for (const agent of Object.values(state.agents)) {
@@ -330,45 +560,55 @@ export default function App() {
     return [...groups.entries()];
   }, [filteredTasks]);
 
-  const runTaskAction = async (task: TaskSummary) => {
-    if (busyAction || task.id === mockTask.id) return;
-    if (isActiveStatus(task.status)) {
-      if (!window.confirm(`Stop task "${shortTaskTitle(task)}"? Agents will halt after the current step.`)) {
+  const runTaskAction = useCallback(
+    async (task: TaskSummary, confirmed = false) => {
+      if (busyAction || task.id === mockTask.id) return;
+      if (isActiveStatus(task.status) && !confirmed) {
+        setConfirmation({ kind: 'stop', task });
         return;
       }
-    }
-    setBusyAction(true);
-    setMenuTaskId(null);
-    try {
-      if (isActiveStatus(task.status)) {
-        await api.stopTask(task.id);
-        pushToast('Stop requested', 'info');
-      } else {
-        await api.resumeTask(task.id);
-        pushToast('Resume requested', 'success');
+      setBusyAction(true);
+      setMenuTaskId(null);
+      try {
+        if (isActiveStatus(task.status)) {
+          await api.stopTask(task.id);
+          pushToast('Stop requested', 'info');
+        } else {
+          await api.resumeTask(task.id);
+          pushToast('Resume requested', 'success');
+        }
+        await refreshTasks(true);
+      } catch (error) {
+        pushToast(error instanceof Error ? error.message : 'Action failed', 'error');
+      } finally {
+        setBusyAction(false);
       }
-      await refreshTasks(true);
-    } catch (error) {
-      pushToast(error instanceof Error ? error.message : 'Action failed', 'error');
-    } finally {
-      setBusyAction(false);
-    }
-  };
+    },
+    [busyAction, pushToast, refreshTasks],
+  );
 
-  const deleteTask = async (task: TaskSummary) => {
+  const deleteTask = async (task: TaskSummary, confirmed = false) => {
     if (busyAction || task.id === mockTask.id) return;
     if (isActiveStatus(task.status)) {
       pushToast('Stop the task before deleting', 'error');
       return;
     }
-    const label = shortTaskTitle(task);
-    const typed = window.prompt(`Type DELETE to permanently remove "${label}"`);
-    if (typed !== 'DELETE') return;
+    if (!confirmed) {
+      setConfirmation({ kind: 'delete', task });
+      return;
+    }
     setBusyAction(true);
     setMenuTaskId(null);
     try {
       await api.deleteTask(task.id);
-      if (selectedTask?.id === task.id) setSelectedTask(undefined);
+      if (selectedTask?.id === task.id) {
+        setSelectedTask(undefined);
+        window.history.replaceState(
+          null,
+          '',
+          `${window.location.pathname}${window.location.search}`,
+        );
+      }
       updatePrefs({ pinnedTaskIds: prefs.pinnedTaskIds.filter((id) => id !== task.id) });
       pushToast('Task deleted', 'success');
       await refreshTasks(false);
@@ -385,7 +625,24 @@ export default function App() {
       await navigator.clipboard.writeText(taskId);
       pushToast('Task ID copied', 'success');
     } catch {
-      window.prompt('Copy task ID', taskId);
+      pushToast(`Copy unavailable. Task ID: ${taskId}`, 'error');
+    }
+  };
+
+  const decideApproval = async (decision: 'approved' | 'rejected') => {
+    if (!displayedTask || !pendingApproval || busyAction) return;
+    setBusyAction(true);
+    try {
+      await api.decideApproval(displayedTask.id, pendingApproval.approvalId, decision);
+      markApprovalDecision(pendingApproval.approvalId, decision);
+      pushToast(
+        decision === 'approved' ? 'Action approved' : 'Action rejected',
+        decision === 'approved' ? 'success' : 'info',
+      );
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : 'Approval decision failed', 'error');
+    } finally {
+      setBusyAction(false);
     }
   };
 
@@ -396,11 +653,11 @@ export default function App() {
     updatePrefs({ pinnedTaskIds: pinned });
   };
 
-  const focusDirector = () => {
+  const focusDirector = useCallback(() => {
     if (!state.directorId) return;
     const director = state.agents[state.directorId];
     if (director) openAgent(director);
-  };
+  }, [openAgent, state.agents, state.directorId]);
 
   const commands: CommandItem[] = useMemo(() => {
     const agentCommands = Object.values(state.agents)
@@ -450,6 +707,11 @@ export default function App() {
         run: () => updatePrefs({ consoleOpen: !prefs.consoleOpen }),
       },
       {
+        id: 'fullscreen',
+        label: fullscreen ? 'Exit fullscreen' : 'Enter fullscreen',
+        run: () => void toggleFullscreen(),
+      },
+      {
         id: 'settings',
         label: 'Open settings',
         run: () => setSettingsOpen(true),
@@ -465,13 +727,16 @@ export default function App() {
   }, [
     displayedTask,
     focusDirector,
+    fullscreen,
     openAgent,
     prefs.consoleOpen,
     prefs.density,
     refreshTasks,
+    runTaskAction,
     state.agents,
     state.directorId,
     taskIsActive,
+    toggleFullscreen,
     updatePrefs,
   ]);
 
@@ -487,6 +752,16 @@ export default function App() {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         setPaletteOpen(true);
+        return;
+      }
+      if (event.key === 'F11') {
+        event.preventDefault();
+        void toggleFullscreen();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        void toggleFullscreen();
         return;
       }
       if (typing || paletteOpen) return;
@@ -506,19 +781,46 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [displayedTask, openAgent, paletteOpen, state.agents, taskIsActive]);
+  }, [
+    displayedTask,
+    openAgent,
+    paletteOpen,
+    runTaskAction,
+    state.agents,
+    taskIsActive,
+    toggleFullscreen,
+  ]);
 
   const profileSummary = `${settings.roleProfiles.worker.model.split('-').slice(-1)[0]}·${settings.roleProfiles.worker.effort}`;
 
   return (
     <div
-      className={`app-shell density-${prefs.density} ${railCollapsed ? 'rail-collapsed' : ''} ${prefs.consoleOpen ? 'console-open' : ''}`}
+      ref={appShellRef}
+      className={`app-shell density-${prefs.density} ${railCollapsed ? 'rail-collapsed' : ''} ${prefs.consoleOpen ? 'console-open' : ''} ${prefs.consoleCollapsed ? 'console-collapsed' : ''}`}
+      style={
+        {
+          '--console-height': `${prefs.consoleHeight}px`,
+          '--workspace-split-percent': `${prefs.workspaceSplitPercent}%`,
+        } as CSSProperties
+      }
     >
-      <aside className="task-rail">
+      <aside className="task-rail" id="task-rail">
         <div className="brand">
-          <div className="brand-mark"><Command size={17} /></div>
-          <div><strong>ORCHESTRATOR</strong><span>MISSION CONTROL</span></div>
-          <button type="button" onClick={() => setRailCollapsed((value) => !value)}>
+          <div className="brand-mark">
+            <Command size={17} />
+          </div>
+          <div>
+            <strong>Orchestrator</strong>
+            <span>Task workspace</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRailCollapsed((value) => !value)}
+            title={railCollapsed ? 'Expand task rail' : 'Collapse task rail'}
+            aria-label={railCollapsed ? 'Expand task rail' : 'Collapse task rail'}
+            aria-controls="task-rail"
+            aria-expanded={!railCollapsed}
+          >
             {railCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
           </button>
         </div>
@@ -531,25 +833,51 @@ export default function App() {
             onChange={(event) => setSearch(event.target.value)}
             placeholder="Filter tasks…"
           />
-          <button type="button" className="rail-kbtn" onClick={() => setPaletteOpen(true)} title="Command palette">
+          <button
+            type="button"
+            className="rail-kbtn"
+            onClick={() => setPaletteOpen(true)}
+            title="Command palette"
+            aria-label="Open command palette"
+          >
             ⌘K
           </button>
         </div>
 
         <div className="rail-filters" role="tablist" aria-label="Task filters">
-          {([
-            ['all', 'All'],
-            ['active', 'Active'],
-            ['failed', 'Failed'],
-            ['done', 'Done'],
-          ] as const).map(([id, label]) => (
+          {(
+            [
+              ['all', 'All'],
+              ['active', 'Active'],
+              ['failed', 'Failed'],
+              ['done', 'Done'],
+            ] as const
+          ).map(([id, label], index, filters) => (
             <button
               key={id}
               type="button"
               role="tab"
               aria-selected={prefs.railFilter === id}
+              aria-controls="task-list"
+              tabIndex={prefs.railFilter === id ? 0 : -1}
               className={prefs.railFilter === id ? 'active' : ''}
               onClick={() => updatePrefs({ railFilter: id })}
+              onKeyDown={(event) => {
+                let nextIndex: number | undefined;
+                if (event.key === 'ArrowRight') nextIndex = (index + 1) % filters.length;
+                else if (event.key === 'ArrowLeft')
+                  nextIndex = (index - 1 + filters.length) % filters.length;
+                else if (event.key === 'Home') nextIndex = 0;
+                else if (event.key === 'End') nextIndex = filters.length - 1;
+                if (nextIndex == null) return;
+                event.preventDefault();
+                updatePrefs({ railFilter: filters[nextIndex][0] });
+                const tabs =
+                  event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                    '[role="tab"]',
+                  );
+                tabs?.[nextIndex]?.focus();
+              }}
             >
               {label}
             </button>
@@ -559,19 +887,31 @@ export default function App() {
         <div className="rail-label">
           <span>Tasks</span>
           <div>
-            <button type="button" onClick={() => setCreateOpen(true)} title="New hierarchy task">
+            <button
+              type="button"
+              onClick={() => setCreateOpen(true)}
+              title="New hierarchy task"
+              aria-label="New hierarchy task"
+            >
               <Plus size={12} />
             </button>
-            <button type="button" onClick={() => void refreshTasks(true)} title="Refresh tasks">
+            <button
+              type="button"
+              onClick={() => void refreshTasks(true)}
+              title="Refresh tasks"
+              aria-label="Refresh tasks"
+            >
               <RefreshCw size={12} />
             </button>
           </div>
         </div>
 
-        <div className="task-list">
+        <div className="task-list" id="task-list" role="tabpanel">
           {groupedTasks.map(([project, projectTasks]) => (
             <div className="task-group" key={project}>
-              <div className="task-group-label">{project}</div>
+              <div className="task-group-label" title={project}>
+                {project}
+              </div>
               {projectTasks.map((task) => {
                 const active = isActiveStatus(task.status);
                 const menuOpen = menuTaskId === task.id;
@@ -585,7 +925,10 @@ export default function App() {
                     <button
                       className="task-card-main"
                       type="button"
-                      onClick={() => setSelectedTask(task)}
+                      onClick={() => selectTask(task)}
+                      title={`${task.name} · ${sentenceStatus(task.status)}`}
+                      aria-label={`Open ${task.name}, ${sentenceStatus(task.status)}`}
+                      aria-pressed={task.id === selectedTask?.id}
                     >
                       <span className={`task-status-strip tone-${tone}`} />
                       <span className={`task-icon role-worker`}>
@@ -594,7 +937,7 @@ export default function App() {
                       <span className="task-card-copy">
                         <strong title={task.name}>{shortTaskTitle(task)}</strong>
                         <small>
-                          {task.status}
+                          {sentenceStatus(task.status)}
                           {task.turn_count != null ? ` · t${task.turn_count}` : ''}
                           {' · '}
                           {relativeTime(task.updated_at)}
@@ -616,22 +959,42 @@ export default function App() {
                       </button>
                       {menuOpen && (
                         <div className="task-menu" role="menu">
-                          <button type="button" role="menuitem" onClick={() => { setMenuTaskId(null); setSelectedTask(task); }}>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setMenuTaskId(null);
+                              selectTask(task);
+                            }}
+                          >
                             <FolderOpen size={13} /> Open task
                           </button>
-                          <button type="button" role="menuitem" onClick={() => { setMenuTaskId(null); togglePin(task.id); }}>
+                          <button
+                            type="button"
+                            role="menuitemcheckbox"
+                            aria-checked={pinned}
+                            onClick={() => {
+                              setMenuTaskId(null);
+                              togglePin(task.id);
+                            }}
+                          >
                             <Pin size={13} /> {pinned ? 'Unpin' : 'Pin'} task
                           </button>
                           <button
                             type="button"
                             role="menuitem"
+                            className={active ? 'danger' : undefined}
                             disabled={busyAction || task.id === mockTask.id}
                             onClick={() => void runTaskAction(task)}
                           >
                             {active ? <CircleStop size={13} /> : <Play size={13} />}
                             {active ? 'Stop task' : 'Resume task'}
                           </button>
-                          <button type="button" role="menuitem" onClick={() => void copyTaskId(task.id)}>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => void copyTaskId(task.id)}
+                          >
                             <Copy size={13} /> Copy task ID
                           </button>
                           <div className="task-menu-sep" />
@@ -669,7 +1032,12 @@ export default function App() {
             {offline ? <CloudOff size={13} /> : <Activity size={13} />}
             <span>{offline ? 'Offline' : 'Backend online'}</span>
           </div>
-          <button type="button" onClick={() => setSettingsOpen(true)} title="Workspace settings">
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true)}
+            title="Workspace settings"
+            aria-label="Workspace settings"
+          >
             <Settings2 size={15} />
           </button>
         </div>
@@ -680,19 +1048,21 @@ export default function App() {
           <>
             <header className="task-header">
               <div className="task-breadcrumb">
-                <span><FolderGit2 size={13} /> {taskProjectKey(displayedTask.root)}</span>
+                <span title={displayedTask.root}>
+                  <FolderGit2 size={13} /> {taskProjectKey(displayedTask.root)}
+                </span>
                 <i>/</i>
-                <strong>{shortTaskTitle(displayedTask)}</strong>
+                <strong title={displayedTask.name}>{shortTaskTitle(displayedTask)}</strong>
                 {displayedTask.phase && (
                   <>
                     <i>/</i>
-                    <em>{displayedTask.phase}</em>
+                    <em title={displayedTask.phase}>{displayedTask.phase}</em>
                   </>
                 )}
                 {displayedTask.current_agent && (
                   <>
                     <i>/</i>
-                    <em>{displayedTask.current_agent}</em>
+                    <em title={displayedTask.current_agent}>{displayedTask.current_agent}</em>
                   </>
                 )}
               </div>
@@ -700,30 +1070,69 @@ export default function App() {
                 <div>
                   <div className="title-kicker">
                     <span className={`pulse-dot ${state.connection}`} />
-                    {state.connection === 'live' ? 'LIVE' : displayedTask.status}
-                    <span className="live-pill">
-                      {runningAgents} agents · {state.signals.length} signals
+                    {state.connection === 'live' ? 'Live' : sentenceStatus(displayedTask.status)}
+                    <span
+                      className="live-pill"
+                      title={`${runningAgents} running, ${waitingAgents} waiting, ${calledChildren} of ${plannedChildren || 'unknown'} selected child agents called`}
+                    >
+                      {runningAgents} running · {waitingAgents} waiting · {calledChildren} of{' '}
+                      {plannedChildren || '—'} selected child agents called
                     </span>
-                    <span className="task-id">#{displayedTask.id.slice(0, 8)}</span>
-                    <span className="profile-pill">{profileSummary}</span>
+                    <span className="task-id" title={displayedTask.id}>
+                      #{displayedTask.id.slice(0, 8)}
+                    </span>
+                    <span className="profile-pill" title={profileSummary}>
+                      {profileSummary}
+                    </span>
                   </div>
                   <h1 title={displayedTask.name}>{shortTaskTitle(displayedTask)}</h1>
                   <p>{displayedTask.prompt || displayedTask.name}</p>
                 </div>
                 <div className="task-header-actions">
-                  <button type="button" className="ghost-button" onClick={() => setPaletteOpen(true)}>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => void toggleFullscreen()}
+                    title="Toggle fullscreen (F11)"
+                    aria-pressed={fullscreen}
+                  >
+                    {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                    {fullscreen ? 'Restore' : 'Fullscreen'}
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setPaletteOpen(true)}
+                    title="Open command palette"
+                  >
                     <Command size={14} /> Commands
                   </button>
                   <button
                     type="button"
                     className="ghost-button"
                     onClick={() => updatePrefs({ consoleOpen: !prefs.consoleOpen })}
+                    aria-pressed={prefs.consoleOpen}
+                    title={prefs.consoleOpen ? 'Hide event console' : 'Show event console'}
                   >
                     <Terminal size={14} /> Console
                   </button>
-                  <button type="button" className="ghost-button" onClick={() => setSettingsOpen(true)}>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setSettingsOpen(true)}
+                    title="Open runtime limits"
+                  >
                     <SlidersHorizontal size={14} /> Limits
                   </button>
+                  {displayedTask.artifact?.zip_path && (
+                    <a
+                      className="ghost-button"
+                      href={`/api/tasks/${encodeURIComponent(displayedTask.id)}/artifacts/download`}
+                      download
+                    >
+                      <FolderOpen size={14} /> Artifacts
+                    </a>
+                  )}
                   <button
                     type="button"
                     className="danger-button"
@@ -734,42 +1143,130 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    className={`primary-button ${taskIsActive ? 'stop' : ''}`}
+                    className={taskIsActive ? 'danger-button' : 'primary-button'}
                     onClick={() => void runTaskAction(displayedTask)}
                     disabled={busyAction || displayedTask.id === mockTask.id}
                   >
-                    {taskIsActive
-                      ? <><CircleStop size={14} /> Stop</>
-                      : <><Play size={14} /> Resume</>}
+                    {taskIsActive ? (
+                      <>
+                        <CircleStop size={14} /> Stop
+                      </>
+                    ) : (
+                      <>
+                        <Play size={14} /> Resume
+                      </>
+                    )}
                   </button>
                 </div>
               </div>
               <PhaseStepper status={displayedTask.status} />
               <div className="task-metrics">
-                <div><Bot size={14} /><span>Agents</span><strong>{agentCount}</strong></div>
-                <div><Sparkles size={14} /><span>Running</span><strong>{runningAgents}</strong></div>
-                <div><Gauge size={14} /><span>Events</span><strong>{state.eventCount}</strong></div>
-                <div><FolderGit2 size={14} /><span>Files</span><strong>{changedFiles}</strong></div>
-                <div><Timer size={14} /><span>Time</span><strong>{totalElapsed}</strong></div>
-                <div><KeyRound size={14} /><span>Accounts</span><strong>{accountsUsed}</strong></div>
+                <div>
+                  <Bot size={14} />
+                  <span>Graph nodes</span>
+                  <strong>{agentCount}</strong>
+                </div>
+                <div>
+                  <Layers3 size={14} />
+                  <span>Selected child agents</span>
+                  <strong>{plannedChildren || '—'}</strong>
+                </div>
+                <div>
+                  <Radio size={14} />
+                  <span>Called child agents</span>
+                  <strong>{calledChildren}</strong>
+                </div>
+                <div>
+                  <Gauge size={14} />
+                  <span>Model requests</span>
+                  <strong>{state.fanout.requestAttempts}</strong>
+                </div>
+                <div>
+                  <RefreshCw size={14} />
+                  <span>Request replays</span>
+                  <strong>{state.fanout.replayedRequests}</strong>
+                </div>
+                <div>
+                  <KeyRound size={14} />
+                  <span>Account switches</span>
+                  <strong>{state.fanout.accountSwitches}</strong>
+                </div>
+                <div>
+                  <Sparkles size={14} />
+                  <span>Running</span>
+                  <strong>{runningAgents}</strong>
+                </div>
+                <div>
+                  <Gauge size={14} />
+                  <span>Events</span>
+                  <strong>{state.eventCount}</strong>
+                </div>
+                <div>
+                  <FolderGit2 size={14} />
+                  <span>Files</span>
+                  <strong>{changedFiles}</strong>
+                </div>
+                <div>
+                  <Timer size={14} />
+                  <span>Time</span>
+                  <strong>{totalElapsed}</strong>
+                </div>
+                <div>
+                  <KeyRound size={14} />
+                  <span>Accounts</span>
+                  <strong>{accountsUsed}</strong>
+                </div>
               </div>
             </header>
 
             <InterventionBanner
-              visible={waitingInput}
-              message="Director is waiting for human input before continuing."
+              visible={waitingInput || pendingApproval != null}
+              message={
+                pendingApproval
+                  ? `${pendingApproval.reason} Target: ${pendingApproval.target}`
+                  : 'Director is waiting for human input before continuing.'
+              }
               onFocus={() => {
                 updatePrefs({ consoleOpen: true });
                 focusDirector();
               }}
             />
+            {pendingApproval && (
+              <div className="approval-actions" role="group" aria-label="Approval decision">
+                <span>
+                  {pendingApproval.kind.replaceAll('_', ' ')}
+                  {pendingApproval.workstreamId ? ` · ${pendingApproval.workstreamId}` : ''}
+                </span>
+                <button
+                  type="button"
+                  className="danger-button"
+                  disabled={busyAction}
+                  onClick={() => void decideApproval('rejected')}
+                >
+                  Reject
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={busyAction}
+                  onClick={() => void decideApproval('approved')}
+                >
+                  Approve
+                </button>
+              </div>
+            )}
 
             <div className={`workspace-content${graphExpanded ? ' graph-expanded' : ''}`}>
-              <DagOverview
+              <TaskDashboard
                 state={state}
+                task={displayedTask}
                 onOpenAgent={openAgent}
-                expanded={graphExpanded}
-                onToggleExpand={() => setGraphExpanded((value) => !value)}
+                graphExpanded={graphExpanded}
+                onToggleGraph={() => setGraphExpanded((value) => !value)}
+              />
+              <WorkspaceSplitter
+                value={prefs.workspaceSplitPercent}
+                onChange={(workspaceSplitPercent) => updatePrefs({ workspaceSplitPercent })}
               />
               <DockWorkspace
                 ref={dockRef}
@@ -783,6 +1280,10 @@ export default function App() {
               state={state}
               open={prefs.consoleOpen}
               onClose={() => updatePrefs({ consoleOpen: false })}
+              collapsed={prefs.consoleCollapsed}
+              height={prefs.consoleHeight}
+              onToggleCollapsed={() => updatePrefs({ consoleCollapsed: !prefs.consoleCollapsed })}
+              onResize={(height) => updatePrefs({ consoleHeight: height })}
               onOpenAgent={(id) => {
                 const agent = state.agents[id];
                 if (agent) openAgent(agent);
@@ -791,7 +1292,9 @@ export default function App() {
           </>
         ) : (
           <div className="workspace-empty">
-            <div className="workspace-empty-mark"><Bot size={27} /></div>
+            <div className="workspace-empty-mark">
+              <Bot size={27} />
+            </div>
             <span className="eyebrow">Mission control</span>
             <h1>Standing by</h1>
             <p>
@@ -803,7 +1306,11 @@ export default function App() {
               <button type="button" className="primary-button" onClick={() => setCreateOpen(true)}>
                 <Sparkles size={14} /> New run
               </button>
-              <button type="button" className="secondary-button" onClick={() => void refreshTasks(false)}>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void refreshTasks(false)}
+              >
                 <RefreshCw size={14} /> Retry
               </button>
               <button type="button" className="ghost-button" onClick={() => setPaletteOpen(true)}>
@@ -830,6 +1337,55 @@ export default function App() {
         )}
       </main>
 
+      {confirmation && (
+        <div className="confirmation-backdrop" onMouseDown={() => setConfirmation(undefined)}>
+          <section
+            className="confirmation-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="confirmation-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <span className={`confirmation-icon ${confirmation.kind}`}>
+              {confirmation.kind === 'delete' ? <Trash2 size={20} /> : <CircleStop size={20} />}
+            </span>
+            <div>
+              <h2 id="confirmation-title">
+                {confirmation.kind === 'delete' ? 'Delete this task?' : 'Stop this task?'}
+              </h2>
+              <p>
+                {confirmation.kind === 'delete'
+                  ? `"${shortTaskTitle(confirmation.task)}" and its persisted history will be removed.`
+                  : 'Agents will halt safely after the current operation and the task can be resumed.'}
+              </p>
+            </div>
+            <footer>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setConfirmation(undefined)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={
+                  confirmation.kind === 'delete' ? 'danger-button danger-solid' : 'danger-button'
+                }
+                onClick={() => {
+                  const current = confirmation;
+                  setConfirmation(undefined);
+                  if (current.kind === 'delete') void deleteTask(current.task, true);
+                  else void runTaskAction(current.task, true);
+                }}
+              >
+                {confirmation.kind === 'delete' ? 'Delete permanently' : 'Stop task'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
       {settingsOpen && (
         <div className="settings-backdrop" onMouseDown={() => setSettingsOpen(false)}>
           <aside
@@ -844,7 +1400,12 @@ export default function App() {
                 <span className="eyebrow">Local preferences</span>
                 <h2>Runtime & UI</h2>
               </div>
-              <button type="button" className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close settings">
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => setSettingsOpen(false)}
+                aria-label="Close settings"
+              >
                 <X size={16} />
               </button>
             </header>
@@ -856,97 +1417,206 @@ export default function App() {
                   <p>Applied to new hierarchy runs. Live agents can still override per window.</p>
                 </header>
                 <div className="role-matrix">
-                  {(['director', 'manager', 'worker', 'tester'] as ConfigurableRole[]).map((role) => (
-                    <RoleProfileEditor
-                      key={role}
-                      role={role}
-                      profile={settings.roleProfiles[role]}
-                      onChange={(profile) =>
-                        setSettings({
-                          ...settings,
-                          roleProfiles: { ...settings.roleProfiles, [role]: profile },
-                        })
-                      }
-                    />
-                  ))}
+                  {(['director', 'manager', 'worker', 'tester'] as ConfigurableRole[]).map(
+                    (role) => (
+                      <RoleProfileEditor
+                        key={role}
+                        role={role}
+                        profile={settings.roleProfiles[role]}
+                        onChange={(profile) =>
+                          setSettings({
+                            ...settings,
+                            roleProfiles: { ...settings.roleProfiles, [role]: profile },
+                          })
+                        }
+                      />
+                    ),
+                  )}
                 </div>
                 <div className="preset-segment" role="group" aria-label="Quality presets">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettings({
-                        ...settings,
-                        roleProfiles: {
-                          director: { model: 'claude-sonnet-4-6', effort: 'medium' },
-                          manager: { model: 'claude-sonnet-4-6', effort: 'medium' },
-                          worker: { model: 'claude-sonnet-4-6', effort: 'low' },
-                          tester: { model: 'claude-sonnet-4-6', effort: 'medium' },
-                        },
-                      })
-                    }
-                  >
-                    Cheap
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettings({
-                        ...settings,
-                        roleProfiles: {
-                          director: { model: 'claude-sonnet-5', effort: 'high' },
-                          manager: { model: 'claude-sonnet-5', effort: 'high' },
-                          worker: { model: 'claude-sonnet-5', effort: 'medium' },
-                          tester: { model: 'claude-sonnet-5', effort: 'high' },
-                        },
-                      })
-                    }
-                  >
-                    Balanced
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettings({
-                        ...settings,
-                        roleProfiles: DEFAULT_SETTINGS.roleProfiles,
-                      })
-                    }
-                  >
-                    Max quality
-                  </button>
+                  {QUALITY_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      className={selectedQualityPreset === preset.id ? 'active' : ''}
+                      aria-pressed={selectedQualityPreset === preset.id}
+                      onClick={() =>
+                        setSettings({
+                          ...settings,
+                          roleProfiles: preset.profiles,
+                        })
+                      }
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
                 </div>
               </section>
 
               <section className="settings-section">
                 <header>
-                  <h3>Hierarchy shape</h3>
+                  <h3>Execution budgets</h3>
                   <p>
-                    These are exact agent counts: Director creates this many Managers;
-                    every Manager creates N-1 Coders and one dedicated Tester.
+                    Hard task limits stop new model calls while preserving completed work and audit
+                    history.
                   </p>
                 </header>
-                <div className="concurrency-card">
-                  <RangeSetting
-                    label="Managers"
-                    value={settings.maxParallelManagers}
-                    min={1}
-                    max={12}
-                    onChange={(value) => setSettings({ ...settings, maxParallelManagers: value })}
-                  />
-                  <RangeSetting
-                    label="Child agents per manager"
-                    value={settings.maxWorkersPerManager}
-                    min={2}
-                    max={12}
-                    onChange={(value) => setSettings({ ...settings, maxWorkersPerManager: value })}
-                  />
-                  <RangeSetting
-                    label="Global parallel workers"
-                    value={settings.maxParallelWorkers}
-                    min={1}
-                    max={32}
-                    onChange={(value) => setSettings({ ...settings, maxParallelWorkers: value })}
-                  />
+                <RangeSetting
+                  label="Maximum model calls"
+                  value={settings.maxModelCalls}
+                  min={20}
+                  max={1000}
+                  onChange={(value) => setSettings({ ...settings, maxModelCalls: value })}
+                />
+                <RangeSetting
+                  label="Maximum runtime in minutes"
+                  value={Math.round(settings.maxWallClockSeconds / 60)}
+                  min={15}
+                  max={480}
+                  onChange={(value) =>
+                    setSettings({ ...settings, maxWallClockSeconds: value * 60 })
+                  }
+                />
+                <RangeSetting
+                  label="Estimated input tokens (thousands)"
+                  value={Math.round(settings.maxEstimatedInputTokens / 1000)}
+                  min={50}
+                  max={5000}
+                  onChange={(value) =>
+                    setSettings({
+                      ...settings,
+                      maxEstimatedInputTokens: value * 1000,
+                    })
+                  }
+                />
+              </section>
+
+              <section className="settings-section">
+                <header>
+                  <h3>Cookie account health</h3>
+                  <p>Durable cooldown and active lease state. Cookie values are never exposed.</p>
+                </header>
+                <div className="account-health-list">
+                  {accountHealth.length ? (
+                    accountHealth.map((account) => (
+                      <div key={`${account.provider}:${account.accountId}`}>
+                        <span className={`account-health-dot state-${account.state}`} />
+                        <strong>{account.accountId}</strong>
+                        <span>{account.state.replaceAll('_', ' ')}</span>
+                        <span>{account.activeLeases} active</span>
+                        <span>
+                          {account.cooldownActive && account.cooldownUntil
+                            ? `Cooldown until ${new Date(account.cooldownUntil * 1000).toLocaleTimeString()}`
+                            : (account.reason ?? 'Available')}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="setting-hint">No durable account health events yet.</p>
+                  )}
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <header>
+                  <h3>Planning caps & execution slots</h3>
+                  <p>
+                    Caps are maxima, not exact counts. Director and Managers select only the fan-out
+                    the plan needs; execution slots independently limit concurrency.
+                  </p>
+                </header>
+                <div className="limit-groups">
+                  <div className="limit-group">
+                    <div className="limit-group-heading">
+                      <strong>Logical planning maxima</strong>
+                      <span>How many roles planners may select</span>
+                    </div>
+                    <RangeSetting
+                      label="Maximum managers"
+                      value={settings.maxManagers}
+                      min={1}
+                      max={32}
+                      onChange={(value) =>
+                        setSettings({
+                          ...settings,
+                          maxManagers: value,
+                          maxParallelManagers: Math.min(settings.maxParallelManagers, value),
+                        })
+                      }
+                    />
+                    <RangeSetting
+                      label="Maximum child agents per manager"
+                      value={settings.maxWorkersPerManager}
+                      min={2}
+                      max={32}
+                      onChange={(value) =>
+                        setSettings({
+                          ...settings,
+                          maxWorkersPerManager: value,
+                          maxParallelWorkersPerManager:
+                            settings.maxParallelWorkersPerManager == null
+                              ? undefined
+                              : Math.min(settings.maxParallelWorkersPerManager, value - 1),
+                        })
+                      }
+                    />
+                    <p className="setting-hint">
+                      One child slot is reserved for the dedicated Tester; the remainder is the
+                      maximum selectable Coder count.
+                    </p>
+                  </div>
+                  <div className="limit-group">
+                    <div className="limit-group-heading">
+                      <strong>Execution concurrency</strong>
+                      <span>How many selected roles may run at once</span>
+                    </div>
+                    <RangeSetting
+                      label="Parallel Manager slots"
+                      value={settings.maxParallelManagers}
+                      min={1}
+                      max={settings.maxManagers}
+                      onChange={(value) => setSettings({ ...settings, maxParallelManagers: value })}
+                    />
+                    <label className="toggle-setting compact-toggle">
+                      <span>
+                        <strong>Per-manager worker slots</strong>
+                        <small>Optional; otherwise uses that manager’s coder cap.</small>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={settings.maxParallelWorkersPerManager != null}
+                        onChange={(event) =>
+                          setSettings({
+                            ...settings,
+                            maxParallelWorkersPerManager: event.target.checked
+                              ? Math.max(1, settings.maxWorkersPerManager - 1)
+                              : undefined,
+                          })
+                        }
+                      />
+                    </label>
+                    {settings.maxParallelWorkersPerManager != null && (
+                      <RangeSetting
+                        label="Parallel workers per manager"
+                        value={settings.maxParallelWorkersPerManager}
+                        min={1}
+                        max={Math.max(1, settings.maxWorkersPerManager - 1)}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            maxParallelWorkersPerManager: value,
+                          })
+                        }
+                      />
+                    )}
+                    <RangeSetting
+                      label="Global parallel worker slots"
+                      value={settings.maxParallelWorkers}
+                      min={1}
+                      max={64}
+                      onChange={(value) => setSettings({ ...settings, maxParallelWorkers: value })}
+                    />
+                  </div>
                 </div>
               </section>
 
@@ -999,7 +1669,11 @@ export default function App() {
         />
       )}
 
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} commands={commands} />
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={commands}
+      />
       <ToastStack
         toasts={toasts}
         onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))}
@@ -1023,7 +1697,10 @@ function RangeSetting({
 }) {
   return (
     <label className="range-setting">
-      <span><strong>{label}</strong><output>{value}</output></span>
+      <span>
+        <strong>{label}</strong>
+        <output>{value}</output>
+      </span>
       <input
         type="range"
         min={min}
@@ -1031,7 +1708,9 @@ function RangeSetting({
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
       />
-      <small>{min} minimum <i /> {max} maximum</small>
+      <small>
+        {min} minimum <i /> {max} maximum
+      </small>
     </label>
   );
 }
@@ -1047,7 +1726,10 @@ function RoleProfileEditor({
 }) {
   return (
     <section className={`role-profile role-profile-${role}`}>
-      <header><strong>{role}</strong><span>default</span></header>
+      <header>
+        <strong>{role}</strong>
+        <span>default</span>
+      </header>
       <div>
         <label>
           <span>Model</span>
@@ -1101,7 +1783,7 @@ function CreateTaskWizard({
   const [task, setTask] = useState('');
   const [testCmd, setTestCmd] = useState('python -m pytest -q');
   const [projectMode, setProjectMode] = useState<'edit' | 'new_project'>('edit');
-  const [managers, setManagers] = useState(settings.maxParallelManagers);
+  const [managers, setManagers] = useState(settings.maxManagers);
   const [workersPerManager, setWorkersPerManager] = useState(settings.maxWorkersPerManager);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -1122,7 +1804,10 @@ function CreateTaskWizard({
     if (!template) return;
     setName(template.name);
     setTask(template.goal);
-    if (template.id === 'greenfield') setProjectMode('new_project');
+    setManagers(template.managers);
+    setWorkersPerManager(template.workersPerManager);
+    setTestCmd(template.testCmd);
+    setProjectMode(template.projectMode);
   };
 
   const submit = async () => {
@@ -1136,8 +1821,13 @@ function CreateTaskWizard({
     try {
       const launchSettings: WorkspaceSettings = {
         ...settings,
-        maxParallelManagers: managers,
+        maxManagers: managers,
+        maxParallelManagers: Math.min(settings.maxParallelManagers, managers),
         maxWorkersPerManager: Math.max(2, workersPerManager),
+        maxParallelWorkersPerManager:
+          settings.maxParallelWorkersPerManager == null
+            ? undefined
+            : Math.min(settings.maxParallelWorkersPerManager, Math.max(1, workersPerManager - 1)),
       };
       const created = await api.createHierarchyTask({
         name: name.trim() || shortTaskTitle({ id: 'new', name, prompt: task, root }),
@@ -1157,30 +1847,58 @@ function CreateTaskWizard({
 
   return (
     <div className="settings-backdrop create-backdrop" onMouseDown={onClose}>
-      <section className="create-dialog wizard" onMouseDown={(event) => event.stopPropagation()}>
+      <section
+        className="create-dialog wizard"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-run-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <header>
           <div>
             <span className="eyebrow">Launch wizard · step {step + 1}/3</span>
-            <h2>New run</h2>
+            <h2 id="create-run-title">New run</h2>
           </div>
-          <button type="button" onClick={onClose}><X size={16} /></button>
+          <button type="button" onClick={onClose} aria-label="Close new run wizard">
+            <X size={16} />
+          </button>
         </header>
 
-        <div className="wizard-steps">
+        <div className="wizard-steps" role="tablist" aria-label="New run steps">
           {['Folder', 'Goal', 'Shape'].map((label, index) => (
             <button
               key={label}
               type="button"
+              role="tab"
               className={index === step ? 'active' : index < step ? 'done' : ''}
+              aria-selected={index === step}
+              aria-controls={`create-step-${index}`}
+              tabIndex={index === step ? 0 : -1}
               onClick={() => setStep(index)}
+              onKeyDown={(event) => {
+                let nextIndex: number | undefined;
+                if (event.key === 'ArrowRight') nextIndex = (index + 1) % 3;
+                else if (event.key === 'ArrowLeft') nextIndex = (index + 2) % 3;
+                else if (event.key === 'Home') nextIndex = 0;
+                else if (event.key === 'End') nextIndex = 2;
+                if (nextIndex == null) return;
+                event.preventDefault();
+                setStep(nextIndex);
+                const tabs =
+                  event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                    '[role="tab"]',
+                  );
+                tabs?.[nextIndex]?.focus();
+              }}
             >
-              <i>{index + 1}</i>{label}
+              <i>{index + 1}</i>
+              {label}
             </button>
           ))}
         </div>
 
-          {step === 0 && (
-          <div className="create-grid">
+        {step === 0 && (
+          <div className="create-grid" id="create-step-0" role="tabpanel" aria-label="Folder">
             <label>
               <span>Project mode</span>
               <select
@@ -1195,7 +1913,11 @@ function CreateTaskWizard({
               <span>Local project folder</span>
               <div className="folder-field">
                 <input value={root} readOnly placeholder="Choose a local folder…" />
-                <button type="button" className="folder-browse-button" onClick={() => void chooseFolder()}>
+                <button
+                  type="button"
+                  className="folder-browse-button"
+                  onClick={() => void chooseFolder()}
+                >
                   <FolderOpen size={14} /> Browse
                 </button>
               </div>
@@ -1221,14 +1943,22 @@ function CreateTaskWizard({
         )}
 
         {step === 1 && (
-          <div className="create-grid">
+          <div className="create-grid" id="create-step-1" role="tabpanel" aria-label="Goal">
             <label>
               <span>Task name</span>
-              <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Short display name" />
+              <input
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="Short display name"
+              />
             </label>
             <label>
               <span>Test command</span>
-              <input value={testCmd} onChange={(event) => setTestCmd(event.target.value)} placeholder="python -m pytest -q" />
+              <input
+                value={testCmd}
+                onChange={(event) => setTestCmd(event.target.value)}
+                placeholder="python -m pytest -q"
+              />
             </label>
             <label className="create-wide">
               <span>Director goal</span>
@@ -1243,10 +1973,21 @@ function CreateTaskWizard({
         )}
 
         {step === 2 && (
-          <div className="create-grid shape-step">
-            <RangeSetting label="Managers" value={managers} min={1} max={12} onChange={setManagers} />
+          <div
+            className="create-grid shape-step"
+            id="create-step-2"
+            role="tabpanel"
+            aria-label="Shape"
+          >
             <RangeSetting
-              label="Child agents per manager"
+              label="Maximum managers"
+              value={managers}
+              min={1}
+              max={12}
+              onChange={setManagers}
+            />
+            <RangeSetting
+              label="Maximum child agents per manager"
               value={workersPerManager}
               min={2}
               max={12}
@@ -1258,18 +1999,52 @@ function CreateTaskWizard({
             <div className="estimate-panel create-wide">
               <strong>Estimate</strong>
               <span>
-                {managers} managers · {managers * Math.max(1, workersPerManager - 1)} coders · {managers} testers · global coder cap{' '}
-                {settings.maxParallelWorkers}
+                Up to {managers} managers · up to {managers * Math.max(1, workersPerManager - 1)}{' '}
+                coders · up to {managers} testers. Execution is limited to{' '}
+                {Math.min(settings.maxParallelManagers, managers)} manager and{' '}
+                {settings.maxParallelWorkers} global worker slots.
               </span>
+            </div>
+            <div className="launch-contract-preview create-wide">
+              <strong>Plan contract preview</strong>
+              <div>
+                <span>Director fan-out</span>
+                <b>1–{managers} workstreams</b>
+              </div>
+              <div>
+                <span>Manager fan-out</span>
+                <b>1–{Math.max(1, workersPerManager - 1)} coders + 1 tester</b>
+              </div>
+              <div>
+                <span>Required contracts</span>
+                <b>Scopes, evidence, risk and approval policy</b>
+              </div>
+              <div>
+                <span>Completion gate</span>
+                <b>All work and model calls reconciled</b>
+              </div>
+              <div>
+                <span>Budget</span>
+                <b>
+                  {settings.maxModelCalls} calls · {Math.round(settings.maxWallClockSeconds / 60)}{' '}
+                  minutes
+                </b>
+              </div>
             </div>
           </div>
         )}
 
         {error && <p className="create-error">{error}</p>}
         <footer>
-          <button type="button" className="ghost-button" onClick={onClose}>Cancel</button>
+          <button type="button" className="ghost-button" onClick={onClose}>
+            Cancel
+          </button>
           {step > 0 && (
-            <button type="button" className="ghost-button" onClick={() => setStep((value) => value - 1)}>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => setStep((value) => value - 1)}
+            >
               Back
             </button>
           )}
@@ -1293,7 +2068,12 @@ function CreateTaskWizard({
               Continue
             </button>
           ) : (
-            <button type="button" className="primary-button" disabled={busy} onClick={() => void submit()}>
+            <button
+              type="button"
+              className="primary-button"
+              disabled={busy}
+              onClick={() => void submit()}
+            >
               <Sparkles size={14} /> {busy ? 'Launching…' : 'Launch'}
             </button>
           )}

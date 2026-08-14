@@ -124,6 +124,7 @@ def test_independent_workstreams_start_all_managers(tmp_path: Path):
             on_event=events.append,
             repository=repository,
         )
+        attempts = repository.list_attempts("t-indep")
 
     mgr = [
         event.get("workstream_id")
@@ -132,6 +133,11 @@ def test_independent_workstreams_start_all_managers(tmp_path: Path):
     ]
     assert sorted(mgr) == ["w1", "w2", "w3", "w4"]
     assert plans["n"] == 4
+    assert attempts
+    assert all(
+        attempt.execution_attempt_id != attempt.logical_agent_id
+        for attempt in attempts
+    )
 
 
 def test_sequential_workstreams_start_managers_one_by_one(tmp_path: Path):
@@ -259,17 +265,25 @@ def test_sequential_workstreams_start_managers_one_by_one(tmp_path: Path):
     timeline = []
     for event in events:
         if event.get("type") == "agent_started" and event.get("role") == "manager":
-            timeline.append(("start", event.get("workstream_id")))
+            if event.get("status") in {None, "queued", "planning"}:
+                timeline.append(("start", event.get("workstream_id")))
         if event.get("type") == "workstream_completed":
             timeline.append(("done", event.get("workstream_id")))
 
-    # First manager must be w1; w2 cannot start before w1 done.
-    assert timeline[0] == ("start", "w1")
-    assert ("done", "w1") in timeline
-    assert timeline.index(("start", "w2")) > timeline.index(("done", "w1"))
-    assert [item for kind, item in timeline if kind == "start"] == [
-        "w1",
-        "w2",
-        "w3",
-        "w4",
+    # All managers are announced/planned even with sequential deps.
+    started = [item for kind, item in timeline if kind == "start"]
+    assert started.count("w1") >= 1
+    assert started.count("w2") >= 1
+    assert started.count("w3") >= 1
+    assert started.count("w4") >= 1
+    manager_plans = [
+        event.get("workstream_id")
+        for event in events
+        if event.get("type") == "manager_plan_created"
     ]
+    assert sorted(manager_plans) == ["w1", "w2", "w3", "w4"]
+    # Execution remains sequential: w2 cannot complete before w1.
+    assert ("done", "w1") in timeline
+    assert timeline.index(("done", "w1")) < timeline.index(("done", "w2"))
+    assert timeline.index(("done", "w2")) < timeline.index(("done", "w3"))
+    assert timeline.index(("done", "w3")) < timeline.index(("done", "w4"))
