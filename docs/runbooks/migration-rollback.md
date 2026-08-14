@@ -1,10 +1,9 @@
 # Migration and rollback handoff
 
-Current canonical SQLite schema: `14`.
+Current canonical SQLite schema: `17`.
 
-**Evidence status:** the current schema-14 report is recorded in
-`../acceptance-evidence.md`. The commands below remain required procedures, and
-any source change after that report requires a new full acceptance run.
+The commands below remain required procedures. Any source change requires a new
+full acceptance run via the [acceptance matrix](../acceptance-matrix.md).
 
 This procedure separates application rollback from data rollback. Never test a
 downgrade against the only copy of operator data, delete migration rows, edit
@@ -12,7 +11,7 @@ downgrade against the only copy of operator data, delete migration rows, edit
 WAL state.
 
 `orchestrator/state_repository.py` defines
-`CURRENT_SCHEMA_VERSION = 14`. It is the source of truth; do not infer the
+`CURRENT_SCHEMA_VERSION = 17`. It is the source of truth; do not infer the
 version from an old runbook or acceptance report.
 
 ## Schema and compatibility
@@ -38,6 +37,11 @@ The sequence is:
     links, and supporting indexes.
 13. immutable contract versions, logical-agent identities, and typed handoffs.
 14. crash-safe managed-retention claims and retention indexes.
+15. sanitized per-provider LLM request-attempt records.
+16. additive repair for request-attempt agent roles.
+17. execution epochs and rosters, unique remediation strategies, exactly-once
+    Manager reports and Director final review, and terminal dispositions/log
+    references.
 
 Migration 12 is named `durable_effect_fencing`. It does not rewrite legacy
 effect rows: version-11 receipts retain their state and receive nullable
@@ -49,6 +53,8 @@ compensation relationship in each direction.
 Migration 13 persists typed contracts, deterministic logical-agent identities,
 and typed handoff envelopes in dedicated canonical tables. Migration 14 adds
 recoverable claim/finalize state for managed log and artifact deletion.
+Migration 17 is additive and leaves existing task, attempt, and report data
+untouched while adding durable execution-recovery records.
 
 The migration acceptance gate builds legacy version-0 and version-2 fixtures
 and checks preservation, event replay, monotonic sequencing, one-time JSON task
@@ -59,9 +65,9 @@ Unknown event types and additive event fields remain replayable. Removing or
 narrowing a reviewed event/HTTP contract is handled by the compatibility gate.
 There are no down migrations.
 
-Treat schema `14` as incompatible with an older application unless that exact
-version has been explicitly verified reading schema `14`, effect fields,
-coordination tables, retention claims, and current event/task fields. Otherwise
+Treat schema `17` as incompatible with an older application unless that exact
+version has been explicitly verified reading schema `17`, effect fields,
+coordination/recovery tables, retention claims, and current event/task fields. Otherwise
 data rollback means restoring the verified pre-upgrade archive.
 
 Cookie contents are not stored in either database. The separate account
@@ -97,7 +103,7 @@ New-Item -ItemType Directory -Force (Split-Path $Backup) | Out-Null
 python scripts/migration_preflight.py `
   --database $Db `
   --account-database $AccountDb `
-  --maximum-schema-version 14
+  --maximum-schema-version 17
 ```
 
 4. Resolve any `quick_check` error or newer-than-supported schema before
@@ -174,11 +180,11 @@ python scripts/orchestrator_admin.py verify $FailedUpgrade
 Choose exactly one path:
 
 - Application-only rollback: allowed only when the prior release is explicitly
-  certified to read schema `14`, the effect/coordination/retention fields, and
+  certified to read schema `17`, the effect/coordination/recovery/retention fields, and
   current event/task fields. Reinstall that release
   and retain the migrated data.
 - Data rollback: required when compatibility is unknown or the prior release
-  cannot read schema `14`. Restore the pre-upgrade archive to empty staging paths,
+  cannot read schema `17`. Restore the pre-upgrade archive to empty staging paths,
   verify it, then configure the prior release to those paths.
 
 ## Staged data rollback

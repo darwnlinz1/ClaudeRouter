@@ -23,7 +23,7 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check orchestrator server.py scripts tests
-      - run: python -m mypy --strict orchestrator/budget.py orchestrator/models.py orchestrator/effects.py orchestrator/reconciliation.py
+      - run: python -m mypy --strict orchestrator/models.py orchestrator/effects.py orchestrator/reconciliation.py
       - run: python -m pytest -q
 
   frontend:

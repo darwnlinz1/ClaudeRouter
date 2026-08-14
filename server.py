@@ -1,5 +1,7 @@
+import importlib
 import ipaddress
 import json
+import logging
 import os
 import queue
 import secrets
@@ -14,6 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tkinter import filedialog
+from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
@@ -33,12 +36,9 @@ from orchestrator import (
 from orchestrator import (
     llm_client as llm_runtime,
 )
-from orchestrator.budget import (
-    BudgetLimits,
-    register_task_budget,
-    remove_task_budget,
-)
 from orchestrator.deployment import require_deployment_ready
+from orchestrator.event_schema import EVENT_SCHEMAS, validate_event_payload
+from orchestrator.event_schema import SCHEMA_VERSION as EVENT_SCHEMA_VERSION
 from orchestrator.hierarchy import run_hierarchy
 from orchestrator.lifecycle import LifecycleCoordinator
 from orchestrator.llm_client import call_agent
@@ -71,6 +71,7 @@ from orchestrator.state_repository import (
 )
 
 _NATIVE_THREAD = threading.Thread
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -101,9 +102,7 @@ class TaskRuntimeRegistry:
                 raise RuntimeError(f"task {task_id} already has an active runtime")
             runtime = TaskRuntime(
                 task_id=task_id,
-                broker=event_broker.ReplayEventBroker(
-                    initial_sequence=initial_sequence
-                ),
+                broker=event_broker.ReplayEventBroker(initial_sequence=initial_sequence),
             )
             self._runtimes[task_id] = runtime
             return runtime
@@ -226,13 +225,9 @@ class TaskRuntimeRegistry:
                 timed_out.append(f"task:{runtime.task_id}")
             for heartbeat in tuple(runtime.heartbeat_threads):
                 if not self._join(heartbeat, deadline):
-                    timed_out.append(
-                        str(getattr(heartbeat, "name", None) or runtime.task_id)
-                    )
+                    timed_out.append(str(getattr(heartbeat, "name", None) or runtime.task_id))
         for runtime in runtimes:
-            runtime.broker.close(
-                timeout=max(0.0, deadline - time.monotonic())
-            )
+            runtime.broker.close(timeout=max(0.0, deadline - time.monotonic()))
             self.evict(runtime.task_id, expected=runtime)
         return tuple(timed_out)
 
@@ -353,16 +348,338 @@ class _ChatQueueView(MutableMapping[object, queue.Queue[str]]):
         runtime_registry._compat_chats.clear()
 
 
-active_queues: MutableMapping[
-    object, event_broker.ReplayEventBroker
-] = _ActiveQueueView()
+active_queues: MutableMapping[object, event_broker.ReplayEventBroker] = _ActiveQueueView()
 stop_flags: MutableMapping[object, bool] = _StopFlagView()
 chat_input_queues: MutableMapping[object, queue.Queue[str]] = _ChatQueueView()
 hierarchy_repository = StateRepository()
 task_manager.configure_repository(hierarchy_repository)
 agent_transcript.configure_repository(hierarchy_repository)
 artifact_manager.configure_repository(hierarchy_repository)
+_configure_request_log = getattr(
+    llm_runtime,
+    "configure_request_log_repository",
+    None,
+)
+if callable(_configure_request_log):
+    try:
+        _configure_request_log(hierarchy_repository)
+    except Exception:
+        logger.warning("Could not configure the optional LLM request log", exc_info=True)
 deployment_profile = require_deployment_ready()
+
+
+_EVENT_CORRELATION_FIELDS = frozenset(
+    {
+        "type",
+        "task_id",
+        "session_id",
+        "workstream_id",
+        "work_item_id",
+        "agent_instance_id",
+        "call_id",
+    }
+)
+_LARGE_EVENT_FIELDS = frozenset({"prompt", "patch", "diff", "text", "test_output"})
+
+
+def _event_envelope(task_id: str, session_id: str, raw: dict) -> EventEnvelope:
+    event_type = str(raw.get("type") or "event")
+    return EventEnvelope(
+        task_id=task_id,
+        session_id=session_id,
+        event_type=event_type,
+        version=EVENT_SCHEMA_VERSION,
+        payload={
+            key: value
+            for key, value in raw.items()
+            if key not in _EVENT_CORRELATION_FIELDS
+        },
+        workstream_id=raw.get("workstream_id"),
+        work_item_id=raw.get("work_item_id"),
+        agent_instance_id=raw.get("agent_instance_id"),
+        call_id=raw.get("call_id"),
+    )
+
+
+def _validate_event_envelope(envelope: EventEnvelope) -> None:
+    validate_event_payload(
+        envelope.event_type,
+        envelope.payload,
+        task_id=envelope.task_id,
+        session_id=envelope.session_id,
+        workstream_id=envelope.workstream_id,
+        work_item_id=envelope.work_item_id,
+        agent_instance_id=envelope.agent_instance_id,
+        call_id=envelope.call_id,
+        sequence=envelope.sequence,
+        timestamp=envelope.timestamp.isoformat(),
+    )
+
+
+def _schema_diagnostic(
+    *,
+    task_id: str,
+    session_id: str,
+    raw: dict,
+    validation_error: Exception,
+    repaired_fields: list[str],
+    repaired: bool,
+) -> dict:
+    source_event_type = str(raw.get("type") or "event")
+    action = "repaired" if repaired else "rejected"
+    diagnostic = {
+        "type": (
+            "event_schema_validation_repaired"
+            if repaired
+            else "event_schema_validation_failure"
+        ),
+        "task_id": task_id,
+        "session_id": session_id,
+        "source_event_type": source_event_type,
+        "action": action,
+        "validation_error": redaction.redact_text(
+            str(validation_error),
+            max_chars=1000,
+        ),
+        "repaired_fields": sorted(repaired_fields),
+        "field_names": sorted(str(key) for key in raw),
+        "summary": (
+            f"Event {source_event_type!r} failed schema validation and was {action}; "
+            "the original event body was not retained in this diagnostic."
+        ),
+    }
+    for field_name in (
+        "workstream_id",
+        "work_item_id",
+        "agent_instance_id",
+        "logical_request_id",
+        "execution_attempt_id",
+        "provider_attempt_id",
+        "attempt_id",
+        "call_id",
+        "call_purpose",
+        "role",
+    ):
+        value = raw.get(field_name)
+        if isinstance(value, (str, int, float, bool)) and value not in {"", None}:
+            diagnostic[field_name] = value
+    return diagnostic
+
+
+def _normalize_runtime_event(
+    task_id: str,
+    session_id: str,
+    event: object,
+) -> tuple[dict | None, dict | None]:
+    """Redact, validate, and narrowly repair one runtime event.
+
+    A rejected event is replaced by a sanitized diagnostic. Returning instead
+    of raising is important: the legacy model-runtime fallback queue receives
+    the caller's original object whenever its injected sink raises.
+    """
+
+    try:
+        raw_value = dict(event)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raw = {"type": "event"}
+        return None, _schema_diagnostic(
+            task_id=task_id,
+            session_id=session_id,
+            raw=raw,
+            validation_error=ValueError(f"event must be a mapping: {type(exc).__name__}"),
+            repaired_fields=[],
+            repaired=False,
+        )
+    raw = redaction.redact_event(raw_value)
+    if not isinstance(raw, dict):
+        raw = {"type": "event"}
+    raw["type"] = str(raw.get("type") or "event")
+    try:
+        _validate_event_envelope(_event_envelope(task_id, session_id, raw))
+        return raw, None
+    except (TypeError, ValueError) as validation_error:
+        repaired = dict(raw)
+        repaired_fields: list[str] = []
+        spec = EVENT_SCHEMAS.get(str(raw["type"]))
+        if spec is not None and "error" in spec.required:
+            current_error = repaired.get("error")
+            if not isinstance(current_error, str) or not current_error.strip():
+                replacement = next(
+                    (
+                        repaired.get(name)
+                        for name in ("reason", "summary", "detail", "message", "data")
+                        if isinstance(repaired.get(name), str)
+                        and str(repaired.get(name)).strip()
+                    ),
+                    None,
+                )
+                repaired["error"] = (
+                    replacement
+                    if replacement is not None
+                    else f"{raw['type']} emitted without error detail"
+                )
+                repaired_fields.append("error")
+        if repaired_fields:
+            try:
+                _validate_event_envelope(
+                    _event_envelope(task_id, session_id, repaired)
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                return repaired, _schema_diagnostic(
+                    task_id=task_id,
+                    session_id=session_id,
+                    raw=raw,
+                    validation_error=validation_error,
+                    repaired_fields=repaired_fields,
+                    repaired=True,
+                )
+        return None, _schema_diagnostic(
+            task_id=task_id,
+            session_id=session_id,
+            raw=raw,
+            validation_error=validation_error,
+            repaired_fields=repaired_fields,
+            repaired=False,
+        )
+
+
+def _write_schema_diagnostic_to_request_log(diagnostic: dict) -> None:
+    """Best-effort bridge to the optional request-attempt ledger."""
+
+    hook = None
+    try:
+        request_log = importlib.import_module("orchestrator.llm_request_log")
+        hook = getattr(request_log, "record_event_schema_diagnostic", None)
+    except (ImportError, AttributeError):
+        hook = None
+    if not callable(hook):
+        hook = getattr(hierarchy_repository, "record_event_schema_diagnostic", None)
+    if not callable(hook):
+        return
+    try:
+        hook(dict(redaction.redact_event(diagnostic)))
+    except Exception:
+        # Diagnostics must never turn successfully completed Worker domain work
+        # into a failed request.
+        logger.warning("Could not write event-schema diagnostic to request log", exc_info=True)
+
+
+def _projectable_event(raw: dict) -> dict:
+    task_event = dict(raw)
+    for large_field in _LARGE_EVENT_FIELDS:
+        task_event.pop(large_field, None)
+    if isinstance(task_event.get("payload"), dict):
+        task_event["payload"] = {
+            key: value
+            for key, value in task_event["payload"].items()
+            if key not in _LARGE_EVENT_FIELDS
+        }
+    return task_event
+
+
+def _persist_redacted_runtime_event(
+    task_id: str,
+    session_id: str,
+    raw: dict,
+    broker: event_broker.ReplayEventBroker,
+) -> dict:
+    envelope = _event_envelope(task_id, session_id, raw)
+    task_event = _projectable_event(raw)
+    try:
+        stored = task_manager.record_event(
+            task_id,
+            task_event,
+            envelope=envelope,
+        )
+    except RuntimeError as exc:
+        if str(exc) != "atomic event projection requires a repository":
+            raise
+        # Compatibility-only JSON/in-memory task stores have no shared
+        # transaction to join. Project first, then synthesize the live cursor.
+        task_manager.record_event(task_id, task_event)
+        stored = replace(
+            envelope,
+            sequence=broker.latest_sequence + 1,
+        )
+    if stored is None:
+        raise RuntimeError("task event projection did not commit")
+    wire = {
+        **raw,
+        **to_dict(stored),
+        "type": envelope.event_type,
+        "sequence": stored.sequence,
+        "timestamp": stored.timestamp.isoformat(),
+    }
+    _observe_runtime_event(
+        task_id,
+        session_id,
+        wire,
+        sequence=stored.sequence,
+    )
+    broker.put(wire)
+    return wire
+
+
+def _emit_persisted_runtime_event(
+    task_id: str,
+    session_holder: dict[str, str],
+    broker: event_broker.ReplayEventBroker,
+    event: object,
+) -> list[dict]:
+    raw_session_id = (
+        event.get("session_id")
+        if isinstance(event, dict)
+        else None
+    )
+    session_id = str(raw_session_id or session_holder["id"])
+    session_holder["id"] = session_id
+    normalized, diagnostic = _normalize_runtime_event(
+        task_id,
+        session_id,
+        event,
+    )
+    emitted: list[dict] = []
+    if diagnostic is not None:
+        _write_schema_diagnostic_to_request_log(diagnostic)
+        try:
+            emitted.append(
+                _persist_redacted_runtime_event(
+                    task_id,
+                    session_id,
+                    diagnostic,
+                    broker,
+                )
+            )
+        except Exception:
+            logger.warning("Could not persist event-schema diagnostic", exc_info=True)
+    if normalized is not None:
+        try:
+            emitted.append(
+                _persist_redacted_runtime_event(
+                    task_id,
+                    session_id,
+                    normalized,
+                    broker,
+                )
+            )
+        except Exception:
+            if diagnostic is None:
+                raise
+            # The source object was schema-invalid. Do not rethrow into the
+            # model runtime, which would enqueue that original unredacted body.
+            logger.warning("Could not persist repaired runtime event", exc_info=True)
+    return emitted
+
+
+def _is_managed_staging_workspace(task_id: str, execution_root: Path) -> bool:
+    try:
+        managed_root = artifact_manager.get_staging_workspace(task_id).resolve()
+        candidate = Path(execution_root).resolve()
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+    return candidate == managed_root
 
 
 def _audit_policy(request: PolicyRequest, decision) -> None:
@@ -408,14 +725,11 @@ def _ensure_account_lease_store() -> SQLiteAccountLeaseStore:
             llm_account_leases = SQLiteAccountLeaseStore(
                 os.environ.get(
                     "ORCH_ACCOUNT_LEASE_DB",
-                    str(
-                        Path.home()
-                        / ".ai_orchestrator"
-                        / "account_leases.sqlite3"
-                    ),
+                    str(Path.home() / ".ai_orchestrator" / "account_leases.sqlite3"),
                 )
             )
         llm_runtime.configure_account_lease_store(llm_account_leases)
+        llm_runtime.configure_account_coordinator(llm_account_leases)
         return llm_account_leases
 
 
@@ -430,21 +744,15 @@ def _observe_runtime_event(
 
     try:
         event_type = str(event.get("type") or "event")
-        call_id = str(
-            event.get("call_id") or event.get("logical_request_id") or ""
-        ) or None
+        call_id = str(event.get("call_id") or event.get("logical_request_id") or "") or None
         context = ObservationContext(
             task_id=task_id,
             session_id=session_id,
             agent_instance_id=(
-                str(event.get("agent_instance_id"))
-                if event.get("agent_instance_id")
-                else None
+                str(event.get("agent_instance_id")) if event.get("agent_instance_id") else None
             ),
             call_id=call_id,
-            attempt_id=(
-                str(event.get("attempt_id")) if event.get("attempt_id") else None
-            ),
+            attempt_id=(str(event.get("attempt_id")) if event.get("attempt_id") else None),
         )
         component = (
             "llm"
@@ -470,9 +778,7 @@ def _observe_runtime_event(
             "orchestrator.event.total",
             labels={
                 "component": component,
-                "operation": "call"
-                if event_type.startswith("model_request_")
-                else "append",
+                "operation": "call" if event_type.startswith("model_request_") else "append",
                 "outcome": outcome,
                 "role": str(event.get("role") or "other"),
             },
@@ -496,23 +802,17 @@ def _observe_runtime_event(
                 while len(_model_call_started_at) > _MODEL_TIMING_MAX:
                     _model_call_started_at.popitem(last=False)
             elif call_id and event_type in {
-            "model_request_completed",
-            "model_request_failed",
-            "model_request_aborted",
+                "model_request_completed",
+                "model_request_failed",
+                "model_request_aborted",
             }:
-                started_at = _model_call_started_at.pop(
-                    (task_id, call_id), None
-                )
+                started_at = _model_call_started_at.pop((task_id, call_id), None)
         if call_id and event_type in {
             "model_request_completed",
             "model_request_failed",
             "model_request_aborted",
         }:
-            duration_ms = (
-                max(0.0, (now - started_at) * 1000)
-                if started_at is not None
-                else None
-            )
+            duration_ms = max(0.0, (now - started_at) * 1000) if started_at is not None else None
             runtime_observer.emit(
                 ObservabilityRecord(
                     kind="span",
@@ -541,9 +841,7 @@ def _observe_runtime_event(
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _PACKAGED_FRONTEND = _PROJECT_ROOT / "orchestrator" / "frontend_dist"
 FRONTEND_DIST = (
-    _PACKAGED_FRONTEND
-    if _PACKAGED_FRONTEND.is_dir()
-    else _PROJECT_ROOT / "frontend" / "dist"
+    _PACKAGED_FRONTEND if _PACKAGED_FRONTEND.is_dir() else _PROJECT_ROOT / "frontend" / "dist"
 )
 
 
@@ -600,10 +898,16 @@ def _safe_frontend_file(relative_path: str) -> Path | None:
     return resolved if resolved.is_file() else None
 
 
+def _owns_startup_recovery() -> bool:
+    return os.environ.get("ORCH_RECOVERY_OWNER_PID") == str(os.getpid())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     maintenance_stop = threading.Event()
     lifecycle = LifecycleCoordinator()
+    if _owns_startup_recovery():
+        task_manager.interrupt_active_tasks()
 
     def _auto_resume() -> None:
         for task in task_manager.list_auto_resumable_tasks():
@@ -631,9 +935,7 @@ async def lifespan(app: FastAPI):
         )
         while not maintenance_stop.is_set():
             try:
-                hierarchy_repository.compact_retention(
-                    RetentionPolicy.from_environment()
-                )
+                hierarchy_repository.compact_retention(RetentionPolicy.from_environment())
                 managed_retention.run(limit=200)
             except (OSError, RuntimeError, ValueError):
                 pass
@@ -668,6 +970,27 @@ async def lifespan(app: FastAPI):
                 llm_account_leases = None
 
 
+def _configure_orchestrator_logging() -> None:
+    """Send the run narration to the terminal.
+
+    Uvicorn installs handlers only for its own loggers, so orchestrator INFO
+    records were dropped and the terminal showed nothing but HTTP access lines
+    while a whole hierarchy was executing.
+    """
+    level_name = os.environ.get("ORCH_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    orchestrator_logger = logging.getLogger("orchestrator")
+    orchestrator_logger.setLevel(level)
+    if not any(
+        isinstance(handler, logging.StreamHandler) for handler in orchestrator_logger.handlers
+    ):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
+        orchestrator_logger.addHandler(handler)
+
+
+_configure_orchestrator_logging()
+
 app = FastAPI(lifespan=lifespan)
 _SESSION_COOKIE = "orchestrator_session"
 _SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -678,11 +1001,7 @@ _local_sessions_lock = threading.RLock()
 
 def _request_allowed_origins(request: Request) -> set[str]:
     host = str(request.headers.get("host") or "").strip()
-    return (
-        {f"http://{host}", f"https://{host}"}
-        if host
-        else set()
-    )
+    return {f"http://{host}", f"https://{host}"} if host else set()
 
 
 def _request_host(request: Request) -> str:
@@ -725,9 +1044,7 @@ def _add_security_headers(response: Response) -> Response:
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = (
-        "camera=(), microphone=(), geolocation=()"
-    )
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     return response
 
 
@@ -771,9 +1088,7 @@ async def protect_local_api(request: Request, call_next):
                 action=PolicyAction.API_REQUEST,
                 resource=request.url.path,
                 subject=PolicySubject(
-                    actor_id=(
-                        "local-session" if session is not None else "anonymous"
-                    ),
+                    actor_id=("local-session" if session is not None else "anonymous"),
                     roles=("operator",) if session is not None else (),
                     namespace=deployment_profile.namespace or "local",
                     authenticated=session is not None,
@@ -784,24 +1099,15 @@ async def protect_local_api(request: Request, call_next):
                 allowed_hosts=frozenset(_ALLOWED_LOCAL_HOSTS),
                 allowed_origins=frozenset(_request_allowed_origins(request)),
                 session_valid=session is not None,
-                csrf_valid=(
-                    session is not None
-                    and secrets.compare_digest(csrf, session[0])
-                ),
+                csrf_valid=(session is not None and secrets.compare_digest(csrf, session[0])),
             )
         )
         if not decision.allowed:
-            reason = (
-                decision.reasons[0]
-                if decision.reasons
-                else "policy_denied"
-            )
+            reason = decision.reasons[0] if decision.reasons else "policy_denied"
             detail = {
                 "host_not_allowed": "Host is not allowed.",
                 "origin_not_allowed": "Origin is not allowed.",
-                "session_or_csrf_invalid": (
-                    "A valid local session and CSRF token are required."
-                ),
+                "session_or_csrf_invalid": ("A valid local session and CSRF token are required."),
             }.get(reason, "Request is not allowed by policy.")
             return _denied_response(detail)
     return _add_security_headers(await call_next(request))
@@ -866,13 +1172,10 @@ def get_favicon():
     for name in ("favicon.svg", "favicon.ico"):
         candidate = _safe_frontend_file(name)
         if candidate is not None:
-            media = (
-                "image/svg+xml"
-                if candidate.suffix == ".svg"
-                else "image/x-icon"
-            )
+            media = "image/svg+xml" if candidate.suffix == ".svg" else "image/x-icon"
             return FileResponse(candidate, media_type=media)
     raise HTTPException(status_code=404, detail="Frontend favicon does not exist.")
+
 
 def get_current_queue():
     try:
@@ -883,6 +1186,7 @@ def get_current_queue():
         task_id = None
     runtime = runtime_registry.get(task_id) if task_id else None
     return runtime.broker if runtime is not None else None
+
 
 def is_current_thread_stopped():
     try:
@@ -924,11 +1228,7 @@ def _split_windows_command_line(command: str) -> list[str]:
                     if slash_count % 2:
                         argument.append('"')
                         position += 1
-                    elif (
-                        in_quotes
-                        and position + 1 < length
-                        and command[position + 1] == '"'
-                    ):
+                    elif in_quotes and position + 1 < length and command[position + 1] == '"':
                         argument.append('"')
                         position += 2
                     else:
@@ -938,11 +1238,7 @@ def _split_windows_command_line(command: str) -> list[str]:
                     argument.extend("\\" * slash_count)
                 continue
             if character == '"':
-                if (
-                    in_quotes
-                    and position + 1 < length
-                    and command[position + 1] == '"'
-                ):
+                if in_quotes and position + 1 < length and command[position + 1] == '"':
                     argument.append('"')
                     position += 2
                 else:
@@ -962,11 +1258,7 @@ def _normalize_test_command(
 ) -> list[str] | None:
     if value is None:
         return None
-    arguments = (
-        _split_windows_command_line(value)
-        if isinstance(value, str)
-        else list(value)
-    )
+    arguments = _split_windows_command_line(value) if isinstance(value, str) else list(value)
     if not arguments:
         return None
     if not arguments[0]:
@@ -987,6 +1279,7 @@ class TaskRequest(StrictRequestModel):
     files: str = ""
     mode: str
     project_mode: str = "edit"
+    approval_mode: Literal["manual", "staging_auto"] = "manual"
     auto_apply: bool = True
     create_zip: bool = True
     model: str = "claude-sonnet-5"
@@ -999,7 +1292,7 @@ class TaskRequest(StrictRequestModel):
     manager_effort: str | None = None
     reviewer_model: str = "claude-sonnet-5"
     reviewer_effort: str = "high"
-    account_mode: str = "sticky" # Bổ sung tham số Sticky/Router
+    account_mode: str = "sticky"  # Bổ sung tham số Sticky/Router
     test_cmd: list[str] | str | None = None
     max_turns: int = Field(default=config.MAX_TURNS, ge=1, le=500)
     auto_continue: bool = False
@@ -1010,21 +1303,9 @@ class TaskRequest(StrictRequestModel):
     max_parallel_managers: int = Field(default=4, ge=1, le=32)
     # Total child agents for each Manager: N-1 Coders and one dedicated Tester.
     max_workers_per_manager: int = Field(default=5, ge=2, le=32)
-    max_parallel_workers_per_manager: int | None = Field(
-        default=None, ge=1, le=31
-    )
+    max_parallel_workers_per_manager: int | None = Field(default=None, ge=1, le=31)
     max_parallel_workers: int = Field(default=8, ge=1, le=64)
-    max_model_calls: int | None = Field(default=None, ge=1, le=10000)
-    max_wall_clock_seconds: int | None = Field(
-        default=None,
-        ge=10,
-        le=604800,
-    )
-    max_estimated_input_tokens: int | None = Field(
-        default=None,
-        ge=1000,
-        le=100000000,
-    )
+
 
 class ChatReplyRequest(StrictRequestModel):
     message: str
@@ -1064,16 +1345,18 @@ def get_ui():
         raise HTTPException(status_code=503, detail="React frontend is unavailable.")
     return FileResponse(workspace, media_type="text/html")
 
+
 @app.get("/api/pick-files")
 def pick_files():
     try:
         root = tk.Tk()
         root.withdraw()
-        root.attributes('-topmost', True)
+        root.attributes("-topmost", True)
         file_paths = filedialog.askopenfilenames(title="Chọn các file Code cần xử lý")
         root.destroy()
         if file_paths:
             import os
+
             paths = [Path(p) for p in file_paths]
             common_root = os.path.commonpath([p.parent for p in paths])
             rel_files = [str(p.relative_to(common_root)).replace("\\", "/") for p in paths]
@@ -1105,6 +1388,7 @@ def chat_reply(task_id: str, req: ChatReplyRequest):
         return {"status": "sent"}
     return {"error": "Luồng chat không tồn tại hoặc đã đóng"}
 
+
 @app.post("/api/run")
 def run_task(req: TaskRequest):
     return _start_task(req)
@@ -1112,6 +1396,16 @@ def run_task(req: TaskRequest):
 
 def _start_task(req: TaskRequest, resume_task_id: str | None = None):
     is_resume = resume_task_id is not None
+    if req.approval_mode == "staging_auto" and (
+        req.mode != "orchestrator" or req.project_mode != "new_project"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "approval_mode=staging_auto chỉ được dùng cho "
+                "Orchestrator new_project trong staging được quản lý."
+            ),
+        )
     manager_cap = req.max_managers or req.max_parallel_managers
     if req.max_parallel_managers > manager_cap:
         raise HTTPException(
@@ -1137,11 +1431,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
             detail="Orchestrator mode yêu cầu project root.",
         )
     root_path = Path(raw_root).resolve() if raw_root else Path.cwd().resolve()
-    if (
-        req.mode == "orchestrator"
-        and req.project_mode == "new_project"
-        and not is_resume
-    ):
+    if req.mode == "orchestrator" and req.project_mode == "new_project" and not is_resume:
         if root_path.exists() and not root_path.is_dir():
             raise HTTPException(status_code=400, detail="Destination phải là thư mục.")
         if root_path.exists() and any(root_path.iterdir()):
@@ -1155,11 +1445,11 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                 detail="Thư mục cha của destination không tồn tại.",
             )
     elif not root_path.is_dir() and not (
-        is_resume
-        and req.mode == "orchestrator"
-        and req.project_mode == "new_project"
+        is_resume and req.mode == "orchestrator" and req.project_mode == "new_project"
     ):
-        raise HTTPException(status_code=400, detail="Project root không tồn tại hoặc không phải thư mục.")
+        raise HTTPException(
+            status_code=400, detail="Project root không tồn tại hoặc không phải thư mục."
+        )
     if (
         req.mode == "orchestrator"
         and req.hierarchy_enabled
@@ -1182,9 +1472,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
             parts = item.split(":", 1)
             path_utils.ensure_context_path_safe(parts[0])
             normalized, _ = path_utils.resolve_under_root(root_path, parts[0])
-            files_list.append(
-                f"{normalized}:{parts[1]}" if len(parts) > 1 else normalized
-            )
+            files_list.append(f"{normalized}:{parts[1]}" if len(parts) > 1 else normalized)
     except (path_utils.PathEscapeError, path_utils.SensitivePathError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1193,11 +1481,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     task_id = resume_task_id or str(uuid.uuid4())
-    initial_sequence = (
-        hierarchy_repository.latest_event_sequence(task_id)
-        if is_resume
-        else 0
-    )
+    initial_sequence = hierarchy_repository.latest_event_sequence(task_id) if is_resume else 0
     try:
         runtime = runtime_registry.reserve(
             task_id,
@@ -1218,40 +1502,36 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                 root=str(root_path) if raw_root else "",
                 files=files_list,
                 settings={
-                "worker_model": req.model,
-                "worker_effort": req.effort,
-                "supervisor_model": req.supervisor_model,
-                "supervisor_effort": req.supervisor_effort,
-                "director_model": req.director_model or req.supervisor_model,
-                "director_effort": req.director_effort or req.supervisor_effort,
-                "manager_model": req.manager_model or req.supervisor_model,
-                "manager_effort": req.manager_effort or req.supervisor_effort,
-                "reviewer_model": req.reviewer_model,
-                "reviewer_effort": req.reviewer_effort,
-                "account_mode": req.account_mode,
-                "test_cmd": parsed_test_cmd,
-                "project_mode": req.project_mode,
-                "auto_apply": req.auto_apply,
-                "create_zip": req.create_zip,
-                "max_turns": req.max_turns,
-                "auto_continue": req.auto_continue,
-                "hierarchy_enabled": req.hierarchy_enabled,
-                "max_managers": manager_cap,
-                "max_parallel_managers": req.max_parallel_managers,
-                "max_workers_per_manager": req.max_workers_per_manager,
-                "max_parallel_workers_per_manager": (
-                    req.max_parallel_workers_per_manager
-                ),
-                "max_parallel_workers": req.max_parallel_workers,
-                "max_model_calls": req.max_model_calls,
-                "max_wall_clock_seconds": req.max_wall_clock_seconds,
-                    "max_estimated_input_tokens": req.max_estimated_input_tokens,
+                    "worker_model": req.model,
+                    "worker_effort": req.effort,
+                    "supervisor_model": req.supervisor_model,
+                    "supervisor_effort": req.supervisor_effort,
+                    "director_model": req.director_model or req.supervisor_model,
+                    "director_effort": req.director_effort or req.supervisor_effort,
+                    "manager_model": req.manager_model or req.supervisor_model,
+                    "manager_effort": req.manager_effort or req.supervisor_effort,
+                    "reviewer_model": req.reviewer_model,
+                    "reviewer_effort": req.reviewer_effort,
+                    "account_mode": req.account_mode,
+                    "test_cmd": parsed_test_cmd,
+                    "project_mode": req.project_mode,
+                    "approval_mode": req.approval_mode,
+                    "auto_apply": req.auto_apply,
+                    "create_zip": req.create_zip,
+                    "max_turns": req.max_turns,
+                    "auto_continue": req.auto_continue,
+                    "hierarchy_enabled": req.hierarchy_enabled,
+                    "max_managers": manager_cap,
+                    "max_parallel_managers": req.max_parallel_managers,
+                    "max_workers_per_manager": req.max_workers_per_manager,
+                    "max_parallel_workers_per_manager": (req.max_parallel_workers_per_manager),
+                    "max_parallel_workers": req.max_parallel_workers,
                 },
             )
     except Exception:
         runtime_registry.complete(runtime, timeout=0)
         raise
-    
+
     def background_worker(
         t_id,
         root,
@@ -1283,25 +1563,11 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
         max_workers_per_manager,
         max_parallel_workers_per_manager,
         max_parallel_workers,
+        approval_mode,
     ):
         task_runtime = runtime_registry.get(t_id)
         if task_runtime is None or task_runtime.broker is not q:
             return
-        task_settings = dict(
-            (task_manager.get_task(t_id) or {}).get("settings") or {}
-        )
-        register_task_budget(
-            t_id,
-            BudgetLimits(
-                max_model_calls=task_settings.get("max_model_calls"),
-                max_wall_clock_seconds=task_settings.get(
-                    "max_wall_clock_seconds"
-                ),
-                max_estimated_input_tokens=task_settings.get(
-                    "max_estimated_input_tokens"
-                ),
-            ),
-        )
 
         session_holder = {"id": f"legacy-{t_id}"}
         event_emit_lock = threading.RLock()
@@ -1311,96 +1577,16 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
 
         def emit(event):
             with event_emit_lock:
-                _emit_event(event)
-
-        def _emit_event(event):
-            raw = redaction.redact_event(dict(event))
-            session_id = str(raw.get("session_id") or session_holder["id"])
-            session_holder["id"] = session_id
-            event_type = str(raw.get("type") or "event")
-            envelope = EventEnvelope(
-                task_id=t_id,
-                session_id=session_id,
-                event_type=event_type,
-                payload={
-                    key: value
-                    for key, value in raw.items()
-                    if key not in {
-                        "type",
-                        "task_id",
-                        "session_id",
-                        "workstream_id",
-                        "work_item_id",
-                        "agent_instance_id",
-                        "call_id",
-                    }
-                },
-                workstream_id=raw.get("workstream_id"),
-                work_item_id=raw.get("work_item_id"),
-                agent_instance_id=raw.get("agent_instance_id"),
-                call_id=raw.get("call_id"),
-            )
-            task_event = dict(raw)
-            for large_field in (
-                "prompt",
-                "patch",
-                "diff",
-                "text",
-                "test_output",
-            ):
-                task_event.pop(large_field, None)
-            if isinstance(task_event.get("payload"), dict):
-                task_event["payload"] = {
-                    key: value
-                    for key, value in task_event["payload"].items()
-                    if key
-                    not in {
-                        "prompt",
-                        "patch",
-                        "diff",
-                        "text",
-                        "test_output",
-                    }
-                }
-            try:
-                stored = task_manager.record_event(
+                _emit_persisted_runtime_event(
                     t_id,
-                    task_event,
-                    envelope=envelope,
+                    session_holder,
+                    q,
+                    event,
                 )
-            except RuntimeError as exc:
-                if (
-                    str(exc)
-                    != "atomic event projection requires a repository"
-                ):
-                    raise
-                # Compatibility-only JSON/in-memory task stores have no shared
-                # transaction to join. Project first, then synthesize the live
-                # cursor without pretending the event was durably appended.
-                task_manager.record_event(t_id, task_event)
-                stored = replace(
-                    envelope,
-                    sequence=q.latest_sequence + 1,
-                )
-            if stored is None:
-                raise RuntimeError("task event projection did not commit")
-            wire = {
-                **raw,
-                **to_dict(stored),
-                "type": event_type,
-                "sequence": stored.sequence,
-                "timestamp": stored.timestamp.isoformat(),
-            }
-            _observe_runtime_event(
-                t_id,
-                session_id,
-                wire,
-                sequence=stored.sequence,
-            )
-            q.put(wire)
-        
+
         try:
             import orchestrator.llm_client as llm_client
+
             llm_client.thread_local.model = model
             llm_client.thread_local.effort = effort
             llm_client.thread_local.worker_model = model
@@ -1416,27 +1602,27 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
             llm_client.thread_local.account_mode = account_mode
             llm_client.thread_local.event_sink = emit
             llm_client.thread_local.task_id = t_id
-            llm_client.thread_local.abort_check = (
-                task_runtime.cancellation.is_set
-            )
+            llm_client.thread_local.abort_check = task_runtime.cancellation.is_set
         except Exception:
             pass
-        
+
         try:
             _ensure_account_lease_store()
-            emit({
-                "type": "status",
-                "data": (
-                    (
-                        f"🚀 Hierarchy | Director: {director_model}/{director_effort} "
-                        f"| Manager: {manager_model}/{manager_effort} "
-                        if hierarchy_enabled
-                        else f"🚀 Task {t_id} | Supervisor: {supervisor_model}/{supervisor_effort} "
-                    )
-                    + f"| Worker: {model}/{effort} | Tester: {reviewer_model}/{reviewer_effort}"
-                ),
-            })
-            
+            emit(
+                {
+                    "type": "status",
+                    "data": (
+                        (
+                            f"🚀 Hierarchy | Director: {director_model}/{director_effort} "
+                            f"| Manager: {manager_model}/{manager_effort} "
+                            if hierarchy_enabled
+                            else f"🚀 Task {t_id} | Supervisor: {supervisor_model}/{supervisor_effort} "
+                        )
+                        + f"| Worker: {model}/{effort} | Tester: {reviewer_model}/{reviewer_effort}"
+                    ),
+                }
+            )
+
             if mode == "orchestrator":
                 llm_client.thread_local.is_continuation = False
                 execution_root = root
@@ -1470,21 +1656,16 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                         f"YÊU CẦU USER:\n{task_desc}"
                     )
                 project_key = str(
-                    Path(root if project_mode == "new_project" else execution_root)
-                    .resolve()
+                    Path(root if project_mode == "new_project" else execution_root).resolve()
                 ).casefold()
-                project_lease = ProjectLeaseManager(
-                    hierarchy_repository
-                ).acquire(
+                project_lease = ProjectLeaseManager(hierarchy_repository).acquire(
                     project_key,
                     t_id,
                     90,
                     purpose=f"{project_mode}:{'hierarchy' if hierarchy_enabled else 'legacy'}",
                 )
                 if project_lease is None:
-                    raise RuntimeError(
-                        "Project is already leased by another active task."
-                    )
+                    raise RuntimeError("Project is already leased by another active task.")
                 emit(
                     {
                         "type": "project_lease_acquired",
@@ -1521,19 +1702,13 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                 lease_heartbeat_thread.start()
                 approved_file_callback = None
                 if project_mode == "new_project":
+
                     def approved_file_callback(file_path):
                         manifest_before = artifact_manager.get_manifest(t_id) or {}
-                        source = (
-                            artifact_manager.get_staging_workspace(t_id)
-                            / file_path
-                        )
+                        source = artifact_manager.get_staging_workspace(t_id) / file_path
                         source_hash = sha256_file(source)
-                        destination = Path(
-                            manifest_before.get("destination") or root
-                        ).resolve()
-                        _, destination_file = path_utils.resolve_under_root(
-                            destination, file_path
-                        )
+                        destination = Path(manifest_before.get("destination") or root).resolve()
+                        _, destination_file = path_utils.resolve_under_root(destination, file_path)
                         before_hash = sha256_file(destination_file)
                         effect = hierarchy_repository.begin_effect(
                             t_id,
@@ -1542,17 +1717,13 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             file_path,
                             payload={
                                 "source_sha256": source_hash,
-                                "auto_apply": bool(
-                                    manifest_before.get("auto_apply", True)
-                                ),
+                                "auto_apply": bool(manifest_before.get("auto_apply", True)),
                             },
                             before_sha256=before_hash,
                         )
                         try:
                             progress_manifest = project_lease.mutate(
-                                lambda: artifact_manager.materialize_approved_file(
-                                    t_id, file_path
-                                )
+                                lambda: artifact_manager.materialize_approved_file(t_id, file_path)
                             )
                             file_metadata = next(
                                 (
@@ -1562,9 +1733,8 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                                 ),
                                 {},
                             )
-                            after_hash = (
-                                file_metadata.get("after_sha256")
-                                or file_metadata.get("sha256")
+                            after_hash = file_metadata.get("after_sha256") or file_metadata.get(
+                                "sha256"
                             )
                             effect = hierarchy_repository.complete_effect(
                                 effect.effect_id,
@@ -1581,9 +1751,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                                     f"{type(exc).__name__}: {exc}",
                                 )
                             raise
-                        task_manager.set_artifact(
-                            t_id, progress_manifest
-                        )
+                        task_manager.set_artifact(t_id, progress_manifest)
                         emit(
                             {
                                 "type": "artifact_progress",
@@ -1596,11 +1764,11 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             }
                         )
 
-                def wait_for_human_approval(candidate: dict) -> bool:
+                def wait_for_approval(candidate: dict) -> bool:
                     approval = hierarchy_repository.request_approval(
                         t_id,
                         idempotency_key=(
-                            "patch:"
+                            f"task:{t_id}:patch:"
                             f"{candidate.get('work_item_id')}:"
                             f"{candidate.get('target')}:"
                             f"{candidate.get('patch_sha256')}"
@@ -1615,10 +1783,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             "work_item_id": candidate.get("work_item_id"),
                             "attempt_id": candidate.get("attempt_id"),
                         },
-                        workstream_id=str(
-                            candidate.get("workstream_id") or ""
-                        )
-                        or None,
+                        workstream_id=str(candidate.get("workstream_id") or "") or None,
                     )
                     if approval["status"] == "pending":
                         emit(
@@ -1630,8 +1795,43 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                                 "target": approval["target"],
                                 "reason": approval["reason"],
                                 "status": approval["status"],
+                                "approval_mode": approval_mode,
                             }
                         )
+                        if approval_mode == "staging_auto":
+                            confined = (
+                                project_mode == "new_project"
+                                and _is_managed_staging_workspace(t_id, execution_root)
+                            )
+                            decision = "approved" if confined else "rejected"
+                            audit_reason = (
+                                "staging_auto approved this request because the task is "
+                                "new_project and execution remains confined to the "
+                                "orchestrator-managed staging workspace."
+                                if confined
+                                else (
+                                    "staging_auto rejected this request because execution "
+                                    "is not confined to the orchestrator-managed staging "
+                                    "workspace."
+                                )
+                            )
+                            approval = hierarchy_repository.decide_approval(
+                                approval["approval_id"],
+                                decision=decision,
+                                reason=audit_reason,
+                            )
+                            emit(
+                                {
+                                    "type": "approval_decided",
+                                    "approval_id": approval["approval_id"],
+                                    "workstream_id": approval["workstream_id"],
+                                    "decision": approval["status"],
+                                    "reason": approval["decision_reason"],
+                                    "approval_mode": approval_mode,
+                                    "automated": True,
+                                }
+                            )
+                            return approval["status"] == "approved"
                         task_manager.set_status(
                             t_id,
                             "WAITING_INPUT",
@@ -1643,9 +1843,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                         time.sleep(0.5)
                         matches = [
                             item
-                            for item in hierarchy_repository.list_approvals(
-                                t_id
-                            )
+                            for item in hierarchy_repository.list_approvals(t_id)
                             if item["approval_id"] == approval["approval_id"]
                         ]
                         if not matches:
@@ -1666,9 +1864,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             max_managers=max_managers,
                             max_parallel_managers=max_parallel_managers,
                             max_workers_per_manager=max_workers_per_manager,
-                            max_parallel_workers_per_manager=(
-                                max_parallel_workers_per_manager
-                            ),
+                            max_parallel_workers_per_manager=(max_parallel_workers_per_manager),
                             max_parallel_workers=max_parallel_workers,
                         ),
                         director_model=director_model,
@@ -1686,17 +1882,15 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                         resume_session=resume_session,
                         agent_config_resolver=(
                             lambda agent_id, role, default_model, default_effort: (
-                                (
-                                    task_manager.get_agent_override(t_id, agent_id)
-                                    or {}
-                                ).get("model", default_model),
-                                (
-                                    task_manager.get_agent_override(t_id, agent_id)
-                                    or {}
-                                ).get("effort", default_effort),
+                                (task_manager.get_agent_override(t_id, agent_id) or {}).get(
+                                    "model", default_model
+                                ),
+                                (task_manager.get_agent_override(t_id, agent_id) or {}).get(
+                                    "effort", default_effort
+                                ),
                             )
                         ),
-                        approval_callback=wait_for_human_approval,
+                        approval_callback=wait_for_approval,
                         cancelled=task_runtime.cancellation.is_set,
                     )
                 else:
@@ -1727,9 +1921,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                                 {
                                     "type": "auto_continue",
                                     "cycle": auto_cycles,
-                                    "turn_count": result.final_state.get(
-                                        "turn_count", 0
-                                    ),
+                                    "turn_count": result.final_state.get("turn_count", 0),
                                 }
                             )
                             continue
@@ -1739,10 +1931,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                     task_manager.finish_task(t_id, status="STOPPED", reason="user_stopped")
                 else:
                     artifact_manifest = None
-                    if (
-                        project_mode == "new_project"
-                        and result.stopped_reason == "task_completed"
-                    ):
+                    if project_mode == "new_project" and result.stopped_reason == "task_completed":
                         finalize_effect = hierarchy_repository.begin_effect(
                             t_id,
                             "artifact-finalize:v1",
@@ -1759,31 +1948,19 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                         }:
                             artifact_manifest = artifact_manager.get_manifest(t_id)
                             if artifact_manifest is None:
-                                raise RuntimeError(
-                                    "Finalized artifact receipt has no manifest"
-                                )
+                                raise RuntimeError("Finalized artifact receipt has no manifest")
                         else:
                             try:
                                 artifact_manifest = project_lease.mutate(
-                                    lambda: artifact_manager.finalize_workspace(
-                                        t_id
-                                    )
+                                    lambda: artifact_manager.finalize_workspace(t_id)
                                 )
-                                finalize_effect = (
-                                    hierarchy_repository.complete_effect(
-                                        finalize_effect.effect_id,
-                                        result={
-                                            "status": artifact_manifest.get(
-                                                "status"
-                                            ),
-                                            "file_count": len(
-                                                artifact_manifest.get("files", [])
-                                            ),
-                                            "zip_created": bool(
-                                                artifact_manifest.get("zip_path")
-                                            ),
-                                        },
-                                    )
+                                finalize_effect = hierarchy_repository.complete_effect(
+                                    finalize_effect.effect_id,
+                                    result={
+                                        "status": artifact_manifest.get("status"),
+                                        "file_count": len(artifact_manifest.get("files", [])),
+                                        "zip_created": bool(artifact_manifest.get("zip_path")),
+                                    },
                                 )
                             except Exception as exc:
                                 hierarchy_repository.fail_effect(
@@ -1792,19 +1969,21 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                                 )
                                 raise
                         task_manager.set_artifact(t_id, artifact_manifest)
-                        emit({
-                            "type": "artifact_ready",
-                            "status": artifact_manifest["status"],
-                            "files": artifact_manifest["files"],
-                            "effect_id": finalize_effect.effect_id,
-                            "download_url": (
-                                f"/api/tasks/{t_id}/artifacts/download"
-                                if artifact_manifest.get("zip_path")
-                                else None
-                            ),
-                        })
+                        emit(
+                            {
+                                "type": "artifact_ready",
+                                "status": artifact_manifest["status"],
+                                "files": artifact_manifest["files"],
+                                "effect_id": finalize_effect.effect_id,
+                                "download_url": (
+                                    f"/api/tasks/{t_id}/artifacts/download"
+                                    if artifact_manifest.get("zip_path")
+                                    else None
+                                ),
+                            }
+                        )
                     finish_payload = {
-                        "type": "finish", 
+                        "type": "finish",
                         "reason": result.stopped_reason,
                         "turns": [
                             {
@@ -1815,11 +1994,19 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             for t in result.turns
                         ],
                         "final_state": {
-                            "last_worker_feedback": result.final_state.get("last_worker_feedback", ""),
-                            "last_execution_result": result.final_state.get("last_execution_result"),
-                            "last_reviewer_feedback": result.final_state.get("last_reviewer_feedback", ""),
+                            "last_worker_feedback": result.final_state.get(
+                                "last_worker_feedback", ""
+                            ),
+                            "last_execution_result": result.final_state.get(
+                                "last_execution_result"
+                            ),
+                            "last_reviewer_feedback": result.final_state.get(
+                                "last_reviewer_feedback", ""
+                            ),
                             "last_review_verdict": result.final_state.get("last_review_verdict"),
-                            "reviewer_next_instructions": result.final_state.get("reviewer_next_instructions", ""),
+                            "reviewer_next_instructions": result.final_state.get(
+                                "reviewer_next_instructions", ""
+                            ),
                             "turn_count": result.final_state.get("turn_count", 0),
                         },
                         "artifact": artifact_manifest,
@@ -1833,6 +2020,10 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             else (
                                 "MAX_TURNS"
                                 if result.stopped_reason == "max_turns_reached"
+                                else "PARTIAL"
+                                if result.stopped_reason == "task_partial"
+                                else "STOPPED"
+                                if result.stopped_reason == "cancelled"
                                 else "FAILED"
                             )
                         ),
@@ -1847,7 +2038,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                 llm_client.thread_local.worker_effort = effort
                 task_runtime.chat_queue = queue.Queue()
                 chat_history = []
-                
+
                 context_blocks = []
                 for f in files:
                     rel_path = f.split(":", 1)[0]
@@ -1855,45 +2046,52 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                     if file_path.exists():
                         content = file_path.read_text(encoding="utf-8", errors="replace")
                         context_blocks.append(f"### FILE: {f}\n```\n{content}\n```")
-                
+
                 if context_blocks:
-                    current_msg = f"Yêu cầu ban đầu:\n{task_desc}\n\nNội dung code:\n" + "\n".join(context_blocks)
+                    current_msg = f"Yêu cầu ban đầu:\n{task_desc}\n\nNội dung code:\n" + "\n".join(
+                        context_blocks
+                    )
                 else:
                     current_msg = task_desc
-                
+
                 is_first_turn = True
-                
+
                 # Vòng lặp chat vô tận cho đến khi bị ép dừng
                 while not task_runtime.cancellation.is_set():
                     # NẾU ROUTER: Bắt buộc nhét tay mớ History vào mỗi lần gọi.
-                    if account_mode == 'router':
+                    if account_mode == "router":
                         if is_first_turn:
                             full_prompt = current_msg
                         else:
                             full_prompt = "\n\n".join(chat_history) + f"\n\nUser: {current_msg}"
-                        llm_client.thread_local.is_continuation = False 
+                        llm_client.thread_local.is_continuation = False
                     # NẾU STICKY: Chỉ ném tin nhắn mới, Claude API tự nối chat_uuid!
                     else:
                         full_prompt = current_msg
                         llm_client.thread_local.is_continuation = not is_first_turn
 
-                    result = call_agent("Bạn là một trợ lý AI thông minh.", full_prompt, tools=[], require_json=False)
-                    
+                    result = call_agent(
+                        "Bạn là một trợ lý AI thông minh.",
+                        full_prompt,
+                        tools=[],
+                        require_json=False,
+                    )
+
                     if task_runtime.cancellation.is_set():
                         emit({"type": "error", "data": "🛑 Luồng chat bị ép dừng!"})
                         break
-                    
+
                     answer = result.raw_response.get("content", "")
-                    
+
                     # Lưu lại lịch sử
                     chat_history.append(f"User: {current_msg}")
                     chat_history.append(f"Assistant: {answer}")
                     is_first_turn = False
-                    
+
                     # Báo cho UI là xong 1 turn, chuẩn bị nhận tiếp
                     emit({"type": "finish_chat_turn"})
                     emit({"type": "status", "data": "⏳ Đang chờ tin nhắn tiếp theo..."})
-                    
+
                     # Treo luồng chờ người dùng gõ tin nhắn mới
                     next_msg = None
                     while not task_runtime.cancellation.is_set():
@@ -1903,13 +2101,13 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
                             break
                         except queue.Empty:
                             continue
-                            
+
                     if task_runtime.cancellation.is_set():
                         break
-                        
+
                     if next_msg:
                         current_msg = next_msg
-                        
+
                 # Dọn dẹp hàng đợi khi thoát
                 task_runtime.chat_queue = None
                 task_manager.finish_task(
@@ -1922,7 +2120,6 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
             emit({"type": "error", "data": str(e)})
             task_manager.finish_task(t_id, status="FAILED", reason=str(e))
         finally:
-            remove_task_budget(t_id)
             lease_heartbeat_stop.set()
             if lease_heartbeat_thread is not None:
                 lease_heartbeat_thread.join(timeout=2)
@@ -1970,6 +2167,7 @@ def _start_task(req: TaskRequest, resume_task_id: str | None = None):
             req.max_workers_per_manager,
             req.max_parallel_workers_per_manager,
             req.max_parallel_workers,
+            req.approval_mode,
         ),
         daemon=False,
     )
@@ -2024,7 +2222,18 @@ def get_task_timeline(task_id: str, after: int = 0, limit: int = 1000):
         after_sequence=max(0, after),
         limit=safe_limit,
     )
-    return {"events": [_event_wire(event) for event in events]}
+    cursor = hierarchy_repository.event_cursor(task_id)
+    latest_sequence = int(cursor.get("latest_sequence") or 0)
+    retained_from_sequence = int(cursor.get("retained_from_sequence") or 1)
+    next_after = events[-1].sequence if events else max(0, after)
+    return {
+        "events": [_event_wire(event) for event in events],
+        "next_after": next_after,
+        "latest_sequence": latest_sequence,
+        "retained_from_sequence": retained_from_sequence,
+        "has_more": next_after < latest_sequence,
+        "history_incomplete": max(0, after) < retained_from_sequence - 1,
+    }
 
 
 @app.get("/api/tasks/{task_id}/attempts")
@@ -2042,16 +2251,43 @@ def get_task_attempts(task_id: str, work_item_id: str | None = None):
     }
 
 
+@app.get("/api/tasks/{task_id}/request-attempts")
+def get_task_request_attempts(
+    task_id: str,
+    limit: int = 100,
+    schema_errors_only: bool = False,
+    include_content: bool = False,
+):
+    """Return sanitized provider-attempt evidence; large bodies are opt-in."""
+    if task_manager.get_task(task_id) is None:
+        raise HTTPException(status_code=404, detail="Task không tồn tại.")
+    if limit < 1 or limit > 1000:
+        raise HTTPException(status_code=400, detail="limit phải từ 1 đến 1000.")
+    attempts = hierarchy_repository.list_llm_request_attempts(
+        task_id,
+        schema_errors_only=schema_errors_only,
+        limit=limit,
+    )
+    if not include_content:
+        content_fields = {
+            "logical_request",
+            "tool_schema",
+            "wire_body",
+            "response_body",
+            "parser_result",
+        }
+        attempts = [
+            {key: value for key, value in attempt.items() if key not in content_fields}
+            for attempt in attempts
+        ]
+    return {"attempts": attempts}
+
+
 @app.get("/api/tasks/{task_id}/effects")
 def get_task_effects(task_id: str):
     if task_manager.get_task(task_id) is None:
         raise HTTPException(status_code=404, detail="Task không tồn tại.")
-    return {
-        "effects": [
-            to_dict(item)
-            for item in hierarchy_repository.list_effects(task_id)
-        ]
-    }
+    return {"effects": [to_dict(item) for item in hierarchy_repository.list_effects(task_id)]}
 
 
 @app.get("/api/tasks/{task_id}/observability")
@@ -2073,6 +2309,7 @@ def _record_control_event(task_id: str, event_type: str, payload: dict) -> dict:
         task_id=task_id,
         session_id=f"control-{task_id}",
         event_type=event_type,
+        version=EVENT_SCHEMA_VERSION,
         payload=payload,
     )
     stored = task_manager.record_event(
@@ -2230,7 +2467,13 @@ def resume_task(task_id: str):
             status_code=400,
             detail="Resume bền vững hiện chỉ hỗ trợ Orchestrator task.",
         )
-    resumable_statuses = {"STOPPED", "FAILED", "MAX_TURNS", "INTERRUPTED"}
+    resumable_statuses = {
+        "STOPPED",
+        "FAILED",
+        "PARTIAL",
+        "MAX_TURNS",
+        "INTERRUPTED",
+    }
     if task.get("status") not in resumable_statuses:
         raise HTTPException(
             status_code=409,
@@ -2243,20 +2486,15 @@ def resume_task(task_id: str):
         task=task.get("prompt", ""),
         files=",".join(task.get("files") or []),
         mode=task.get("mode", "orchestrator"),
-        project_mode=settings.get(
-            "project_mode", task.get("project_mode", "edit")
-        ),
+        project_mode=settings.get("project_mode", task.get("project_mode", "edit")),
+        approval_mode=settings.get("approval_mode", "manual"),
         auto_apply=settings.get("auto_apply", True),
         create_zip=settings.get("create_zip", True),
         model=settings.get("worker_model", "claude-sonnet-5"),
         effort=settings.get("worker_effort", "max"),
-        supervisor_model=settings.get(
-            "supervisor_model", "claude-sonnet-5"
-        ),
+        supervisor_model=settings.get("supervisor_model", "claude-sonnet-5"),
         supervisor_effort=settings.get("supervisor_effort", "max"),
-        reviewer_model=settings.get(
-            "reviewer_model", "claude-sonnet-5"
-        ),
+        reviewer_model=settings.get("reviewer_model", "claude-sonnet-5"),
         reviewer_effort=settings.get("reviewer_effort", "high"),
         director_model=settings.get("director_model"),
         director_effort=settings.get("director_effort"),
@@ -2273,9 +2511,7 @@ def resume_task(task_id: str):
         ),
         max_parallel_managers=settings.get("max_parallel_managers", 4),
         max_workers_per_manager=settings.get("max_workers_per_manager", 5),
-        max_parallel_workers_per_manager=settings.get(
-            "max_parallel_workers_per_manager"
-        ),
+        max_parallel_workers_per_manager=settings.get("max_parallel_workers_per_manager"),
         max_parallel_workers=settings.get("max_parallel_workers", 8),
     )
     return _start_task(request, resume_task_id=task_id)
@@ -2346,8 +2582,16 @@ def delete_task_artifacts(task_id: str, force: bool = False):
 def delete_task(task_id: str):
     task = task_manager.get_task(task_id)
     active_statuses = {
-        "QUEUED", "RUNNING", "PLANNING", "MANAGING", "CODING",
-        "REVIEWING", "REVISION", "WAITING_INPUT", "STOPPING", "RESUMING",
+        "QUEUED",
+        "RUNNING",
+        "PLANNING",
+        "MANAGING",
+        "CODING",
+        "REVIEWING",
+        "REVISION",
+        "WAITING_INPUT",
+        "STOPPING",
+        "RESUMING",
     }
     if task is not None and task.get("status") in active_statuses:
         raise HTTPException(status_code=409, detail="Không thể xóa task đang chạy.")
@@ -2363,6 +2607,7 @@ def delete_task(task_id: str):
         raise HTTPException(status_code=404, detail="Task không tồn tại.")
     return {"status": "deleted", "purged": purged}
 
+
 @app.post("/api/stop/{task_id}")
 def stop_task(task_id: str):
     runtime = runtime_registry.get(task_id)
@@ -2370,6 +2615,7 @@ def stop_task(task_id: str):
         task_manager.set_status(task_id, "STOPPING", "stopping")
         runtime.cancellation.set()
     return {"status": "stopping"}
+
 
 @app.get("/api/stream/{task_id}")
 def stream_output(task_id: str, after: int = 0):
@@ -2379,6 +2625,19 @@ def stream_output(task_id: str, after: int = 0):
         task = task_manager.get_task(task_id)
         last_sequence = max(0, after)
         replayed_any = False
+        cursor_hook = getattr(hierarchy_repository, "event_cursor", None)
+        cursor = cursor_hook(task_id) if callable(cursor_hook) else {}
+        retained_from_sequence = int(cursor.get("retained_from_sequence") or 1)
+        if last_sequence < retained_from_sequence - 1:
+            last_sequence = retained_from_sequence - 1
+            gap = {
+                "type": "timeline_gap",
+                "sequence": last_sequence,
+                "retained_from_sequence": retained_from_sequence,
+                "latest_sequence": int(cursor.get("latest_sequence") or last_sequence),
+                "history_incomplete": True,
+            }
+            yield f"data: {json.dumps(gap)}\n\n"
         while True:
             persisted = hierarchy_repository.replay_events(
                 task_id,
@@ -2430,4 +2689,5 @@ def stream_output(task_id: str, after: int = 0):
                 yield f"data: {json.dumps(msg)}\n\n"
                 if msg["type"] == "done":
                     return
+
     return StreamingResponse(event_stream(), media_type="text/event-stream")

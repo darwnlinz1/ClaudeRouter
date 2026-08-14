@@ -13,6 +13,7 @@ from orchestrator.event_schema import (
     TYPESCRIPT_ARTIFACT_PATH,
     generate_typescript,
     validate_event,
+    validate_event_payload,
 )
 from orchestrator.lifecycle import LifecycleCoordinator
 from orchestrator.models import EventEnvelope
@@ -92,7 +93,7 @@ def test_old_schema_migrates_events_and_exposes_version(tmp_path):
         assert appended.sequence == 8
 
 
-def test_task_manager_imports_json_once_then_uses_sqlite_snapshot(
+def test_task_manager_imports_terminal_json_without_late_status_mutation(
     monkeypatch,
     tmp_path,
 ):
@@ -122,11 +123,11 @@ def test_task_manager_imports_json_once_then_uses_sqlite_snapshot(
         task_manager.configure_repository(repository)
         task_manager.set_status("legacy", "REVISION", "review")
 
-        assert repository.get_task_snapshot("legacy")["status"] == "REVISION"
+        assert repository.get_task_snapshot("legacy")["status"] == "COMPLETED"
         legacy_file.write_text("{}", encoding="utf-8")
         task_manager.configure_repository(repository)
-        assert task_manager.get_task("legacy")["status"] == "INTERRUPTED"
-        assert repository.get_task_snapshot("legacy")["status"] == "INTERRUPTED"
+        assert task_manager.get_task("legacy")["status"] == "COMPLETED"
+        assert repository.get_task_snapshot("legacy")["status"] == "COMPLETED"
 
     task_manager.configure_repository(None)
     task_manager._records.clear()
@@ -180,6 +181,100 @@ def test_event_schema_codegen_is_deterministic_and_legacy_is_additive():
     assert validate_event(legacy) == legacy
     with pytest.raises(ValueError, match="missing required"):
         validate_event({"type": "model_request_started"})
+
+
+def test_envelope_event_type_is_authoritative_over_payload_discriminator():
+    payload = validate_event_payload(
+        "model_request_failed",
+        {
+            "type": "legacy.plugin_event",
+            "role": "worker",
+            "error": "provider failed",
+        },
+    )
+
+    assert "type" not in payload
+    assert payload["role"] == "worker"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "agent_waiting_account",
+            "role": "worker",
+            "status": "waiting_account",
+            "summary": "Waiting for a free account",
+        },
+        {
+            "type": "agent_account_assigned",
+            "role": "worker",
+            "status": "queued",
+        },
+        {
+            "type": "event_schema_validation_repaired",
+            "action": "repaired",
+            "source_event_type": "model_request_failed",
+            "summary": "Repaired",
+            "validation_error": "missing error",
+        },
+        {
+            "type": "crisis_detected",
+            "crisis_id": "crisis-1",
+            "scope": "workstream",
+            "failure_kind": "syntax",
+            "reason": "failed",
+            "retryable": True,
+        },
+        {
+            "type": "remediation_exhausted",
+            "crisis_id": "crisis-1",
+            "scope": "workstream",
+            "reason": "repeated",
+        },
+        {
+            "type": "manager_terminal_report",
+            "execution_epoch": "epoch-1",
+            "manager_id": "manager-1",
+            "workstream_id": "core",
+            "status": "partial",
+            "completed_item_ids": ["a"],
+            "abandoned_item_ids": ["b"],
+            "skipped_item_ids": [],
+            "artifacts": ["a.py"],
+            "reasons": ["b failed"],
+            "log_refs": ["manager.log"],
+            "synthesized": False,
+        },
+        {
+            "type": "manager_report_barrier",
+            "execution_epoch": "epoch-1",
+            "expected_manager_ids": ["manager-1"],
+            "reported_manager_ids": ["manager-1"],
+            "expected_count": 1,
+            "reported_count": 1,
+            "satisfied": True,
+        },
+        {
+            "type": "director_final_review",
+            "verdict": "approved",
+            "summary": "reviewed",
+            "manager_reports_expected": 1,
+            "manager_reports_reported": 1,
+            "final_review_number": 1,
+        },
+        {
+            "type": "hierarchy_partial",
+            "verdict": "approved",
+            "summary": "partial",
+            "completed_workstream_ids": ["a"],
+            "abandoned_workstream_ids": ["b"],
+            "skipped_workstream_ids": [],
+        },
+    ],
+)
+def test_account_schema_and_terminal_events_are_typed(event):
+    assert validate_event(event) == event
 
 
 def test_human_approval_queue_is_idempotent_and_auditable(tmp_path):
@@ -320,7 +415,10 @@ def test_structured_observer_bounds_memory_and_can_skip_durable_records():
     assert [record["attributes"]["index"] for record in repository.saved] == [0, 2]
 
 
-def test_secret_fixture_is_detected_redacted_and_blocked(monkeypatch, tmp_path):
+def test_secret_fixture_is_detected_redacted_but_packaging_is_audit_only(
+    monkeypatch,
+    tmp_path,
+):
     secret = "AKIAIOSFODNN7EXAMPLE"
     prompt = f"Deploy with aws key {secret}"
     findings = scan_secrets(prompt, candidate_type="prompt")
@@ -337,8 +435,8 @@ def test_secret_fixture_is_detected_redacted_and_blocked(monkeypatch, tmp_path):
         create_zip=False,
     )
     (staging / "config.txt").write_text(prompt, encoding="utf-8")
-    with pytest.raises(ValueError, match="potential credentials"):
-        artifact_manager.finalize_workspace("task-secret")
+    manifest = artifact_manager.finalize_workspace("task-secret")
+    assert {item["path"] for item in manifest["files"]} == {"config.txt"}
 
 
 def test_retention_preserves_terminal_events_records_and_cursor(tmp_path):
@@ -455,7 +553,7 @@ def test_artifact_reconciliation_detects_missing_tampered_and_extras(
     assert result["unapproved_extras"] == ["extra.txt"]
 
 
-def test_task_end_rejects_unfinished_call_then_persists_terminal_state(
+def test_task_end_rejects_unfinished_call_and_remains_terminal(
     monkeypatch,
     tmp_path,
 ):
@@ -499,9 +597,13 @@ def test_task_end_rejects_unfinished_call_then_persists_terminal_state(
     )
     task_manager.finish_task("task-invariant", status="COMPLETED")
     completed = task_manager.get_task("task-invariant")
-    assert completed["status"] == "COMPLETED"
-    assert completed["hierarchy"]["completion_invariant"]["balanced"] is True
+    assert completed["status"] == "FAILED"
+    assert completed["hierarchy"]["completion_invariant"]["balanced"] is False
+    assert completed["hierarchy"]["completion_invariant"][
+        "unresolved_call_ids"
+    ] == ["call-1"]
     assert completed["hierarchy"]["execution"]["calls"]["call-1"][
         "attempt_id"
     ] == "attempt-1"
+    assert completed["hierarchy"]["execution"]["calls"]["call-1"]["state"] == "started"
     task_manager._records.clear()

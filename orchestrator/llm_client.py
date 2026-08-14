@@ -11,36 +11,37 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
 import random
 import re
 import secrets
+import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, cast
 
 import requests
 
-from . import config
+from . import config, llm_request_log, retry_policy
 from .account_lease import (
     AccountCandidate,
     AccountHealthTransition,
     AccountLease,
     AccountLeaseStore,
 )
-from .budget import BudgetExceededError, get_task_budget
 from .plugin_registry import ProviderPluginRegistry, build_production_registry
-from .policy import PolicyAction, PolicyEngine, PolicyRequest
 from .provider_adapter import (
     LEGACY_WEB_PROVIDER,
     ProviderAbortedError,
     ProviderAuthenticationError,
     ProviderChunk,
+    ProviderError,
     ProviderMessage,
     ProviderPayloadError,
     ProviderRateLimitError,
@@ -51,7 +52,6 @@ from .provider_adapter import (
     ProviderTransportError,
     parse_retry_after,
 )
-from .redaction import scan_secrets
 
 thread_local = threading.local()
 logger = logging.getLogger(__name__)
@@ -80,7 +80,21 @@ class LLMError(RuntimeError):
 
 
 class PayloadRejectedError(LLMError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str = "malformed_input",
+    ) -> None:
+        super().__init__(message)
+        self.classification = classification
+
+
+class AmbiguousConversationError(PayloadRejectedError):
+    """A Web Claude 400 that requires one bounded cross-account probe."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, classification="ambiguous_conversation")
 
 
 class IncompleteStreamError(requests.RequestException):
@@ -93,6 +107,14 @@ class ModelRequestAborted(LLMError):
 
 class AccountLeaseUnavailableError(LLMError):
     """Raised when an injected durable store declines an account lease."""
+
+
+class AccountPoolExhaustedError(LLMError):
+    """Raised when no configured account can be assigned to an agent."""
+
+
+class TaskAccountPoolExhaustedError(AccountPoolExhaustedError):
+    """Raised when a task cannot atomically obtain a replacement account."""
 
 
 class AccountLeaseLostError(ModelRequestAborted):
@@ -424,6 +446,110 @@ class CookieManager:
             return existed
 
 
+class _StreamStallWatchdog:
+    """Close a streamed response that has stopped producing lines.
+
+    Needed because a blocked ``iter_lines()`` cannot check its own clock, and
+    the socket timeout only covers a total absence of bytes. Closing the
+    response from another thread is what unblocks the read.
+    """
+
+    def __init__(
+        self,
+        response: Any,
+        stall_after: float,
+        max_after: float = 0,
+    ) -> None:
+        self._response = response
+        self._stall_after = stall_after
+        self._max_after = max_after
+        self._started_at = time.monotonic()
+        self._last_progress = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.fired = False
+
+    def start(self) -> None:
+        if self._stall_after <= 0 and self._max_after <= 0:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def mark_progress(self) -> None:
+        self._last_progress = time.monotonic()
+
+    def _run(self) -> None:
+        positive_limits = [
+            limit for limit in (self._stall_after, self._max_after) if limit > 0
+        ]
+        interval = max(0.05, min(5.0, min(positive_limits) / 4))
+        while not self._stop.wait(interval):
+            now = time.monotonic()
+            exceeded_total = (
+                self._max_after > 0 and now - self._started_at > self._max_after
+            )
+            exceeded_stall = (
+                self._stall_after > 0
+                and now - self._last_progress > self._stall_after
+            )
+            if not exceeded_total and not exceeded_stall:
+                continue
+            self.fired = True
+            if exceeded_total:
+                logger.warning(
+                    "Provider stream exceeded %.0fs total runtime; forcing socket shutdown.",
+                    self._max_after,
+                )
+            else:
+                logger.warning(
+                    "Provider stream produced no model content for %.0fs; forcing socket shutdown.",
+                    self._stall_after,
+                )
+            self._shutdown_socket()
+            close = getattr(self._response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Stalled stream did not close cleanly", exc_info=True)
+            return
+
+    def _shutdown_socket(self) -> None:
+        """Interrupt urllib3's blocking read on platforms where close() cannot."""
+
+        paths = (
+            ("raw", "_fp", "fp", "raw", "_sock"),
+            ("raw", "_connection", "sock"),
+            ("raw", "_original_response", "fp", "raw", "_sock"),
+        )
+        for path in paths:
+            candidate: Any = self._response
+            for attribute in path:
+                candidate = getattr(candidate, attribute, None)
+                if candidate is None:
+                    break
+            if candidate is None:
+                continue
+            shutdown = getattr(candidate, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except OSError:
+                    pass
+            return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
 # =====================================================================
 # 2. CLAUDE DESKTOP APP EMULATOR
 # =====================================================================
@@ -467,6 +593,9 @@ class WebClaudeClient:
         assistant_message_uuid: str | None = None,
         emit_chunks: bool = True,
         should_abort: Any | None = None,
+        on_thinking_delta: Callable[[str, int], None] | None = None,
+        on_thinking_reset: Callable[[str, int], None] | None = None,
+        request_diagnostics: Any | None = None,
     ) -> str:
         self.last_stream_chunks: tuple[ProviderChunk, ...] = ()
         abort_check = should_abort or _is_model_call_aborted
@@ -610,24 +739,58 @@ class WebClaudeClient:
                     }
                 )
 
+        if request_diagnostics is not None:
+            request_diagnostics.record_wire(
+                route=(
+                    "POST /organizations/{org_ref}/chat_conversations/"
+                    "{conversation_ref}/completion"
+                ),
+                body=payload,
+                org_id=self.org_id,
+            )
         resp = self.session.post(url, json=payload, stream=True, timeout=120)
+        thinking_chunk_index = 0
+        response_diagnostic_lines: list[str] = []
+        response_diagnostic_recorded = False
+        # A stalled stream cannot be detected from inside the read loop: if the
+        # server dribbles bytes that never complete a line, iter_lines() simply
+        # blocks and the socket timeout never fires either, so the run hangs for
+        # as long as the connection stays open. A watchdog closes the response
+        # from the outside, which makes the blocked read raise.
+        stall_after = _stream_stall_seconds()
+        max_after = _stream_max_seconds()
+        stall_state = _StreamStallWatchdog(resp, stall_after, max_after)
+        stall_state.start()
         try:
+            if resp.status_code >= 400 and request_diagnostics is not None:
+                request_diagnostics.record_response(
+                    status=resp.status_code,
+                    headers=getattr(resp, "headers", {}),
+                    body=self._safe_response_body(resp),
+                )
+                response_diagnostic_recorded = True
             self._check_response(resp)
             stream_buffer = ProviderStreamBuffer()
             saw_terminal_event = False
             for line in resp.iter_lines():
                 if abort_check():
                     raise ModelRequestAborted("Model request was aborted while Web Claude streamed")
+                # Closing the response normally breaks the read, but a transport
+                # that keeps yielding after close must not trap the loop.
+                if stall_state.fired:
+                    break
                 if not line:
                     continue
 
                 decoded_line = (
                     line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
                 ).strip()
+                response_diagnostic_lines.append(decoded_line)
                 if not decoded_line.startswith("data:"):
                     continue
                 encoded = decoded_line[5:].strip()
                 if encoded == "[DONE]":
+                    stall_state.mark_progress()
                     saw_terminal_event = True
                     continue
                 try:
@@ -646,8 +809,10 @@ class WebClaudeClient:
                         and delta.get("stop_reason")
                     )
                 ):
+                    stall_state.mark_progress()
                     saw_terminal_event = True
                 if data.get("type") == "error":
+                    stall_state.mark_progress()
                     error = data.get("error")
                     error = error if isinstance(error, dict) else {}
                     error_type = str(error.get("type") or "").casefold()
@@ -659,6 +824,10 @@ class WebClaudeClient:
                                 error.get("retry_after") or data.get("retry_after")
                             ),
                         )
+                    if any(
+                        marker in error_type for marker in ("auth", "permission", "forbidden")
+                    ) or self._looks_like_account_error(message):
+                        raise PermissionError(message)
                     raise requests.RequestException(message)
 
                 chunk_text = ""
@@ -678,16 +847,57 @@ class WebClaudeClient:
                     chunk_text = data["text"]
 
                 if chunk_text:
+                    stall_state.mark_progress()
                     stream_buffer.append(chunk_text, kind=chunk_type)
+                    if chunk_type == "thinking":
+                        if on_thinking_delta is not None:
+                            try:
+                                on_thinking_delta(
+                                    chunk_text,
+                                    thinking_chunk_index,
+                                )
+                            except Exception:
+                                logger.exception("Không thể phát thinking delta tạm thời")
+                        thinking_chunk_index += 1
             if abort_check():
                 raise ModelRequestAborted("Model request was aborted before Web Claude completion")
+            if stall_state.fired:
+                raise requests.ReadTimeout(
+                    "Web Claude stream produced no content or exceeded total runtime"
+                )
             if not saw_terminal_event:
                 raise IncompleteStreamError("Web Claude stream ended before a terminal event")
-            full_text, self.last_stream_chunks = stream_buffer.finish()
+            _, self.last_stream_chunks = stream_buffer.finish()
+            full_text = "".join(
+                chunk.text for chunk in self.last_stream_chunks if chunk.kind != "thinking"
+            )
             if emit_chunks:
                 _commit_provider_chunks(self.last_stream_chunks)
             return full_text
+        except Exception as exc:
+            if thinking_chunk_index and on_thinking_reset is not None:
+                try:
+                    on_thinking_reset(
+                        type(exc).__name__,
+                        thinking_chunk_index,
+                    )
+                except Exception:
+                    logger.exception("Không thể phát thinking reset tạm thời")
+            if stall_state.fired and not isinstance(exc, ModelRequestAborted):
+                # Report why the read died; the adapter maps this to a transport
+                # error and the caller replays on another account.
+                raise requests.ReadTimeout(
+                    "Web Claude stream produced no content or exceeded total runtime"
+                ) from exc
+            raise
         finally:
+            if request_diagnostics is not None and not response_diagnostic_recorded:
+                request_diagnostics.record_response(
+                    status=getattr(resp, "status_code", None),
+                    headers=getattr(resp, "headers", {}),
+                    body=response_diagnostic_lines,
+                )
+            stall_state.stop()
             close = getattr(resp, "close", None)
             if callable(close):
                 close()
@@ -713,9 +923,20 @@ class WebClaudeClient:
                     "Account/organization gắn với cookie đã bị vô hiệu hóa"
                     + (f": {detail}" if detail else "")
                 )
+            if "conversation could not be created" in detail.casefold():
+                raise AmbiguousConversationError(
+                    "Claude API could not create the conversation (400)"
+                    + (f": {detail}" if detail else "")
+                )
+            classification = (
+                "malformed_input"
+                if self._looks_like_malformed_input(detail)
+                else "provider_payload"
+            )
             raise PayloadRejectedError(
                 "Claude API từ chối payload (400); đây không phải lỗi cookie"
-                + (f": {detail}" if detail else "")
+                + (f": {detail}" if detail else ""),
+                classification=classification,
             )
         resp.raise_for_status()
 
@@ -740,6 +961,17 @@ class WebClaudeClient:
             return ""
 
     @staticmethod
+    def _safe_response_body(resp: Any) -> Any:
+        try:
+            return resp.json()
+        except (ValueError, TypeError, AttributeError):
+            pass
+        try:
+            return str(resp.text)
+        except Exception:
+            return None
+
+    @staticmethod
     def _looks_like_account_error(detail: str) -> bool:
         normalized = str(detail or "").casefold()
         account_markers = (
@@ -756,6 +988,24 @@ class WebClaudeClient:
             "account is not active",
         )
         return any(marker in normalized for marker in account_markers)
+
+    @staticmethod
+    def _looks_like_malformed_input(detail: str) -> bool:
+        normalized = str(detail or "").casefold()
+        malformed_markers = (
+            "invalid request",
+            "invalid payload",
+            "malformed",
+            "missing required",
+            "required field",
+            "should have at least",
+            "must be",
+            "validation error",
+            "invalid model",
+            "invalid tool",
+            "tools:",
+        )
+        return any(marker in normalized for marker in malformed_markers)
 
 
 class LegacyWebClaudeAdapter:
@@ -790,6 +1040,17 @@ class LegacyWebClaudeAdapter:
                 assistant_message_uuid=metadata.get("assistant_message_uuid"),
                 emit_chunks=False,
                 should_abort=should_abort,
+                on_thinking_delta=(
+                    metadata.get("on_thinking_delta")
+                    if callable(metadata.get("on_thinking_delta"))
+                    else None
+                ),
+                on_thinking_reset=(
+                    metadata.get("on_thinking_reset")
+                    if callable(metadata.get("on_thinking_reset"))
+                    else None
+                ),
+                request_diagnostics=metadata.get("request_diagnostics"),
             )
         except ModelRequestAborted as exc:
             raise ProviderAbortedError(
@@ -811,11 +1072,13 @@ class LegacyWebClaudeAdapter:
             raise ProviderPayloadError(
                 str(exc),
                 provider=self.name,
+                classification=exc.classification,
             ) from exc
         except ProviderStreamLimitError as exc:
             raise ProviderPayloadError(
                 str(exc),
                 provider=self.name,
+                classification="response_too_large",
             ) from exc
         except requests.RequestException as exc:
             raise ProviderTransportError(
@@ -830,7 +1093,6 @@ class LegacyWebClaudeAdapter:
 
 
 provider_plugins: ProviderPluginRegistry = build_production_registry(LegacyWebClaudeAdapter)
-runtime_policy = PolicyEngine()
 
 
 # =====================================================================
@@ -929,6 +1191,12 @@ def _validate_schema(value: Any, schema: dict[str, Any], path: str = "payload") 
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             raise LLMError(f"{path} vượt quá độ dài cho phép")
 
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            raise LLMError(f"{path} nhỏ hơn giá trị tối thiểu {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            raise LLMError(f"{path} vượt quá giá trị tối đa {schema['maximum']}")
+
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             raise LLMError(f"{path} có quá ít phần tử")
@@ -957,6 +1225,81 @@ def _validate_schema(value: Any, schema: dict[str, Any], path: str = "payload") 
                 _validate_schema(item, properties[name], f"{path}.{name}")
 
 
+# Prose the model writes for a human to read. Overrunning a legacy schema limit
+# on one of these is a verbosity issue, not a malformed answer. Preserve the
+# complete text and ignore maxLength for narrative fields; identifiers, paths,
+# enums and other protocol fields remain strictly validated.
+_UNBOUNDED_NARRATIVE_FIELDS = frozenset(
+    {
+        "acceptance_criteria",
+        "context_note",
+        "decisions_md_entry",
+        "evidence_requirements",
+        "goal",
+        "instructions",
+        "next_instructions",
+        "reason",
+        "remaining_risks",
+        "reviewer_feedback",
+        "selected_fanout_reason",
+        "summary",
+        "test_focus",
+        "test_requirements",
+        "title",
+        "worker_feedback",
+    }
+)
+
+
+def _without_narrative_limits(
+    schema: dict[str, Any],
+    *,
+    narrative: bool = False,
+) -> dict[str, Any]:
+    """Recursively remove only prose ``maxLength`` constraints.
+
+    Planner responses contain narrative fields inside workstream/work-item
+    objects and arrays. A top-level-only rewrite still rejected an overlong
+    criterion or nested instruction and replayed the whole request. Structural
+    limits, IDs, paths, scopes, enums and array cardinality remain unchanged.
+    """
+    relaxed: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "maxLength" and narrative:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            relaxed[key] = {
+                name: (
+                    _without_narrative_limits(
+                        field_schema,
+                        narrative=narrative or name in _UNBOUNDED_NARRATIVE_FIELDS,
+                    )
+                    if isinstance(field_schema, dict)
+                    else field_schema
+                )
+                for name, field_schema in value.items()
+            }
+            continue
+        if key == "items" and isinstance(value, dict):
+            relaxed[key] = _without_narrative_limits(value, narrative=narrative)
+            continue
+        if isinstance(value, dict):
+            relaxed[key] = _without_narrative_limits(value, narrative=narrative)
+            continue
+        if isinstance(value, list):
+            relaxed[key] = [
+                (
+                    _without_narrative_limits(item, narrative=narrative)
+                    if isinstance(item, dict)
+                    else item
+                )
+                for item in value
+            ]
+            continue
+        relaxed[key] = value
+    return relaxed
+
+
 def validate_action_response(
     parsed_data: dict[str, Any], actions: list[dict[str, Any]]
 ) -> tuple[str, dict[str, Any]]:
@@ -977,7 +1320,7 @@ def validate_action_response(
         for key, value in parsed_data.items()
         if key not in {"_action", "_tool_name", "patch_content"}
     }
-    _validate_schema(payload, schemas[action_name])
+    _validate_schema(payload, _without_narrative_limits(schemas[action_name]))
 
     if action_name == "submit_patch":
         patch_content = parsed_data.get("patch_content", "")
@@ -1107,6 +1450,7 @@ def _normalize_action_keys(value: dict[str, Any]) -> dict[str, Any]:
 
 cookie_manager = None
 account_lease_store: AccountLeaseStore | None = None
+account_coordinator: object | None = None
 _fingerprint_salt_lock = threading.Lock()
 _fingerprint_salt_cache: tuple[str, bytes] | None = None
 
@@ -1118,6 +1462,26 @@ def configure_account_lease_store(
 
     global account_lease_store
     account_lease_store = store
+
+
+def configure_account_coordinator(coordinator: object | None) -> None:
+    """Inject optional task-level reservation/replacement hooks.
+
+    The coordinator is feature-detected.  ``consume_reserved_account`` may
+    return a pre-reserved account/lease, while ``replace_account_atomically``
+    may return its immediate replacement.  The existing lease store is also
+    inspected for these hooks, so storage implementations can opt in without
+    changing the legacy ``AccountLeaseStore`` protocol.
+    """
+
+    global account_coordinator
+    account_coordinator = coordinator
+
+
+def configure_request_log_repository(repository: object | None) -> bool:
+    """Inject durable request diagnostics when the repository supports them."""
+
+    return llm_request_log.configure_repository(repository)
 
 
 def _machine_fingerprint_salt() -> bytes:
@@ -1172,6 +1536,21 @@ def _lease_account_id(account: dict[str, str]) -> str:
     return f"webacct_{digest[:32]}"
 
 
+def _public_account_ref(account: dict[str, str]) -> str:
+    """Return a stable, non-secret UI label that survives event redaction."""
+    digest = _lease_account_id(account).removeprefix("webacct_")[:12]
+    return "acct-" + "-".join(digest[index : index + 4] for index in range(0, len(digest), 4))
+
+
+def _public_org_ref(org_id: str) -> str:
+    digest = hmac.new(
+        _machine_fingerprint_salt(),
+        str(org_id).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:12]
+    return "org-" + "-".join(digest[index : index + 4] for index in range(0, len(digest), 4))
+
+
 def _acquire_account_lease(
     *,
     account: dict[str, str],
@@ -1213,6 +1592,41 @@ def _account_lease_ttl_seconds() -> float:
     return max(0.15, configured)
 
 
+def _task_account_reservation_ttl_seconds() -> float:
+    try:
+        configured = float(
+            os.environ.get("ORCH_TASK_ACCOUNT_RESERVATION_TTL_SECONDS", "86400")
+        )
+    except ValueError:
+        configured = 86400.0
+    return max(_account_lease_ttl_seconds(), configured)
+
+
+def _stream_stall_seconds() -> float:
+    """Give up on a provider stream that stops producing content.
+
+    Deliberately generous: a live Director was observed going quiet for seven
+    minutes mid-plan and then finishing normally, so this must only catch a
+    stream that is truly dead, not one that is merely thinking. Zero disables
+    the guard.
+    """
+    try:
+        configured = float(os.environ.get("ORCH_STREAM_STALL_SECONDS", "900"))
+    except ValueError:
+        configured = 900.0
+    return max(0.0, configured)
+
+
+def _stream_max_seconds() -> float:
+    """Bound a stream even when it emits endless thinking deltas."""
+
+    try:
+        configured = float(os.environ.get("ORCH_STREAM_MAX_SECONDS", "1800"))
+    except ValueError:
+        configured = 1800.0
+    return max(0.0, configured)
+
+
 class _AccountLeaseHeartbeat:
     """Renew an account lease while a blocking provider attempt is active."""
 
@@ -1221,7 +1635,11 @@ class _AccountLeaseHeartbeat:
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
-        self._ttl = _account_lease_ttl_seconds()
+        self._ttl = (
+            _task_account_reservation_ttl_seconds()
+            if lease is not None and lease.metadata.get("task_reservation")
+            else _account_lease_ttl_seconds()
+        )
 
     @property
     def lost(self) -> bool:
@@ -1346,6 +1764,8 @@ def _runtime_request_context() -> dict[str, Any]:
         ("task_id", "task_id"),
         ("session_id", "session_id"),
         ("call_id", "call_id"),
+        ("execution_attempt_id", "execution_attempt_id"),
+        ("call_purpose", "call_purpose"),
     ):
         value = getattr(thread_local, local_name, None)
         if value:
@@ -1360,6 +1780,7 @@ def _commit_provider_chunks(
     attempt_id: str | None = None,
     attempt: int | None = None,
     logical_request_id: str | None = None,
+    request_revision: int | None = None,
 ) -> None:
     """Publish a completed attempt's buffered stream exactly once."""
 
@@ -1381,6 +1802,7 @@ def _commit_provider_chunks(
                     "attempt_id": attempt_id,
                     "attempt": attempt,
                     "logical_request_id": logical_request_id,
+                    "request_revision": request_revision,
                     "committed": True,
                     "provisional": False,
                     "chunk_index": chunk.index,
@@ -1488,6 +1910,8 @@ def _emit_logical_terminal(
         "attempt_id": getattr(thread_local, "attempt_id", None),
         "error_type": type(error).__name__,
         "error": str(error)[:500],
+        "attempt_terminal": True,
+        "reset_provisional": True,
     }
     _emit_runtime_event(event)
 
@@ -1513,20 +1937,36 @@ def _emit_retry_event(
     reason: str,
     switching: bool,
     error: str,
+    *,
+    selection: retry_policy.RemediationSelection | None = None,
 ) -> None:
-    _emit_runtime_event(
-        {
-            "type": "protocol_retry",
-            "role": role,
-            **_runtime_request_context(),
-            "account": source,
-            "attempt": attempt_on_cookie,
-            "max_attempts": config.PROTOCOL_ATTEMPTS_PER_COOKIE,
-            "reason": reason,
-            "switching": switching,
-            "error": str(error)[:500],
-        }
-    )
+    event = {
+        "type": "protocol_retry",
+        "role": role,
+        **_runtime_request_context(),
+        "account": source,
+        "attempt": attempt_on_cookie,
+        "attempt_id": getattr(thread_local, "attempt_id", None),
+        "provider": getattr(thread_local, "provider_name", None),
+        "reason": reason,
+        "switching": switching,
+        "error": str(error)[:500],
+        "logical_request_id": getattr(
+            thread_local,
+            "logical_request_id",
+            None,
+        ),
+        "request_revision": getattr(
+            thread_local,
+            "request_revision",
+            1,
+        ),
+        "attempt_terminal": True,
+        "reset_provisional": True,
+    }
+    if selection is not None:
+        event.update(selection.as_dict())
+    _emit_runtime_event(event)
 
 
 # Planner-level roles keep one account sticky so parallel Managers do not
@@ -1584,6 +2024,503 @@ def _clear_sticky_cookie(agent_role: str) -> None:
         setattr(thread_local, chat_attr, None)
 
 
+# One account per logical agent. The old cache was thread-local and keyed by
+# role, so a second Manager scheduled onto a thread a first Manager had already
+# used inherited that thread's cookie and the two shared an identity. Binding by
+# logical agent id is what actually keeps them apart, because the id outlives
+# the thread.
+_agent_account_bindings: dict[str, dict[str, str]] = {}
+_agent_account_lock = threading.RLock()
+_task_reserved_agents: dict[str, set[str]] = {}
+
+
+def _current_agent_key() -> str | None:
+    return str(getattr(thread_local, "agent_instance_id", "") or "") or None
+
+
+def _bound_account(agent_id: str) -> dict[str, str] | None:
+    with _agent_account_lock:
+        return _agent_account_bindings.get(agent_id)
+
+
+def _bind_account(agent_id: str, account: dict[str, str]) -> None:
+    with _agent_account_lock:
+        _agent_account_bindings[agent_id] = account
+
+
+def _claim_account_for_agent(
+    agent_id: str,
+    excluded_sources: set[str],
+) -> tuple[dict[str, str] | None, set[str]]:
+    """Atomically select an account not held by another logical agent."""
+    with _agent_account_lock:
+        current = _agent_account_bindings.get(agent_id)
+        held_sources = {
+            str(account.get("source"))
+            for holder, account in _agent_account_bindings.items()
+            if holder != agent_id and account.get("source")
+        }
+        if (
+            current is not None
+            and current in cookie_manager.cookies_pool
+            and current.get("source") not in excluded_sources
+            and current.get("source") not in held_sources
+        ):
+            return current, set()
+        _agent_account_bindings.pop(agent_id, None)
+        account = cookie_manager.get_next_cookie(excluded_sources | held_sources)
+        if account is not None:
+            _agent_account_bindings[agent_id] = account
+        return account, held_sources
+
+
+def release_agent_account(agent_id: str) -> None:
+    """Hand an agent's account back once it will not call the model again."""
+    with _agent_account_lock:
+        _agent_account_bindings.pop(agent_id, None)
+
+
+def _accounts_held_by_other_agents(agent_id: str | None) -> set[str]:
+    with _agent_account_lock:
+        return {
+            str(account.get("source"))
+            for holder, account in _agent_account_bindings.items()
+            if holder != agent_id and account.get("source")
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountAssignment:
+    account: dict[str, str]
+    lease: AccountLease | None = None
+    coordinated: bool = False
+
+
+_NO_COORDINATOR_HOOK = object()
+
+
+def _coordinator_targets() -> tuple[object, ...]:
+    targets: list[object] = []
+    for candidate in (
+        getattr(thread_local, "account_coordinator", None),
+        account_coordinator,
+        account_lease_store,
+    ):
+        if candidate is not None and all(candidate is not item for item in targets):
+            targets.append(candidate)
+    return tuple(targets)
+
+
+def _invoke_coordinator_hook(
+    names: tuple[str, ...],
+    **kwargs: Any,
+) -> object:
+    """Call the first supported hook with only parameters it declares."""
+
+    for coordinator in _coordinator_targets():
+        for name in names:
+            callback = getattr(coordinator, name, None)
+            if not callable(callback):
+                continue
+            try:
+                signature = inspect.signature(callback)
+            except (TypeError, ValueError):
+                return callback(**kwargs)
+            parameters = signature.parameters
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            selected = kwargs if accepts_kwargs else {
+                key: value
+                for key, value in kwargs.items()
+                if key in parameters
+                and parameters[key].kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            }
+            return callback(**selected)
+    return _NO_COORDINATOR_HOOK
+
+
+def _account_candidates(
+    accounts: Collection[dict[str, str]],
+) -> tuple[AccountCandidate, ...]:
+    manager = cookie_manager
+    active_requests = getattr(manager, "_active_requests", {})
+    cooldowns = getattr(manager, "_cooldown_until", {})
+    return tuple(
+        AccountCandidate(
+            account_id=_lease_account_id(account),
+            provider=LEGACY_WEB_PROVIDER,
+            active_requests=int(active_requests.get(account["source"], 0)),
+            cooldown_until=cooldowns.get(account["source"]),
+            metadata={"source": account["source"]},
+        )
+        for account in accounts
+    )
+
+
+def reserve_account_cohort(
+    task_id: str,
+    agent_ids: Collection[str],
+) -> object:
+    """Reserve one unique account per agent before any start event is emitted."""
+
+    task = str(task_id).strip()
+    agents = tuple(dict.fromkeys(str(value).strip() for value in agent_ids if str(value).strip()))
+    if not task or not agents:
+        raise ValueError("task_id and at least one agent_id are required")
+    global cookie_manager
+    if cookie_manager is None:
+        cookie_manager = CookieManager()
+    accounts = tuple(getattr(cookie_manager, "cookies_pool", ()) or ())
+    candidates = _account_candidates(accounts)
+    assignments = {agent_id: candidates for agent_id in agents}
+    reserved = _invoke_coordinator_hook(
+        ("reserve_many", "reserve_account_cohort"),
+        task_id=task,
+        assignments=assignments,
+        lease_ttl_seconds=_task_account_reservation_ttl_seconds(),
+        now=time.time(),
+    )
+    if reserved is _NO_COORDINATOR_HOOK:
+        with _agent_account_lock:
+            held_sources = {
+                str(account.get("source"))
+                for account in _agent_account_bindings.values()
+                if account.get("source")
+            }
+            available = [
+                account
+                for account in accounts
+                if account.get("source") not in held_sources
+            ]
+            if len(available) < len(agents):
+                reserved = None
+            else:
+                selected_accounts = available[: len(agents)]
+                for agent_id, account in zip(agents, selected_accounts, strict=True):
+                    _agent_account_bindings[agent_id] = account
+                reserved = {
+                    agent_id: _public_account_ref(account)
+                    for agent_id, account in zip(agents, selected_accounts, strict=True)
+                }
+    if reserved is None:
+        raise TaskAccountPoolExhaustedError(
+            f"Cannot reserve {len(agents)} unique accounts for task cohort"
+        )
+    with _agent_account_lock:
+        _task_reserved_agents.setdefault(task, set()).update(agents)
+    return reserved
+
+
+def release_reserved_agent_account(task_id: str, agent_id: str) -> None:
+    """Release durable and local ownership when one logical agent settles."""
+
+    _invoke_coordinator_hook(
+        ("release_agent", "release_account_reservation"),
+        task_id=str(task_id),
+        agent_id=str(agent_id),
+        reason="agent_settled",
+        now=time.time(),
+    )
+    release_agent_account(str(agent_id))
+    with _agent_account_lock:
+        agents = _task_reserved_agents.get(str(task_id))
+        if agents is not None:
+            agents.discard(str(agent_id))
+
+
+def release_task_account_cohort(task_id: str) -> None:
+    """Release every task-lifetime reservation during all teardown paths."""
+
+    task = str(task_id)
+    _invoke_coordinator_hook(
+        ("release_task", "release_task_reservations"),
+        task_id=task,
+        reason="task_settled",
+        now=time.time(),
+    )
+    with _agent_account_lock:
+        for agent_id in _task_reserved_agents.pop(task, set()):
+            _agent_account_bindings.pop(agent_id, None)
+
+
+def _account_for_reservation(
+    value: object,
+    accounts: Collection[dict[str, str]],
+) -> _AccountAssignment | None:
+    """Resolve coordinator output without requiring it to carry credentials."""
+
+    if value is None:
+        return None
+    if isinstance(value, _AccountAssignment):
+        return value
+    lease: AccountLease | None = value if isinstance(value, AccountLease) else None
+    account_value: object | None = None
+    account_id = lease.account_id if lease is not None else ""
+    if isinstance(value, Mapping):
+        nested_lease = value.get("lease")
+        if isinstance(nested_lease, AccountLease):
+            lease = nested_lease
+            account_id = lease.account_id
+        account_value = value.get("account")
+        if account_value is None and value.get("cookie_string"):
+            account_value = value
+        account_id = str(value.get("account_id") or account_id)
+    elif isinstance(value, tuple):
+        for item in value:
+            if isinstance(item, AccountLease):
+                lease = item
+                account_id = item.account_id
+            else:
+                resolved = _account_for_reservation(item, accounts)
+                if resolved is not None:
+                    account_value = resolved.account
+                    lease = lease or resolved.lease
+                    account_id = account_id or _lease_account_id(resolved.account)
+    elif isinstance(value, str):
+        account_id = value
+    else:
+        nested_account = getattr(value, "account", None)
+        nested_lease = getattr(value, "lease", None)
+        if nested_account is not None:
+            account_value = nested_account
+        if isinstance(nested_lease, AccountLease):
+            lease = nested_lease
+            account_id = nested_lease.account_id
+        account_id = str(getattr(value, "account_id", "") or account_id)
+
+    if isinstance(account_value, Mapping) and account_value.get("cookie_string"):
+        account = cast(dict[str, str], account_value)
+        return _AccountAssignment(account=account, lease=lease, coordinated=True)
+    for account in accounts:
+        if (
+            account_id
+            and account_id in {_lease_account_id(account), account.get("source", "")}
+        ):
+            return _AccountAssignment(account=account, lease=lease, coordinated=True)
+    return None
+
+
+def _consume_pre_reserved_account(
+    *,
+    logical_call_id: str,
+    agent_id: str | None,
+    excluded_sources: Collection[str] = (),
+) -> _AccountAssignment | None:
+    accounts = tuple(getattr(cookie_manager, "cookies_pool", ()) or ())
+    for attribute in (
+        "pre_reserved_account",
+        "reserved_account",
+        "account_reservation",
+    ):
+        value = getattr(thread_local, attribute, None)
+        if value is None:
+            continue
+        setattr(thread_local, attribute, None)
+        assignment = _account_for_reservation(value, accounts)
+        if (
+            assignment is not None
+            and assignment.account.get("source") not in excluded_sources
+        ):
+            return assignment
+    candidates = _account_candidates(accounts)
+    result = _invoke_coordinator_hook(
+        (
+            "consume_reserved_account",
+            "consume_pre_reserved_account",
+            "consume_account_reservation",
+            "consume_reservation",
+        ),
+        task_id=str(getattr(thread_local, "task_id", "") or ""),
+        agent_id=agent_id or "",
+        owner_id=agent_id or logical_call_id,
+        logical_call_id=logical_call_id,
+        provider=LEGACY_WEB_PROVIDER,
+        candidates=candidates,
+        candidate_account_ids=tuple(candidate.account_id for candidate in candidates),
+        exclude_account_ids=tuple(
+            _lease_account_id(account)
+            for account in accounts
+            if account.get("source") in excluded_sources
+        ),
+        lease_ttl_seconds=_task_account_reservation_ttl_seconds(),
+        now=time.time(),
+    )
+    if result is _NO_COORDINATOR_HOOK or result is None:
+        return None
+    return _account_for_reservation(result, accounts)
+
+
+def _replace_account_atomically(
+    *,
+    current: dict[str, str],
+    current_lease: AccountLease | None,
+    reason: str,
+    logical_call_id: str,
+    agent_id: str | None,
+    excluded_sources: Collection[str],
+) -> _AccountAssignment | None:
+    """Feature-detected coordinator replacement with an atomic local fallback."""
+
+    if _is_model_call_aborted():
+        raise ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!")
+    accounts = tuple(getattr(cookie_manager, "cookies_pool", ()) or ())
+    excluded = set(str(source) for source in excluded_sources)
+    excluded.add(str(current.get("source") or ""))
+    eligible = tuple(
+        account for account in accounts if account.get("source") not in excluded
+    )
+    candidates = _account_candidates(eligible)
+    result = _invoke_coordinator_hook(
+        (
+            "replace_account_atomically",
+            "replace_reserved_account",
+            "acquire_replacement_account",
+            "replace_account",
+        ),
+        task_id=str(getattr(thread_local, "task_id", "") or ""),
+        agent_id=agent_id or "",
+        owner_id=agent_id or logical_call_id,
+        logical_call_id=logical_call_id,
+        provider=LEGACY_WEB_PROVIDER,
+        current_account_id=_lease_account_id(current),
+        current_lease=current_lease,
+        reason=reason,
+        candidates=candidates,
+        candidate_account_ids=tuple(candidate.account_id for candidate in candidates),
+        exclude_account_ids=tuple(
+            _lease_account_id(account)
+            for account in accounts
+            if account.get("source") in excluded
+        ),
+        lease_ttl_seconds=_task_account_reservation_ttl_seconds(),
+        now=time.time(),
+    )
+    if result is not _NO_COORDINATOR_HOOK:
+        assignment = _account_for_reservation(result, accounts)
+        if (
+            assignment is None
+            or assignment.account.get("source") in excluded
+        ):
+            return None
+        if agent_id:
+            _bind_account(agent_id, assignment.account)
+        return assignment
+
+    with _agent_account_lock:
+        held_sources = {
+            str(account.get("source"))
+            for holder, account in _agent_account_bindings.items()
+            if holder != agent_id and account.get("source")
+        }
+        replacement = cookie_manager.get_next_cookie(excluded | held_sources)
+        if (
+            replacement is None
+            or replacement.get("source") in excluded
+            or replacement.get("source") in held_sources
+        ):
+            return None
+        if agent_id:
+            _agent_account_bindings[agent_id] = replacement
+    return _AccountAssignment(account=replacement)
+
+
+def _runtime_failure_signature(
+    failure_kind: str,
+    *,
+    source: str,
+    base_request_hash: str,
+    error: BaseException,
+    response: str = "",
+) -> retry_policy.FailureSignature:
+    return retry_policy.build_failure_signature(
+        failure_kind,
+        source=source,
+        review={
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "response": response,
+        },
+        request=base_request_hash,
+    )
+
+
+def _attach_remediation_metadata(
+    error: BaseException,
+    selection: retry_policy.RemediationSelection | None,
+    signature: retry_policy.FailureSignature,
+) -> None:
+    metadata = {
+        "failure_category": signature.category,
+        "failure_signature": signature.digest,
+        "remediation_strategy": (
+            selection.strategy.name if selection is not None else None
+        ),
+        "remediation_hint": (
+            selection.strategy.hint if selection is not None else None
+        ),
+    }
+    for key, value in metadata.items():
+        try:
+            setattr(error, key, value)
+        except Exception:
+            pass
+
+
+def _emit_remediation_selected(
+    *,
+    role: str,
+    source: str,
+    selection: retry_policy.RemediationSelection,
+    logical_request_id: str,
+) -> None:
+    _emit_runtime_event(
+        {
+            "type": "remediation_selected",
+            "role": role,
+            **_runtime_request_context(),
+            "provider": LEGACY_WEB_PROVIDER,
+            "account": source,
+            "logical_request_id": logical_request_id,
+            **selection.as_dict(),
+        }
+    )
+
+
+def _record_attempt_remediation(
+    attempt_log: llm_request_log.RequestAttemptLog | None,
+    error: BaseException,
+    selection: retry_policy.RemediationSelection | None,
+) -> None:
+    if attempt_log is None:
+        return
+    attempt_log.update(
+        parser_result={
+            "remediation": {
+                "failure_category": getattr(error, "failure_category", None),
+                "failure_signature": getattr(error, "failure_signature", None),
+                "remediation_strategy": (
+                    selection.strategy.name if selection is not None else None
+                ),
+                "remediation_actor": (
+                    selection.strategy.actor if selection is not None else None
+                ),
+                "remediation_hint": (
+                    selection.strategy.hint if selection is not None else None
+                ),
+                "prompt_variant": (
+                    selection.strategy.prompt_variant if selection is not None else None
+                ),
+            }
+        }
+    )
+
+
 def _call_agent_impl(
     system_prompt: str,
     user_message: str,
@@ -1604,61 +2541,7 @@ def _call_agent_impl(
     agent_role = getattr(thread_local, "agent_role", "supervisor")
     account_mode = str(getattr(thread_local, "account_mode", "sticky") or "sticky")
     sticky_enabled = account_mode != "router" and agent_role in _STICKY_ROLES
-    provider_content = f"{system_prompt}\n{user_message}"
-    secret_findings = scan_secrets(
-        provider_content,
-        candidate_type="provider_prompt",
-    )
-    provider_decision = runtime_policy.evaluate(
-        PolicyRequest(
-            action=PolicyAction.PROVIDER_REQUEST,
-            resource=provider_name,
-            content=provider_content,
-        )
-    )
-    if not provider_decision.allowed:
-        _emit_runtime_event(
-            {
-                "type": "secret_blocked",
-                "role": agent_role,
-                **_runtime_request_context(),
-                "candidate_type": "provider_prompt",
-                "finding_kinds": sorted({finding.kind for finding in secret_findings}),
-                "logical_request_id": logical_request_id,
-                "request_revision": 1,
-            }
-        )
-        raise PayloadRejectedError(
-            "Provider prompt blocked because it contains potential credentials "
-            "(policy: " + ", ".join(provider_decision.reasons) + ")"
-        )
-    runtime_context = _runtime_request_context()
-    budget = get_task_budget(str(runtime_context.get("task_id") or "") or None)
-    if budget is not None:
-        try:
-            budget_snapshot = budget.reserve_model_call(f"{system_prompt}\n{user_message}")
-        except BudgetExceededError as exc:
-            _emit_runtime_event(
-                {
-                    "type": "budget_exceeded",
-                    "role": agent_role,
-                    **runtime_context,
-                    "logical_request_id": logical_request_id,
-                    "reason": exc.reason,
-                    "budget": exc.snapshot,
-                }
-            )
-            raise
-        _emit_runtime_event(
-            {
-                "type": "budget_updated",
-                "role": agent_role,
-                **runtime_context,
-                "logical_request_id": logical_request_id,
-                "budget": budget_snapshot,
-            }
-        )
-
+    agent_key = _current_agent_key()
     # Mỗi vai trò có thể dùng model/effort độc lập.
     current_model, current_effort = _role_model_effort(agent_role, model)
 
@@ -1669,35 +2552,147 @@ def _call_agent_impl(
     cached_prompt: str | None = None
     cached_protocol_correction: str | None = None
     request_revision = 1
-    request_chat_uuid = str(uuid.uuid4())
-    request_mcp_server_uuid = str(uuid.uuid4())
-    request_human_message_uuid = str(uuid.uuid4())
-    request_assistant_message_uuid = str(uuid.uuid4())
-    portable_conversation = _load_portable_conversation()
+    # Every Worker turn already carries the complete target and contract.
+    # Replaying prior file turns made the provider insist that files created in
+    # its unrelated sandbox already existed, then refuse the patch protocol.
+    portable_conversation = (
+        () if agent_role == "worker" else _load_portable_conversation()
+    )
 
     # ===============================
 
-    last_error: Exception | None = None
     excluded_sources: set[str] = set()
     failures_by_source: dict[str, int] = {}
-    current_retry_cookie: dict[str, str] | None = None
-    pool_size = max(1, len(cookie_manager.cookies_pool))
-    max_attempts = max(
-        config.LLM_MAX_RETRIES,
-        pool_size * config.PROTOCOL_ATTEMPTS_PER_COOKIE,
+    remediation_tracker = retry_policy.RemediationTracker()
+    base_request_hash = retry_policy.deterministic_hash(
+        {
+            "system_prompt": system_prompt,
+            "user_message": user_message,
+            "tools": tools,
+            "model": current_model,
+            "max_tokens": max_tokens,
+            "require_json": require_json,
+        }
     )
-    attempts_made = 0
-    for attempt in range(1, max_attempts + 1):
-        attempts_made = attempt
+    if _is_model_call_aborted():
+        raise ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!")
+    reserved_assignment = _consume_pre_reserved_account(
+        logical_call_id=logical_request_id,
+        agent_id=agent_key,
+    )
+    reservation_required = bool(
+        agent_key
+        and getattr(thread_local, "task_id", None)
+        and any(
+            callable(getattr(target, "consume_reserved_account", None))
+            for target in _coordinator_targets()
+        )
+    )
+    if reservation_required and reserved_assignment is None:
+        raise TaskAccountPoolExhaustedError(
+            f"Logical agent {agent_key} has no pre-reserved task account"
+        )
+    current_retry_cookie = (
+        reserved_assignment.account if reserved_assignment is not None else None
+    )
+    pending_account_lease = (
+        reserved_assignment.lease if reserved_assignment is not None else None
+    )
+    assignment_announced = False
+    conversation_probe_pending = False
+    conversation_probe_first_log: llm_request_log.RequestAttemptLog | None = None
+    conversation_probe_first_attempt_id: str | None = None
+
+    def enforce_cancellation_precedence(error: BaseException) -> None:
+        if _is_model_call_aborted():
+            raise ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!") from error
+
+    def choose_runtime_remediation(
+        failure_kind: str,
+        error: BaseException,
+        *,
+        source: str,
+        response: str = "",
+        include_source: bool = True,
+        automatic_only: bool = True,
+    ) -> tuple[
+        retry_policy.RemediationSelection | None,
+        retry_policy.FailureSignature,
+    ]:
+        enforce_cancellation_precedence(error)
+        signature = _runtime_failure_signature(
+            failure_kind,
+            source=source if include_source else "",
+            base_request_hash=base_request_hash,
+            error=error,
+            response=response,
+        )
+        selection = remediation_tracker.choose(
+            failure_kind,
+            signature,
+            automatic_only=automatic_only,
+        )
+        _attach_remediation_metadata(error, selection, signature)
+        if selection is not None:
+            _emit_remediation_selected(
+                role=agent_role,
+                source=source,
+                selection=selection,
+                logical_request_id=logical_request_id,
+            )
+        return selection, signature
+
+    def coordinated_replacement(
+        failure_kind: str,
+        error: BaseException,
+        *,
+        account: dict[str, str],
+        lease: AccountLease | None,
+        reason: str,
+        response: str = "",
+        include_source: bool = True,
+    ) -> tuple[
+        retry_policy.RemediationSelection | None,
+        _AccountAssignment | None,
+    ]:
+        selection, _signature = choose_runtime_remediation(
+            failure_kind,
+            error,
+            source=account["source"],
+            response=response,
+            include_source=include_source,
+        )
+        if selection is None or not selection.strategy.replace_account:
+            return selection, None
+        replacement = _replace_account_atomically(
+            current=account,
+            current_lease=lease,
+            reason=reason,
+            logical_call_id=logical_request_id,
+            agent_id=agent_key,
+            excluded_sources=excluded_sources,
+        )
+        return selection, replacement
+
+    attempt = 0
+    while True:
+        attempt += 1
+        attempt_log: llm_request_log.RequestAttemptLog | None = None
+        account_lease: AccountLease | None = None
+        raw_response_text = ""
+        is_conversation_probe = False
+        # Provider conversation/message identities are scoped to one account
+        # attempt. Reusing a chat UUID after switching organizations produces
+        # Claude's "Conversation could not be created" 400 even when the prompt
+        # and logical request are unchanged.
+        request_chat_uuid = str(uuid.uuid4())
+        request_mcp_server_uuid = str(uuid.uuid4())
+        request_human_message_uuid = str(uuid.uuid4())
+        request_assistant_message_uuid = str(uuid.uuid4())
         if cached_prompt is None or cached_protocol_correction != protocol_correction:
             if cached_prompt is not None:
                 # Protocol correction creates a new request revision.
-                # Account/transport retries reuse the prepared IDs unchanged.
                 request_revision += 1
-                request_chat_uuid = str(uuid.uuid4())
-                request_mcp_server_uuid = str(uuid.uuid4())
-                request_human_message_uuid = str(uuid.uuid4())
-                request_assistant_message_uuid = str(uuid.uuid4())
             cached_prompt = (
                 build_action_protocol_prompt(
                     system_prompt,
@@ -1736,16 +2731,43 @@ def _call_agent_impl(
             logger.warning("Luồng AI bị ép dừng bởi người dùng.")
             raise ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!")
 
-        if not cookie_manager.has_cookies():
+        if current_retry_cookie is None and not cookie_manager.has_cookies():
             logger.error("🛑 ĐÃ HẾT TOÀN BỘ TÀI KHOẢN HỢP LỆ!")
-            raise LLMError("Cạn kiệt Cookie/Tài khoản.")
+            raise TaskAccountPoolExhaustedError("Cạn kiệt Cookie/Tài khoản.")
 
         try:
             # === LOGIC TÁCH COOKIE THEO CHỨC DANH ===
             cookie_attr = _COOKIE_ATTR.get(agent_role)
             chat_attr = _CHAT_UUID_ATTR.get(agent_role)
-            if sticky_enabled and cookie_attr:
-                # Director/Manager/Supervisor: sticky account per role/thread.
+            if (
+                current_retry_cookie is not None
+                and current_retry_cookie.get("source") not in excluded_sources
+            ):
+                cookie_item = current_retry_cookie
+                if agent_key:
+                    _bind_account(agent_key, cookie_item)
+                if cookie_attr:
+                    setattr(thread_local, cookie_attr, cookie_item)
+                chat_uuid = request_chat_uuid
+                if chat_attr:
+                    setattr(thread_local, chat_attr, chat_uuid)
+                is_new_chat = True
+            elif agent_key:
+                # One account per logical agent, kept across its calls and never
+                # offered to another agent while this one holds it.
+                cookie_item, _held_by_others = _claim_account_for_agent(
+                    agent_key,
+                    excluded_sources,
+                )
+                if cookie_attr:
+                    setattr(thread_local, cookie_attr, cookie_item)
+                chat_uuid = request_chat_uuid
+                if chat_attr:
+                    setattr(thread_local, chat_attr, chat_uuid)
+                is_new_chat = True
+            elif sticky_enabled and cookie_attr:
+                # No logical agent in context (legacy/CLI callers): fall back to
+                # the per-role cache.
                 cookie_item = current_retry_cookie or getattr(thread_local, cookie_attr, None)
                 if (
                     not cookie_item
@@ -1778,11 +2800,25 @@ def _call_agent_impl(
                 chat_uuid = request_chat_uuid
                 is_new_chat = True
             if cookie_item is None:
-                last_error = LLMError(
+                raise TaskAccountPoolExhaustedError(
                     f"Không còn account khả dụng cho {agent_role}; "
-                    "các account còn lại đang cooldown hoặc đã được thử."
+                    "các account còn lại đang được giữ, cooldown hoặc đã được thử."
                 )
-                break
+            if reserved_assignment is not None and not assignment_announced:
+                assignment_announced = True
+                _emit_runtime_event(
+                    {
+                        "type": "agent_account_assigned",
+                        "role": agent_role,
+                        **_runtime_request_context(),
+                        "status": "reserved",
+                        "provider": provider_name,
+                        "account": cookie_item["source"],
+                        "account_ref": _public_account_ref(cookie_item),
+                        "logical_request_id": logical_request_id,
+                        "coordinated": reserved_assignment.coordinated,
+                    }
+                )
             cookie_item = cast(dict[str, str], cookie_item)
             current_retry_cookie = cookie_item
             if pending_switch_from and pending_switch_from != cookie_item["source"]:
@@ -1795,6 +2831,8 @@ def _call_agent_impl(
                         "to_account": cookie_item["source"],
                         "reason": pending_switch_reason or "retry",
                         "attempt": attempt,
+                        "attempt_id": attempt_id,
+                        "provider": provider_name,
                         "logical_request_id": logical_request_id,
                         "request_revision": request_revision,
                         "request_fingerprint": request_fingerprint,
@@ -1804,10 +2842,18 @@ def _call_agent_impl(
                 pending_switch_from = None
                 pending_switch_reason = None
 
-            account_lease = _acquire_account_lease(
-                account=cookie_item,
-                logical_call_id=logical_request_id,
-            )
+            account_lease = pending_account_lease
+            pending_account_lease = None
+            if account_lease is None:
+                account_lease = _acquire_account_lease(
+                    account=cookie_item,
+                    # Attribute the lease to the agent, not just this one call, so
+                    # the lease table reads as "who is holding what".
+                    logical_call_id=(
+                        str(getattr(thread_local, "agent_instance_id", "") or "")
+                        or logical_request_id
+                    ),
+                )
             logger.info(
                 f"🚀 [{agent_role.upper()}] Đang xử lý bằng tài khoản: [{cookie_item['source']}]"
             )
@@ -1829,32 +2875,139 @@ def _call_agent_impl(
                     "stage": "calling_model",
                     "provider": provider_name,
                     "account": cookie_item["source"],
+                    "account_ref": _public_account_ref(cookie_item),
                     "attempt": attempt,
                     "attempt_id": attempt_id,
                     "logical_request_id": logical_request_id,
                     "request_revision": request_revision,
                     "request_fingerprint": request_fingerprint,
                     "replayed": attempt > 1,
-                    "data": f"{status_text} {cookie_item['source']}",
+                    "data": f"{status_text} {_public_account_ref(cookie_item)}",
                 }
             )
-            _emit_runtime_event(
-                {
-                    "type": "model_request_started",
-                    "role": agent_role,
-                    **_runtime_request_context(),
-                    "stage": "calling_model",
-                    "provider": provider_name,
-                    "account": cookie_item["source"],
-                    "attempt": attempt,
-                    "attempt_id": attempt_id,
-                    "logical_request_id": logical_request_id,
-                    "request_revision": request_revision,
-                    "request_fingerprint": request_fingerprint,
-                    "replayed": attempt > 1,
-                }
-            )
+            provisional_thinking_state = {"emitted": False, "reset": False}
 
+            def emit_provisional_thinking(
+                text: str,
+                chunk_index: int,
+                *,
+                _state: dict[str, bool] = provisional_thinking_state,
+                _attempt_id: str = attempt_id,
+                _attempt: int = attempt,
+                _logical_request_id: str = logical_request_id,
+                _request_revision: int = request_revision,
+            ) -> None:
+                _state["emitted"] = True
+                _emit_runtime_event(
+                    {
+                        "type": "thinking",
+                        "role": agent_role,
+                        **_runtime_request_context(),
+                        "text": text,
+                        "provider": provider_name,
+                        "attempt_id": _attempt_id,
+                        "attempt": _attempt,
+                        "logical_request_id": _logical_request_id,
+                        "request_revision": _request_revision,
+                        "committed": False,
+                        "provisional": True,
+                        "chunk_index": chunk_index,
+                        "terminal": False,
+                        "reset": False,
+                    }
+                )
+
+            def reset_provisional_thinking(
+                reason: str,
+                chunk_index: int,
+                *,
+                _state: dict[str, bool] = provisional_thinking_state,
+                _attempt_id: str = attempt_id,
+                _attempt: int = attempt,
+                _logical_request_id: str = logical_request_id,
+                _request_revision: int = request_revision,
+            ) -> None:
+                if not _state["emitted"] or _state["reset"]:
+                    return
+                _state["reset"] = True
+                _emit_runtime_event(
+                    {
+                        "type": "thinking",
+                        "role": agent_role,
+                        **_runtime_request_context(),
+                        "provider": provider_name,
+                        "attempt_id": _attempt_id,
+                        "attempt": _attempt,
+                        "logical_request_id": _logical_request_id,
+                        "request_revision": _request_revision,
+                        "committed": False,
+                        "provisional": True,
+                        "chunk_index": chunk_index,
+                        "terminal": True,
+                        "reset": True,
+                        "reason": reason,
+                        "attempt_terminal": True,
+                    }
+                )
+
+            is_conversation_probe = conversation_probe_pending
+            if is_conversation_probe:
+                conversation_probe_pending = False
+            attempt_log = llm_request_log.start_attempt(
+                {
+                    "attempt_id": attempt_id,
+                    **_runtime_request_context(),
+                    "agent_role": agent_role,
+                    "logical_request_id": logical_request_id,
+                    "request_revision": request_revision,
+                    "provider_attempt": attempt,
+                    "provider": provider_name,
+                    "account_ref": _public_account_ref(cookie_item),
+                    "org_ref": _public_org_ref(cookie_item["org_id"]),
+                    "route": (
+                        "POST /organizations/{org_ref}/chat_conversations/"
+                        "{conversation_ref}/completion"
+                    ),
+                    "model": current_model,
+                    "effort": current_effort,
+                    "max_tokens": max_tokens,
+                    "request_fingerprint": request_fingerprint,
+                    "logical_request": {
+                        "system": system_prompt,
+                        "user_message": user_message,
+                        "rendered_prompt": fingerprint_prompt,
+                        "messages": [
+                            {
+                                "role": message.role,
+                                "content": message.content,
+                                "tool_calls": [
+                                    {
+                                        "id": call.id,
+                                        "name": call.name,
+                                        "arguments": dict(call.arguments),
+                                    }
+                                    for call in message.tool_calls
+                                ],
+                                "metadata": dict(message.metadata),
+                            }
+                            for message in request_messages
+                        ],
+                        "require_json": require_json,
+                    },
+                    "tool_schema": tools,
+                    "status": "started",
+                    "probe_of_attempt_id": (
+                        conversation_probe_first_attempt_id
+                        if is_conversation_probe
+                        else None
+                    ),
+                },
+                sensitive_values=(
+                    cookie_item.get("source", ""),
+                    cookie_item.get("org_id", ""),
+                    cookie_item.get("cookie_string", ""),
+                ),
+            )
             provider_request = ProviderRequest(
                 logical_call_id=logical_request_id,
                 attempt_id=attempt_id,
@@ -1871,6 +3024,9 @@ def _call_agent_impl(
                     "human_message_uuid": request_human_message_uuid,
                     "assistant_message_uuid": request_assistant_message_uuid,
                     "request_revision": request_revision,
+                    "on_thinking_delta": emit_provisional_thinking,
+                    "on_thinking_reset": reset_provisional_thinking,
+                    "request_diagnostics": attempt_log,
                 },
             )
             adapter = provider_plugins.create_adapter(
@@ -1889,6 +3045,27 @@ def _call_agent_impl(
                 },
             )
 
+            # This is the authoritative "actually called" boundary: account,
+            # request and adapter are ready, and the next operation starts the
+            # provider transport. Planning and prompt preparation are not calls.
+            _emit_runtime_event(
+                {
+                    "type": "model_request_started",
+                    "role": agent_role,
+                    **_runtime_request_context(),
+                    "stage": "calling_model",
+                    "provider": provider_name,
+                    "account": cookie_item["source"],
+                    "account_ref": _public_account_ref(cookie_item),
+                    "attempt": attempt,
+                    "attempt_id": attempt_id,
+                    "logical_request_id": logical_request_id,
+                    "request_revision": request_revision,
+                    "request_fingerprint": request_fingerprint,
+                    "replayed": attempt > 1,
+                    "attempt_terminal": False,
+                }
+            )
             _mark_request_activity(cookie_item["source"], started=True)
             lease_outcome = "failed"
             lease_heartbeat = _AccountLeaseHeartbeat(account_lease)
@@ -1927,6 +3104,15 @@ def _call_agent_impl(
                 raise
             if lease_heartbeat.lost:
                 raise AccountLeaseLostError("Account lease was lost during provider transport")
+            if is_conversation_probe and conversation_probe_first_log is not None:
+                conversation_probe_first_log.update(
+                    error_classification="account_specific",
+                    retryable=False,
+                    parser_result={
+                        "diagnosis": "alternate_account_succeeded",
+                        "probe_attempt_id": attempt_id,
+                    },
+                )
             raw_response_text = provider_response.content
             _commit_provider_chunks(
                 provider_response.chunks,
@@ -1934,6 +3120,7 @@ def _call_agent_impl(
                 attempt_id=attempt_id,
                 attempt=attempt,
                 logical_request_id=logical_request_id,
+                request_revision=request_revision,
             )
             _record_journal_message(
                 role="assistant",
@@ -1958,6 +3145,16 @@ def _call_agent_impl(
 
             # NẾU LÀ CHẾ ĐỘ CHAT (Không cần JSON), TRẢ VỀ LUÔN
             if not require_json:
+                if attempt_log is not None:
+                    attempt_log.terminal(
+                        status="completed",
+                        parser_result={
+                            "kind": "chat",
+                            "parsed": True,
+                        },
+                        error_type=None,
+                        error_message=None,
+                    )
                 _emit_runtime_event(
                     {
                         "type": "model_request_completed",
@@ -1971,6 +3168,8 @@ def _call_agent_impl(
                         "request_revision": request_revision,
                         "request_fingerprint": request_fingerprint,
                         "replayed": attempt > 1,
+                        "attempt_terminal": True,
+                        "reset_provisional": True,
                     }
                 )
                 return ToolCallResult(
@@ -1978,6 +3177,7 @@ def _call_agent_impl(
                 )
 
             # NẾU LÀ CHẾ ĐỘ ORCHESTRATOR -> PARSE RECORD CÓ CẤU TRÚC
+            parsed_data: dict[str, Any] | None = None
             try:
                 parsed_data = extract_json_from_response(raw_response_text)
                 tool_name, tool_input = validate_action_response(
@@ -1985,6 +3185,18 @@ def _call_agent_impl(
                     tools,
                 )
             except LLMError as protocol_error:
+                if attempt_log is not None:
+                    attempt_log.terminal(
+                        status="failed",
+                        parser_result={
+                            "parsed": False,
+                            "raw_response_present": bool(raw_response_text),
+                        },
+                        error_stage="parser",
+                        error_classification="protocol_error",
+                        error=protocol_error,
+                        retryable=True,
+                    )
                 try:
                     from .agent_transcript import record_response
 
@@ -1992,7 +3204,7 @@ def _call_agent_impl(
                         task_id=getattr(thread_local, "task_id", None),
                         agent_id=getattr(thread_local, "agent_instance_id", None),
                         role=agent_role,
-                        account=cookie_item.get("source"),
+                        account=_public_account_ref(cookie_item),
                         attempt=attempt,
                         raw_response=raw_response_text,
                         parsed_ok=False,
@@ -2028,6 +3240,11 @@ def _call_agent_impl(
                     ),
                     "patch_content": patch_content,
                 }
+                parsed_data = {
+                    "_action": tool_name,
+                    **tool_input,
+                    "_recovered": True,
+                }
 
             try:
                 from .agent_transcript import record_response
@@ -2036,7 +3253,7 @@ def _call_agent_impl(
                     task_id=getattr(thread_local, "task_id", None),
                     agent_id=getattr(thread_local, "agent_instance_id", None),
                     role=agent_role,
-                    account=cookie_item.get("source"),
+                    account=_public_account_ref(cookie_item),
                     attempt=attempt,
                     raw_response=raw_response_text,
                     parsed_ok=True,
@@ -2048,6 +3265,18 @@ def _call_agent_impl(
             except Exception:
                 logger.exception("Không ghi được response transcript")
 
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="completed",
+                    parser_result={
+                        "parsed": True,
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                        "record": parsed_data,
+                    },
+                    error_type=None,
+                    error_message=None,
+                )
             _emit_runtime_event(
                 {
                     "type": "model_request_completed",
@@ -2062,6 +3291,8 @@ def _call_agent_impl(
                     "request_fingerprint": request_fingerprint,
                     "replayed": attempt > 1,
                     "tool_name": tool_name,
+                    "attempt_terminal": True,
+                    "reset_provisional": True,
                 }
             )
             return ToolCallResult(
@@ -2071,16 +3302,41 @@ def _call_agent_impl(
             )
 
         except ProviderAbortedError as e:
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="aborted",
+                    error_stage="transport",
+                    error_classification="aborted",
+                    error=e,
+                    retryable=False,
+                )
             raise ModelRequestAborted(str(e)) from e
 
         except (PermissionError, ProviderAuthenticationError) as e:
-            last_error = e
+            enforce_cancellation_precedence(e)
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="response",
+                    error_classification="authentication",
+                    error=e,
+                    retryable=True,
+                )
             source = cookie_item["source"]
             excluded_sources.add(source)
-            current_retry_cookie = None
             cookie_manager.mark_invalid(source)
             if sticky_enabled:
                 _clear_sticky_cookie(agent_role)
+            if agent_key:
+                release_agent_account(agent_key)
+            selection, replacement = coordinated_replacement(
+                "authentication",
+                e,
+                account=cookie_item,
+                lease=account_lease,
+                reason="account_invalid",
+            )
+            _record_attempt_remediation(attempt_log, e, selection)
             pending_switch_from = source
             pending_switch_reason = "account_invalid"
             _record_account_health(
@@ -2100,15 +3356,34 @@ def _call_agent_impl(
                     "account_state": "quarantined",
                     "credential_deleted": False,
                     "attempt": attempt,
+                    "attempt_id": attempt_id,
+                    "provider": provider_name,
                     "logical_request_id": logical_request_id,
                     "request_revision": request_revision,
                     "request_fingerprint": request_fingerprint,
+                    "attempt_terminal": True,
+                    "reset_provisional": True,
+                    **(selection.as_dict() if selection is not None else {}),
                 }
             )
+            if replacement is None:
+                raise TaskAccountPoolExhaustedError(
+                    "No atomic replacement account is available after authentication failure"
+                ) from e
+            current_retry_cookie = replacement.account
+            pending_account_lease = replacement.lease
             continue
 
         except (RateLimitError, ProviderRateLimitError) as e:
-            last_error = e
+            enforce_cancellation_precedence(e)
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="response",
+                    error_classification="rate_limit",
+                    error=e,
+                    retryable=True,
+                )
             retry_after = (
                 e.retry_after
                 if isinstance(e, RateLimitError)
@@ -2116,7 +3391,6 @@ def _call_agent_impl(
             )
             source = cookie_item["source"]
             excluded_sources.add(source)
-            current_retry_cookie = None
             maximum_cooldown = max(
                 config.RATE_LIMIT_COOLDOWN_SECONDS,
                 int(os.environ.get("ORCH_MAX_ACCOUNT_COOLDOWN_SECONDS", str(24 * 60 * 60))),
@@ -2128,6 +3402,16 @@ def _call_agent_impl(
             cookie_manager.mark_rate_limited(source, cooldown_seconds)
             if sticky_enabled:
                 _clear_sticky_cookie(agent_role)
+            if agent_key:
+                release_agent_account(agent_key)
+            selection, replacement = coordinated_replacement(
+                "rate_limit",
+                e,
+                account=cookie_item,
+                lease=account_lease,
+                reason="rate_limit",
+            )
+            _record_attempt_remediation(attempt_log, e, selection)
             pending_switch_from = source
             pending_switch_reason = "rate_limit"
             _record_account_health(
@@ -2154,6 +3438,9 @@ def _call_agent_impl(
                     "logical_request_id": logical_request_id,
                     "request_revision": request_revision,
                     "request_fingerprint": request_fingerprint,
+                    "attempt_terminal": True,
+                    "reset_provisional": True,
+                    **(selection.as_dict() if selection is not None else {}),
                 }
             )
             logger.warning(
@@ -2161,10 +3448,24 @@ def _call_agent_impl(
                 agent_role,
                 source,
             )
+            if replacement is None:
+                raise TaskAccountPoolExhaustedError(
+                    "No atomic replacement account is available after rate limiting"
+                ) from e
+            current_retry_cookie = replacement.account
+            pending_account_lease = replacement.lease
             continue
 
         except (requests.RequestException, ProviderTransportError) as e:
-            last_error = e
+            enforce_cancellation_precedence(e)
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="transport",
+                    error_classification="transport_error",
+                    error=e,
+                    retryable=True,
+                )
             source = cookie_item["source"]
             failure_count = failures_by_source.get(source, 0) + 1
             failures_by_source[source] = failure_count
@@ -2175,14 +3476,22 @@ def _call_agent_impl(
                 logical_call_id=logical_request_id,
                 attempt_id=attempt_id,
             )
-            switching = failure_count >= config.PROTOCOL_ATTEMPTS_PER_COOKIE
-            if switching:
-                excluded_sources.add(source)
-                current_retry_cookie = None
-                pending_switch_from = source
-                pending_switch_reason = "transport_error"
-                if sticky_enabled:
-                    _clear_sticky_cookie(agent_role)
+            switching = True
+            excluded_sources.add(source)
+            pending_switch_from = source
+            pending_switch_reason = "transport_error"
+            if sticky_enabled:
+                _clear_sticky_cookie(agent_role)
+            if agent_key:
+                release_agent_account(agent_key)
+            selection, replacement = coordinated_replacement(
+                "transport",
+                e,
+                account=cookie_item,
+                lease=account_lease,
+                reason="transport_error",
+            )
+            _record_attempt_remediation(attempt_log, e, selection)
             _emit_retry_event(
                 agent_role,
                 source,
@@ -2190,50 +3499,361 @@ def _call_agent_impl(
                 "transport_error",
                 switching,
                 str(e),
+                selection=selection,
             )
             logger.warning(
-                "Lỗi mạng/API [%s] lần %d/%d: %s",
+                "Lỗi mạng/API [%s] lần %d; chuyển account khác: %s",
                 source,
                 failure_count,
-                config.PROTOCOL_ATTEMPTS_PER_COOKIE,
                 e,
             )
+            if replacement is None:
+                raise TaskAccountPoolExhaustedError(
+                    "No atomic replacement account is available after transport failure"
+                ) from e
+            current_retry_cookie = replacement.account
+            pending_account_lease = replacement.lease
             continue
 
         except (PayloadRejectedError, ProviderPayloadError) as e:
-            # Retrying an identical malformed payload with eight accounts only
-            # burns quota and obscures the actual request error.
+            enforce_cancellation_precedence(e)
+            classification = (
+                e.classification
+                if isinstance(e, PayloadRejectedError)
+                else (e.info.classification or "provider_payload")
+            )
+            if classification == "ambiguous_conversation":
+                source = cookie_item["source"]
+                selection, signature = choose_runtime_remediation(
+                    "ambiguous_conversation",
+                    e,
+                    source=source,
+                    include_source=False,
+                )
+                _record_attempt_remediation(attempt_log, e, selection)
+                if (
+                    selection is not None
+                    and selection.strategy.name == "probe_ambiguous_conversation"
+                ):
+                    conversation_probe_pending = True
+                    conversation_probe_first_log = attempt_log
+                    conversation_probe_first_attempt_id = attempt_id
+                    if attempt_log is not None:
+                        attempt_log.terminal(
+                            status="failed",
+                            error_stage="response",
+                            error_classification="ambiguous_conversation",
+                            error=e,
+                            retryable=True,
+                        )
+                    excluded_sources.add(source)
+                    pending_switch_from = source
+                    pending_switch_reason = "conversation_probe"
+                    if sticky_enabled:
+                        _clear_sticky_cookie(agent_role)
+                    if agent_key:
+                        release_agent_account(agent_key)
+                    _record_account_health(
+                        account=cookie_item,
+                        state="degraded",
+                        reason="conversation_create_ambiguous",
+                        logical_call_id=logical_request_id,
+                        attempt_id=attempt_id,
+                    )
+                    replacement = _replace_account_atomically(
+                        current=cookie_item,
+                        current_lease=account_lease,
+                        reason="conversation_probe",
+                        logical_call_id=logical_request_id,
+                        agent_id=agent_key,
+                        excluded_sources=excluded_sources,
+                    )
+                    if replacement is None:
+                        error = PayloadRejectedError(
+                            "Conversation ambiguity could not be probed because "
+                            "no alternate account is available",
+                            classification="provider_conversation_input",
+                        )
+                        _attach_remediation_metadata(error, selection, signature)
+                        raise error from e
+                    current_retry_cookie = replacement.account
+                    pending_account_lease = replacement.lease
+                    continue
+                if attempt_log is not None:
+                    attempt_log.terminal(
+                        status="failed",
+                        error_stage="response",
+                        error_classification="provider_conversation_input",
+                        error=e,
+                        retryable=False,
+                    )
+                if conversation_probe_first_log is not None:
+                    conversation_probe_first_log.update(
+                        error_classification="provider_conversation_input",
+                        retryable=False,
+                        parser_result={
+                            "diagnosis": "alternate_account_returned_same_400",
+                            "probe_attempt_id": attempt_id,
+                        },
+                    )
+                error = PayloadRejectedError(
+                    str(e),
+                    classification="provider_conversation_input",
+                )
+                _attach_remediation_metadata(error, selection, signature)
+                raise error from e
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="response",
+                    error_classification=classification,
+                    error=e,
+                    retryable=False,
+                )
+            signature = _runtime_failure_signature(
+                "provider_payload",
+                source=cookie_item["source"],
+                base_request_hash=base_request_hash,
+                error=e,
+            )
+            selection = retry_policy.advance_remediation(
+                "provider_payload",
+                signature,
+                retry_policy.RecoveryState(
+                    signature.digest,
+                    ("probe_ambiguous_conversation",),
+                ),
+                automatic_only=False,
+            )
+            _attach_remediation_metadata(e, selection, signature)
+            _record_attempt_remediation(attempt_log, e, selection)
+            # Account rotation cannot repair definite malformed request bytes.
             if isinstance(e, PayloadRejectedError):
                 raise
-            raise PayloadRejectedError(str(e)) from e
+            error = PayloadRejectedError(
+                str(e),
+                classification=classification,
+            )
+            _attach_remediation_metadata(error, selection, signature)
+            raise error from e
 
-        except AccountLeaseUnavailableError as e:
-            last_error = e
-            source = cookie_item["source"]
-            excluded_sources.add(source)
-            current_retry_cookie = None
-            if sticky_enabled:
-                _clear_sticky_cookie(agent_role)
-            continue
-
-        except ModelRequestAborted:
-            raise
-
-        except LLMError as e:
-            last_error = e
-            logger.error(f"Lỗi Output AI/Parser Error: {e}")
-            protocol_correction = str(e)[:1000]
+        except ProviderError as e:
+            enforce_cancellation_precedence(e)
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="provider",
+                    error_classification=e.info.classification or e.info.code.value,
+                    error=e,
+                    retryable=e.info.retryable,
+                )
+            if not e.info.retryable:
+                signature = _runtime_failure_signature(
+                    "provider_payload",
+                    source=cookie_item["source"],
+                    base_request_hash=base_request_hash,
+                    error=e,
+                )
+                error = PayloadRejectedError(
+                    str(e),
+                    classification=e.info.classification or "provider_error",
+                )
+                _attach_remediation_metadata(error, None, signature)
+                raise error from e
             source = cookie_item["source"]
             failure_count = failures_by_source.get(source, 0) + 1
             failures_by_source[source] = failure_count
-            switching = failure_count >= config.PROTOCOL_ATTEMPTS_PER_COOKIE
+            excluded_sources.add(source)
+            pending_switch_from = source
+            pending_switch_reason = "provider_error"
+            if sticky_enabled:
+                _clear_sticky_cookie(agent_role)
+            if agent_key:
+                release_agent_account(agent_key)
+            selection, replacement = coordinated_replacement(
+                "provider_error",
+                e,
+                account=cookie_item,
+                lease=account_lease,
+                reason="provider_error",
+            )
+            _record_attempt_remediation(attempt_log, e, selection)
+            _record_account_health(
+                account=cookie_item,
+                state="degraded",
+                reason="provider_error",
+                logical_call_id=logical_request_id,
+                attempt_id=attempt_id,
+            )
+            _emit_retry_event(
+                agent_role,
+                source,
+                failure_count,
+                "provider_error",
+                True,
+                str(e),
+                selection=selection,
+            )
+            if replacement is None:
+                raise TaskAccountPoolExhaustedError(
+                    "No atomic replacement account is available after provider failure"
+                ) from e
+            current_retry_cookie = replacement.account
+            pending_account_lease = replacement.lease
+            continue
+
+        except AccountLeaseUnavailableError as e:
+            enforce_cancellation_precedence(e)
+            source = cookie_item["source"]
+            excluded_sources.add(source)
+            if sticky_enabled:
+                _clear_sticky_cookie(agent_role)
+            if agent_key:
+                release_agent_account(agent_key)
+            selection, replacement = coordinated_replacement(
+                "account_lease_unavailable",
+                e,
+                account=cookie_item,
+                lease=account_lease,
+                reason="account_lease_unavailable",
+            )
+            _record_attempt_remediation(attempt_log, e, selection)
+            if replacement is None:
+                raise TaskAccountPoolExhaustedError(
+                    "No immediate replacement exists for the unavailable account lease"
+                ) from e
+            pending_switch_from = source
+            pending_switch_reason = "account_lease_unavailable"
+            current_retry_cookie = replacement.account
+            pending_account_lease = replacement.lease
+            continue
+
+        except AccountLeaseLostError as e:
+            enforce_cancellation_precedence(e)
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="transport",
+                    error_classification="lease_loss",
+                    error=e,
+                    retryable=True,
+                )
+            source = cookie_item["source"]
+            excluded_sources.add(source)
+            if sticky_enabled:
+                _clear_sticky_cookie(agent_role)
+            if agent_key:
+                release_agent_account(agent_key)
+            selection, replacement = coordinated_replacement(
+                "lease_loss",
+                e,
+                account=cookie_item,
+                lease=account_lease,
+                reason="lease_loss",
+            )
+            _record_attempt_remediation(attempt_log, e, selection)
+            if replacement is None:
+                raise TaskAccountPoolExhaustedError(
+                    "No immediate replacement exists after account lease loss"
+                ) from e
+            pending_switch_from = source
+            pending_switch_reason = "lease_loss"
+            current_retry_cookie = replacement.account
+            pending_account_lease = replacement.lease
+            _emit_retry_event(
+                agent_role,
+                source,
+                failures_by_source.get(source, 0) + 1,
+                "lease_loss",
+                True,
+                str(e),
+                selection=selection,
+            )
+            continue
+
+        except ModelRequestAborted as e:
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="aborted",
+                    error_stage="orchestrator",
+                    error_classification="aborted",
+                    error=e,
+                    retryable=False,
+                )
+            raise
+
+        except (TaskAccountPoolExhaustedError, AccountPoolExhaustedError):
+            raise
+
+        except LLMError as e:
+            enforce_cancellation_precedence(e)
+            source = cookie_item["source"]
+            selection, signature = choose_runtime_remediation(
+                "protocol_error",
+                e,
+                source=source,
+                response=raw_response_text,
+            )
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="parser",
+                    error_classification="protocol_error",
+                    error=e,
+                    retryable=selection is not None,
+                )
+            _record_attempt_remediation(attempt_log, e, selection)
+            logger.error(f"Lỗi Output AI/Parser Error: {e}")
+            failure_count = failures_by_source.get(source, 0) + 1
+            failures_by_source[source] = failure_count
+            if selection is None:
+                error = PayloadRejectedError(
+                    "No unused protocol remediation remains for failure signature "
+                    f"{signature.digest}: {e}",
+                    classification="protocol_error",
+                )
+                _attach_remediation_metadata(error, None, signature)
+                raise error from e
+            protocol_correction = retry_policy.remediation_prompt(
+                "protocol_error",
+                signature,
+                error=str(e),
+                strategy=selection.strategy,
+                diagnostic_refs={
+                    "logical_request_id": logical_request_id,
+                    "provider_attempt_id": attempt_id,
+                    "request_fingerprint": request_fingerprint,
+                },
+            )
+            switching = selection.strategy.replace_account
             if switching:
                 excluded_sources.add(source)
-                current_retry_cookie = None
                 pending_switch_from = source
                 pending_switch_reason = "protocol_error"
                 if sticky_enabled:
                     _clear_sticky_cookie(agent_role)
+                if agent_key:
+                    release_agent_account(agent_key)
+                replacement = _replace_account_atomically(
+                    current=cookie_item,
+                    current_lease=account_lease,
+                    reason="protocol_error",
+                    logical_call_id=logical_request_id,
+                    agent_id=agent_key,
+                    excluded_sources=excluded_sources,
+                )
+                if replacement is None:
+                    error = PayloadRejectedError(
+                        "Protocol prompt variants were exhausted and no alternate "
+                        "account is available",
+                        classification="protocol_error",
+                    )
+                    _attach_remediation_metadata(error, selection, signature)
+                    raise error from e
+                current_retry_cookie = replacement.account
+                pending_account_lease = replacement.lease
+            else:
+                current_retry_cookie = cookie_item
             _emit_retry_event(
                 agent_role,
                 source,
@@ -2241,15 +3861,20 @@ def _call_agent_impl(
                 "protocol_error",
                 switching,
                 str(e),
+                selection=selection,
             )
             continue
 
-    raise LLMError(
-        f"LLM thất bại sau {attempts_made} lần thử; tất cả cookie khả dụng "
-        f"đã lỗi {config.PROTOCOL_ATTEMPTS_PER_COOKIE} lần hoặc đang "
-        f"rate-limit: {last_error}"
-    )
-
+        except Exception as e:
+            if attempt_log is not None:
+                attempt_log.terminal(
+                    status="failed",
+                    error_stage="internal",
+                    error_classification="unexpected_error",
+                    error=e,
+                    retryable=False,
+                )
+            raise
 
 def call_agent(
     system_prompt: str,

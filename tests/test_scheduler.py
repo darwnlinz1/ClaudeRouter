@@ -11,10 +11,38 @@ from orchestrator.scheduler import (
     SchedulingError,
     ScopeClaims,
     canonical_scope,
+    is_terminal_work_status,
     ready_work_items,
     scopes_conflict,
     validate_plan,
 )
+
+
+@pytest.fixture(autouse=True)
+def bounded_scheduling(monkeypatch):
+    """These cases specify the bounded contract: dependencies gate, caps bind.
+
+    Maximum parallelism is the shipped default and is covered separately below;
+    pinning it off here keeps this file testing the semantics it was written
+    for instead of silently passing because nothing is gated any more.
+    """
+    monkeypatch.setenv("ORCH_MAX_PARALLELISM", "0")
+
+
+def test_scheduler_defaults_match_frontend_and_api_shape():
+    limits = SchedulerLimits()
+
+    assert limits.manager_cap == 4
+    assert limits.max_parallel_managers == 4
+    assert limits.max_workers_per_manager == 5
+    assert limits.coders_per_manager == 4
+    assert limits.worker_parallel_cap == 4
+    assert limits.max_parallel_workers == 8
+
+
+def test_scheduler_rejects_child_cap_without_coder_and_tester_slots():
+    with pytest.raises(ValueError, match="one Coder and one Tester"):
+        SchedulerLimits(max_workers_per_manager=1)
 
 
 def item(
@@ -59,6 +87,134 @@ def plan_with(*streams: Workstream, managers=2) -> TaskPlan:
     )
 
 
+class TestMaximumParallelism:
+    """The shipped default: the plan runs at the width it was planned at.
+
+    Dependency and scope metadata cannot prevent model inference in this mode.
+    Filesystem effects are independently serialized by the ticket executor.
+    """
+
+    @pytest.fixture(autouse=True)
+    def unbounded(self, monkeypatch):
+        monkeypatch.delenv("ORCH_MAX_PARALLELISM", raising=False)
+
+    def test_independent_workstreams_all_start_despite_a_low_manager_cap(self):
+        ready = plan_with(
+            stream("core", items=(item("core-a", "core"),), workers=1),
+            stream("api", items=(item("api-a", "api"),), workers=1),
+            stream("ui", items=(item("ui-a", "ui"),), workers=1),
+            stream("tests", items=(item("t-a", "tests"),), workers=1),
+            managers=4,
+        )
+        # Planning allows four; concurrency says one. The concurrency cap is
+        # exactly what must stop binding.
+        scheduler = Scheduler(SchedulerLimits(max_managers=4, max_parallel_managers=1))
+
+        selected = scheduler.select_workstreams(ready, active_manager_count=0)
+
+        assert [stream.id for stream in selected] == ["core", "api", "ui", "tests"]
+
+    def test_workstream_dependencies_do_not_delay_model_inference(self):
+        planned = plan_with(
+            stream("foundation", items=(item("core-a", "foundation"),), workers=1),
+            stream(
+                "consumer",
+                dependencies=("foundation",),
+                items=(item("api-a", "consumer"),),
+                workers=1,
+            ),
+            managers=2,
+        )
+        scheduler = Scheduler(
+            SchedulerLimits(max_managers=2, max_parallel_managers=1)
+        )
+
+        selected = scheduler.select_workstreams(
+            planned,
+            active_manager_count=0,
+            statuses={
+                "foundation": WorkStatus.PENDING,
+                "consumer": WorkStatus.PENDING,
+            },
+        )
+
+        assert [value.id for value in selected] == ["foundation", "consumer"]
+
+    def test_slot_caps_do_not_shrink_the_planned_width(self):
+        target = stream("core", items=tuple(item(f"i{index}", "core") for index in range(6)))
+        target = replace(target, requested_worker_count=6)
+        scheduler = Scheduler(SchedulerLimits(max_parallel_workers=2))
+
+        slots = scheduler.worker_slots(target, active_for_manager=0, active_global=0)
+
+        assert slots == 6
+
+    def test_dependencies_and_scope_conflicts_do_not_block_model_inference(self):
+        target = stream(
+            "core",
+            items=(
+                item("first", "core", scope="src/shared.py"),
+                item(
+                    "second",
+                    "core",
+                    scope="src/shared.py",
+                    dependencies=("first",),
+                ),
+            ),
+            workers=2,
+        )
+        scheduler = Scheduler(SchedulerLimits())
+
+        selected = scheduler.select_work_items(
+            target,
+            active_for_manager=0,
+            active_global=0,
+        )
+
+        assert [value.id for value in selected] == ["first", "second"]
+
+    def test_cycles_are_metadata_not_recursive_scheduler_traversal(self):
+        cyclic_streams = plan_with(
+            stream(
+                "first",
+                dependencies=("second",),
+                items=(item("first-item", "first"),),
+                workers=1,
+            ),
+            stream(
+                "second",
+                dependencies=("first",),
+                items=(item("second-item", "second"),),
+                workers=1,
+            ),
+            managers=2,
+        )
+        scheduler = Scheduler(
+            SchedulerLimits(max_managers=2, max_parallel_managers=1)
+        )
+
+        selected_streams = scheduler.select_workstreams(
+            cyclic_streams,
+            active_manager_count=0,
+        )
+        assert [value.id for value in selected_streams] == ["first", "second"]
+
+        cyclic_items = stream(
+            "items",
+            items=(
+                item("a", "items", dependencies=("b",)),
+                item("b", "items", dependencies=("a",)),
+            ),
+            workers=2,
+        )
+        selected_items = scheduler.select_work_items(
+            cyclic_items,
+            active_for_manager=0,
+            active_global=0,
+        )
+        assert [value.id for value in selected_items] == ["a", "b"]
+
+
 def test_two_level_dag_validation_rejects_cycles():
     first = stream("one")
     second = stream("two", dependencies=("one",))
@@ -86,14 +242,16 @@ def test_manager_selection_respects_dependencies_and_dynamic_limit():
     second = stream("two", dependencies=("one",))
     third = stream("three")
     plan = plan_with(first, second, third, managers=3)
-    scheduler = Scheduler(
-        SchedulerLimits(max_managers=3, max_parallel_managers=2)
-    )
+    scheduler = Scheduler(SchedulerLimits(max_managers=3, max_parallel_managers=2))
 
     selected = scheduler.select_workstreams(
         plan,
         active_manager_count=0,
-        statuses={"one": WorkStatus.PENDING, "two": WorkStatus.PENDING, "three": WorkStatus.PENDING},
+        statuses={
+            "one": WorkStatus.PENDING,
+            "two": WorkStatus.PENDING,
+            "three": WorkStatus.PENDING,
+        },
     )
 
     assert [value.id for value in selected] == ["one", "three"]
@@ -123,9 +281,7 @@ def test_worker_selection_respects_both_limits_dependencies_and_scopes():
             item("d", "one", scope="src/independent.py"),
         ),
     )
-    scheduler = Scheduler(
-        SchedulerLimits(max_workers_per_manager=3, max_parallel_workers=3)
-    )
+    scheduler = Scheduler(SchedulerLimits(max_workers_per_manager=3, max_parallel_workers=3))
 
     selected = scheduler.select_work_items(
         workstream,
@@ -153,6 +309,31 @@ def test_ready_items_require_approved_dependencies():
             statuses={"a": WorkStatus.APPROVED, "b": WorkStatus.PENDING},
         )
     ] == ["b"]
+
+
+def test_abandoned_and_skipped_are_terminal_and_do_not_unlock_dependencies():
+    workstream = stream(
+        "one",
+        items=(
+            item("a", "one"),
+            item("b", "one", dependencies=("a",)),
+            item("c", "one"),
+        ),
+        workers=3,
+    )
+
+    ready = ready_work_items(
+        workstream,
+        statuses={
+            "a": WorkStatus.ABANDONED,
+            "b": WorkStatus.PENDING,
+            "c": WorkStatus.SKIPPED,
+        },
+    )
+
+    assert ready == []
+    assert is_terminal_work_status(WorkStatus.ABANDONED)
+    assert is_terminal_work_status(WorkStatus.SKIPPED)
 
 
 def test_scope_conflicts_are_path_aware_and_claims_are_owner_checked():
@@ -229,12 +410,8 @@ def test_selection_prioritizes_critical_path_then_rotates_waiters():
     foundation = stream("foundation")
     dependent = stream("dependent", dependencies=("foundation",))
     plan = plan_with(independent, foundation, dependent, managers=3)
-    scheduler = Scheduler(
-        SchedulerLimits(max_managers=3, max_parallel_managers=1)
-    )
-    statuses = {
-        value.id: WorkStatus.PENDING for value in plan.workstreams
-    }
+    scheduler = Scheduler(SchedulerLimits(max_managers=3, max_parallel_managers=1))
+    statuses = {value.id: WorkStatus.PENDING for value in plan.workstreams}
 
     first = scheduler.select_workstreams(
         plan,
@@ -260,9 +437,7 @@ def test_worker_selection_ages_skipped_item_and_honors_cancellation():
             item("low", "fair", priority=0),
         ),
     )
-    scheduler = Scheduler(
-        SchedulerLimits(max_workers_per_manager=2, max_parallel_workers=1)
-    )
+    scheduler = Scheduler(SchedulerLimits(max_workers_per_manager=2, max_parallel_workers=1))
 
     first = scheduler.select_work_items(
         workstream,

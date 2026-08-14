@@ -1,5 +1,7 @@
+import type { ConfigurableRole, WorkspaceSettings } from '../types';
+
 export const PREFS_KEY = 'orchestrator:ui-prefs:v1';
-export const WORKSPACE_SPLIT_DEFAULT = 44;
+export const WORKSPACE_SPLIT_DEFAULT = 56;
 export const WORKSPACE_SPLIT_MIN = 30;
 export const WORKSPACE_SPLIT_MAX = 70;
 export const WORKSPACE_SPLIT_STEP = 2;
@@ -39,6 +41,67 @@ const normalizePrefs = (stored: Partial<UiPrefs>): UiPrefs => {
       : DEFAULT_PREFS.workspaceSplitPercent,
   };
 };
+
+const boundedInteger = (value: unknown, fallback: number, minimum: number, maximum: number) => {
+  const parsed = Number(value);
+  const selected = Number.isFinite(parsed) ? Math.trunc(parsed) : fallback;
+  return Math.min(maximum, Math.max(minimum, selected));
+};
+
+export function normalizeWorkspaceSettings(
+  stored: Partial<WorkspaceSettings>,
+  defaults: WorkspaceSettings,
+): WorkspaceSettings {
+  const maxManagers = boundedInteger(
+    stored.maxManagers ?? stored.maxParallelManagers,
+    defaults.maxManagers,
+    1,
+    32,
+  );
+  const maxWorkersPerManager = boundedInteger(
+    stored.maxWorkersPerManager,
+    defaults.maxWorkersPerManager,
+    2,
+    32,
+  );
+  const coderCap = maxWorkersPerManager - 1;
+  const roles: ConfigurableRole[] = ['director', 'manager', 'worker', 'tester'];
+  const roleProfiles = Object.fromEntries(
+    roles.map((role) => [
+      role,
+      {
+        ...defaults.roleProfiles[role],
+        ...(stored.roleProfiles?.[role] ?? {}),
+      },
+    ]),
+  ) as WorkspaceSettings['roleProfiles'];
+  const perManagerSlots = stored.maxParallelWorkersPerManager;
+  return {
+    ...defaults,
+    ...stored,
+    maxManagers,
+    maxParallelManagers: boundedInteger(
+      stored.maxParallelManagers,
+      Math.min(defaults.maxParallelManagers, maxManagers),
+      1,
+      maxManagers,
+    ),
+    maxWorkersPerManager,
+    maxParallelWorkersPerManager:
+      perManagerSlots == null ? undefined : boundedInteger(perManagerSlots, coderCap, 1, coderCap),
+    maxParallelWorkers: boundedInteger(
+      stored.maxParallelWorkers,
+      defaults.maxParallelWorkers,
+      1,
+      64,
+    ),
+    mockWhenUnavailable:
+      typeof stored.mockWhenUnavailable === 'boolean'
+        ? stored.mockWhenUnavailable
+        : defaults.mockWhenUnavailable,
+    roleProfiles,
+  };
+}
 
 export function loadPrefs(): UiPrefs {
   try {

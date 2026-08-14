@@ -61,15 +61,20 @@ beforeEach(() => {
   );
   vi.stubGlobal('cancelAnimationFrame', vi.fn());
   apiMock.getTask.mockResolvedValue({ ...task, events: [] });
-  apiMock.getTimeline.mockResolvedValue([
-    {
-      sequence: 1,
-      type: 'agent_started',
-      agent_instance_id: 'worker-a',
-      role: 'worker',
-      payload: { stage: 'running' },
-    },
-  ]);
+  apiMock.getTimeline.mockResolvedValue({
+    events: [
+      {
+        sequence: 1,
+        type: 'agent_started',
+        agent_instance_id: 'worker-a',
+        role: 'worker',
+        payload: { stage: 'running' },
+      },
+    ],
+    latestSequence: 1,
+    retainedFromSequence: 1,
+    historyIncomplete: false,
+  });
   apiMock.listApprovals.mockResolvedValue([]);
   apiMock.streamUrl.mockReturnValue('/api/stream/task-live?after=1');
 });
@@ -123,6 +128,69 @@ describe('useWorkspace live synchronization', () => {
     });
     expect(apiMock.listApprovals).toHaveBeenCalledTimes(2);
 
+    unmount();
+  });
+
+  it('reapplies authoritative request counters after timeline replay', async () => {
+    apiMock.getTask.mockResolvedValue({
+      ...task,
+      hierarchy: {
+        execution: {
+          request_attempts: 5,
+          completed_requests: 4,
+        },
+      },
+    });
+    apiMock.getTimeline.mockResolvedValue({
+      events: [
+        {
+          sequence: 1,
+          type: 'model_request_started',
+          agent_instance_id: 'worker-a',
+          role: 'worker',
+          attempt_id: 'request-a:a1',
+          logical_request_id: 'request-a',
+          account_ref: 'acct-1234-abcd-5678',
+          payload: { stage: 'calling_model' },
+        },
+      ],
+      latestSequence: 1,
+      retainedFromSequence: 1,
+      historyIncomplete: false,
+    });
+
+    const { result, unmount } = renderHook(() => useWorkspace(task));
+
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    expect(result.current.state.fanout.requestAttempts).toBe(5);
+    expect(result.current.state.usedAccounts).toEqual(['acct-1234-abcd-5678']);
+
+    unmount();
+  });
+
+  it('flushes queued terminal frames when task polling closes the stream', async () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ currentTask }: { currentTask: TaskSummary }) => useWorkspace(currentTask),
+      { initialProps: { currentTask: task } },
+    );
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    act(() => {
+      sendEvent(FakeEventSource.instances[0], {
+        sequence: 2,
+        type: 'agent_completed',
+        agent_instance_id: 'worker-terminal',
+        role: 'worker',
+        workstream_id: 'stream-terminal',
+        work_item_id: 'item-terminal',
+        status: 'completed',
+      });
+    });
+    expect(result.current.state.agents['worker-terminal']).toBeUndefined();
+
+    rerender({ currentTask: { ...task, status: 'COMPLETED' } });
+
+    expect(result.current.state.agents['worker-terminal']?.status).toBe('passed');
     unmount();
   });
 

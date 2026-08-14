@@ -1,4 +1,13 @@
--r requirements.lock
+-r requirements.txt
+
+# Test runner
+pytest==9.1.1
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pygments==2.20.0
+
+# Lint, types, properties, packaging, audit
 ruff
 mypy
 types-requests

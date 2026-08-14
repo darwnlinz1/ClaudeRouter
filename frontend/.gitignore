@@ -8,3 +8,4 @@ coverage/
 .vite/
 .pytest_cache/
 .eslintcache
+.ui-screens/

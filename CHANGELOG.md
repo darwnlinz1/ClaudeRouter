@@ -15,6 +15,33 @@ an entry in this file does not prove that a test or release gate passed.
   retain their canonical contract snapshots for replay and compatibility.
 - Corrected schema references and upgrade/rollback checks throughout operator,
   architecture, event, security, and acceptance documentation.
+- At the operator's request, execution is unbounded: there is no model-call,
+  wall-clock time, or token budget. This does not change or imply support for
+  remote operation; the local-only boundary remains in force.
+- Agent windows now display provisional thinking as it streams and provide a
+  per-agent Response tab beside Stream, Thinking, Diff, and Tools.
+- Frontend fan-out settings now flow directly to Director and Manager planning
+  without the former per-Manager package cap; planned Managers and independent
+  Workers launch concurrently within the separately configured execution slots.
+- Dependency-gated agents now report `blocked` without emitting false failure
+  attempts, and provider failures rotate cookies before replaying the same
+  logical assignment.
+- Provider prompt content is no longer rejected by the internal secret scanner;
+  log/artifact redaction and the local API, path, CSRF, and sandbox boundaries
+  remain enabled.
+- Planner write scopes are rejected when they exceed the configured package
+  limit instead of being silently truncated; action-schema numeric bounds are
+  now enforced at the transport boundary.
+- Completion reconciliation now proves that every planned logical agent was
+  called for a named purpose or received an explicit terminal no-call
+  disposition. Execution attempts and provider retry attempts have distinct
+  correlation IDs.
+- Shared workstream Testers are serialized by logical identity, cancellation is
+  persisted as `CANCELLED`, and Worker submission is bounded before thread
+  creation by the frontend-backed global concurrency setting.
+- Event contract version `2` requires stable fan-out identities. Canonical task
+  snapshots retain agent topology across event compaction, while timeline
+  pages and SSE reconnects expose retained-history gaps.
 
 ### Evidence note
 

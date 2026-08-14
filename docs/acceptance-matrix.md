@@ -4,10 +4,9 @@ This matrix is the repeatable release gate for the accepted P0 product:
 local-only service, React-only UI, fail-closed repository sandbox, and one
 flattened repository.
 
-**Evidence status: CURRENT for the recorded source fingerprint.** The latest
-[acceptance evidence](acceptance-evidence.md) records a full 19/19 schema-14 run
-on the flattened repository. It becomes stale after any source or dependency
-change.
+Keep hashed JSON/Markdown reports outside the repository (`acceptance-results/`
+is gitignored). A checked-in snapshot is not a substitute for rerunning the
+matrix after source or dependency changes.
 
 ## Release preconditions
 
@@ -127,6 +126,5 @@ A release report is usable only when:
 - the JSON/Markdown reports and individual log hashes are retained;
 - the run did not use `-SkipE2E` or reinterpret `-AllowBlocked` as success.
 
-Do not rewrite [acceptance-evidence.md](acceptance-evidence.md) to imply that an
-old run covered new source. Add or replace evidence only with a newly executed,
-hashed report for the exact source under review.
+Do not commit dated acceptance snapshots into `docs/`. Store hashed reports
+outside the tree and rerun the matrix for the exact source under review.

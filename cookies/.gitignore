@@ -1,0 +1,3 @@
+# Session cookies and quarantine metadata stay on this machine only.
+*
+!.gitignore

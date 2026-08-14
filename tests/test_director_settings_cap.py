@@ -17,7 +17,7 @@ def _result(count: int) -> ToolCallResult:
                     "title": f"W{i}",
                     "goal": "g",
                     "acceptance_criteria": ["ok"],
-                    "dependencies": [f"w{i-1}"] if i > 1 else [],
+                    "dependencies": [f"w{i - 1}"] if i > 1 else [],
                     "contract_id": f"w{i}-contract",
                     "contract_version": 1,
                     "input_artifacts": [],
@@ -75,6 +75,25 @@ def test_director_rejects_plan_above_manager_cap():
             ),
             max_manager_count=4,
         )
+
+
+def test_director_accepts_frontend_manager_cap_above_twelve():
+    plan = _director_plan_from_result(
+        _result(20),
+        task_id="t-large",
+        session_id="s-large",
+        goal="goal",
+        limits=SchedulerLimits(
+            max_managers=20,
+            max_parallel_managers=8,
+            max_workstreams=64,
+        ),
+        max_manager_count=20,
+    )
+
+    assert plan.requested_manager_count == 20
+    assert len(plan.workstreams) == 20
+    assert plan.metadata["fanout"]["manager"]["max"] == 20
 
 
 def test_director_validates_execution_slots_against_effective_cap():

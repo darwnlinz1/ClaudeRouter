@@ -278,3 +278,22 @@ def test_plan_prompts_select_dynamic_fanout_and_require_work_contract(prompt):
     assert "evidence_requirements" in prompt
     assert "hard contract" not in lowered
     assert "return exactly" not in lowered
+
+
+def test_director_prompt_discourages_serialising_the_plan():
+    """A dependency edge costs parallelism, so the prompt must say so.
+
+    A Director that chains every workstream produces a plan where only one
+    stream can run at a time: eleven workers were spawned and at most five
+    could ever be in flight, then two, then one. The earlier wording ("add a
+    dependency only when one stream truly needs another") was too soft to stop
+    it treating a shared API contract as a real artifact dependency.
+    """
+    # The prompt is hard-wrapped, so compare on collapsed whitespace.
+    lowered = " ".join(DIRECTOR_PLAN_PROMPT.lower().split())
+
+    assert "removes parallelism" in lowered
+    assert "cannot be written without reading a file another stream produces" in lowered
+    # The specific false dependencies that serialised real runs.
+    assert "not dependencies" in lowered
+    assert "empty `dependencies` list" in lowered

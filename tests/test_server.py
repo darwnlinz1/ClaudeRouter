@@ -35,6 +35,17 @@ def isolated_task_store(monkeypatch, tmp_path):
     server.stop_flags.clear()
 
 
+def test_startup_recovery_is_limited_to_the_cli_owner_process(monkeypatch):
+    monkeypatch.delenv("ORCH_RECOVERY_OWNER_PID", raising=False)
+    assert server._owns_startup_recovery() is False
+
+    monkeypatch.setenv("ORCH_RECOVERY_OWNER_PID", str(server.os.getpid()))
+    assert server._owns_startup_recovery() is True
+
+    monkeypatch.setenv("ORCH_RECOVERY_OWNER_PID", str(server.os.getpid() + 1))
+    assert server._owns_startup_recovery() is False
+
+
 class _FakeThread:
     last_args = None
 
@@ -56,9 +67,7 @@ class _ImmediateThread(_FakeThread):
 def test_chat_mode_does_not_require_project_root(monkeypatch):
     monkeypatch.setattr(server.threading, "Thread", _FakeThread)
 
-    response = server.run_task(
-        server.TaskRequest(root="", task="Xin chào", files="", mode="chat")
-    )
+    response = server.run_task(server.TaskRequest(root="", task="Xin chào", files="", mode="chat"))
 
     assert response["status"] == "started"
     assert _FakeThread.last_args[1] == Path.cwd().resolve()
@@ -104,6 +113,46 @@ def test_account_health_endpoint_exposes_state_without_credentials(monkeypatch):
 
     assert result["accounts"][0]["state"] == "cooldown"
     assert "cookie_string" not in result["accounts"][0]
+
+
+def test_request_attempt_endpoint_hides_large_content_by_default(monkeypatch):
+    class Repository:
+        def list_llm_request_attempts(self, task_id, *, schema_errors_only, limit):
+            assert task_id == "task-request-log"
+            assert schema_errors_only is True
+            assert limit == 5
+            return [
+                {
+                    "attempt_id": "attempt-1",
+                    "response_status": 400,
+                    "error_classification": "provider_conversation_input",
+                    "logical_request": {"rendered_prompt": "full prompt"},
+                    "tool_schema": [{"name": "submit_patch"}],
+                    "wire_body": {"prompt": "full prompt"},
+                    "response_body": {"error": "bad request"},
+                    "parser_result": {"parsed": False},
+                }
+            ]
+
+    monkeypatch.setattr(server, "hierarchy_repository", Repository())
+    monkeypatch.setattr(server.task_manager, "get_task", lambda task_id: {"id": task_id})
+
+    compact = server.get_task_request_attempts(
+        "task-request-log",
+        limit=5,
+        schema_errors_only=True,
+    )
+    assert compact["attempts"][0]["response_status"] == 400
+    assert "logical_request" not in compact["attempts"][0]
+    assert "wire_body" not in compact["attempts"][0]
+
+    full = server.get_task_request_attempts(
+        "task-request-log",
+        limit=5,
+        schema_errors_only=True,
+        include_content=True,
+    )
+    assert full["attempts"][0]["wire_body"]["prompt"] == "full prompt"
 
 
 def test_operator_can_explicitly_delete_quarantined_credential(monkeypatch):
@@ -196,9 +245,18 @@ def test_local_api_requires_same_origin_session_and_csrf(monkeypatch):
 
 @pytest.mark.parametrize(
     "unknown_field",
-    ["api_key", "provider_key", "provider", "provider_config", "unexpected"],
+    [
+        "api_key",
+        "provider_key",
+        "provider",
+        "provider_config",
+        "max_model_calls",
+        "max_wall_clock_seconds",
+        "max_estimated_input_tokens",
+        "unexpected",
+    ],
 )
-def test_run_api_rejects_unknown_provider_fields(unknown_field):
+def test_run_api_rejects_removed_or_unknown_fields(unknown_field):
     client = TestClient(server.app)
     session = client.get("/api/session")
     csrf = session.json()["csrf_token"]
@@ -218,8 +276,7 @@ def test_run_api_rejects_unknown_provider_fields(unknown_field):
 
     assert response.status_code == 422
     assert any(
-        item["type"] == "extra_forbidden"
-        and item["loc"] == ["body", unknown_field]
+        item["type"] == "extra_forbidden" and item["loc"] == ["body", unknown_field]
         for item in response.json()["detail"]
     )
 
@@ -299,9 +356,7 @@ def test_legacy_routes_are_gone_and_security_headers_cover_404s():
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["x-frame-options"] == "DENY"
         assert response.headers["referrer-policy"] == "no-referrer"
-        assert "frame-ancestors 'none'" in response.headers[
-            "content-security-policy"
-        ]
+        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
         assert response.headers["permissions-policy"] == (
             "camera=(), microphone=(), geolocation=()"
         )
@@ -416,9 +471,11 @@ def test_legacy_test_command_uses_windows_quoting_rules(monkeypatch):
     ]
     assert _FakeThread.last_args[15] == expected
     assert server.get_task(created["task_id"])["settings"]["test_cmd"] == expected
-    assert server._split_windows_command_line(
-        r'python -c "print(\"ok\")"'
-    ) == ["python", "-c", 'print("ok")']
+    assert server._split_windows_command_line(r'python -c "print(\"ok\")"') == [
+        "python",
+        "-c",
+        'print("ok")',
+    ]
 
 
 @pytest.mark.parametrize("value", [0, 501])
@@ -431,6 +488,16 @@ def test_task_rejects_invalid_max_turns(value):
             mode="chat",
             max_turns=value,
         )
+
+
+def test_task_approval_mode_defaults_to_manual():
+    request = server.TaskRequest(
+        root="",
+        task="Manual approval by default",
+        mode="chat",
+    )
+
+    assert request.approval_mode == "manual"
 
 
 def test_manual_resume_reuses_same_task_and_settings(monkeypatch, tmp_path):
@@ -446,9 +513,7 @@ def test_manual_resume_reuses_same_task_and_settings(monkeypatch, tmp_path):
         )
     )
     task_id = created["task_id"]
-    server.task_manager.finish_task(
-        task_id, status="MAX_TURNS", reason="max_turns_reached"
-    )
+    server.task_manager.finish_task(task_id, status="MAX_TURNS", reason="max_turns_reached")
     stale_runtime = server.runtime_registry.get(task_id)
     assert stale_runtime is not None
     server.runtime_registry.complete(stale_runtime, timeout=0)
@@ -512,10 +577,7 @@ def test_duplicate_concurrent_resume_has_one_winner(monkeypatch, tmp_path):
     def collect_result():
         results.append(attempt_resume())
 
-    callers = [
-        server._NATIVE_THREAD(target=collect_result)
-        for _ in range(2)
-    ]
+    callers = [server._NATIVE_THREAD(target=collect_result) for _ in range(2)]
     for caller in callers:
         caller.start()
     for caller in callers:
@@ -534,9 +596,7 @@ def test_auto_continue_runs_next_turn_cycle(monkeypatch, tmp_path):
 
     def fake_run_session(root, **kwargs):
         calls.append(kwargs["resume_session"])
-        stopped_reason = (
-            "max_turns_reached" if len(calls) == 1 else "task_completed"
-        )
+        stopped_reason = "max_turns_reached" if len(calls) == 1 else "task_completed"
         return type(
             "Result",
             (),
@@ -650,9 +710,7 @@ def test_hierarchy_edit_rejects_empty_project_root(monkeypatch, tmp_path):
 
 def test_agent_model_override_is_persisted_for_next_call(monkeypatch):
     monkeypatch.setattr(server.threading, "Thread", _FakeThread)
-    created = server.run_task(
-        server.TaskRequest(root="", task="Agent config", mode="chat")
-    )
+    created = server.run_task(server.TaskRequest(root="", task="Agent config", mode="chat"))
 
     response = server.update_agent_config(
         created["task_id"],
@@ -665,16 +723,15 @@ def test_agent_model_override_is_persisted_for_next_call(monkeypatch):
 
     assert response["status"] == "saved"
     assert response["applies_to"] == "next_model_call"
-    assert server.task_manager.get_agent_override(
-        created["task_id"], "worker-1"
-    )["model"] == "claude-sonnet-4-6"
+    assert (
+        server.task_manager.get_agent_override(created["task_id"], "worker-1")["model"]
+        == "claude-sonnet-4-6"
+    )
 
 
 def test_terminal_task_can_be_deleted_even_if_stream_queue_remains(monkeypatch):
     monkeypatch.setattr(server.threading, "Thread", _FakeThread)
-    created = server.run_task(
-        server.TaskRequest(root="", task="Hello", files="", mode="chat")
-    )
+    created = server.run_task(server.TaskRequest(root="", task="Hello", files="", mode="chat"))
     task_id = created["task_id"]
     server.task_manager.finish_task(task_id, status="COMPLETED")
 
@@ -685,9 +742,7 @@ def test_terminal_task_can_be_deleted_even_if_stream_queue_remains(monkeypatch):
 
 def test_stop_marks_dashboard_task_as_stopping(monkeypatch):
     monkeypatch.setattr(server.threading, "Thread", _FakeThread)
-    created = server.run_task(
-        server.TaskRequest(root="", task="Hello", files="", mode="chat")
-    )
+    created = server.run_task(server.TaskRequest(root="", task="Hello", files="", mode="chat"))
 
     server.stop_task(created["task_id"])
 
@@ -775,6 +830,157 @@ def test_control_event_commits_before_live_publish(monkeypatch):
     server.runtime_registry.complete(runtime)
 
 
+def test_runtime_event_boundary_repairs_and_redacts_before_persistence(monkeypatch):
+    broker = ReplayEventBroker()
+    order = []
+    persisted = []
+
+    def no_request_log(_name):
+        raise ImportError
+
+    def diagnostic_hook(diagnostic):
+        order.append(("diagnostic", diagnostic["action"]))
+        assert "super-secret-value" not in str(diagnostic)
+
+    def record_event(task_id, event, *, envelope):
+        order.append(("event", event["type"]))
+        persisted.append((event, envelope))
+        return replace(envelope, sequence=len(persisted))
+
+    monkeypatch.setattr(
+        server.hierarchy_repository,
+        "record_event_schema_diagnostic",
+        diagnostic_hook,
+        raising=False,
+    )
+    monkeypatch.setattr(server.importlib, "import_module", no_request_log)
+    monkeypatch.setattr(server.task_manager, "record_event", record_event)
+    monkeypatch.setattr(server, "_observe_runtime_event", lambda *args, **kwargs: None)
+
+    emitted = server._emit_persisted_runtime_event(
+        "task-schema-repair",
+        {"id": "session-schema-repair"},
+        broker,
+        {
+            "type": "model_request_failed",
+            "role": "worker",
+            "reason": "provider rejected sessionKey=super-secret-value",
+        },
+    )
+
+    assert order == [
+        ("diagnostic", "repaired"),
+        ("event", "event_schema_validation_repaired"),
+        ("event", "model_request_failed"),
+    ]
+    repaired = persisted[1][0]
+    assert repaired["error"] == repaired["reason"]
+    assert "super-secret-value" not in repaired["error"]
+    assert [event["type"] for event in emitted] == [
+        "event_schema_validation_repaired",
+        "model_request_failed",
+    ]
+
+
+def test_runtime_event_boundary_rejects_invalid_body_without_raising(monkeypatch):
+    broker = ReplayEventBroker()
+    persisted = []
+
+    def no_request_log(_name):
+        raise ImportError
+
+    def failing_diagnostic_hook(_diagnostic):
+        raise RuntimeError("request ledger unavailable")
+
+    def record_event(task_id, event, *, envelope):
+        persisted.append(event)
+        return replace(envelope, sequence=len(persisted))
+
+    monkeypatch.setattr(
+        server.hierarchy_repository,
+        "record_event_schema_diagnostic",
+        failing_diagnostic_hook,
+        raising=False,
+    )
+    monkeypatch.setattr(server.importlib, "import_module", no_request_log)
+    monkeypatch.setattr(server.task_manager, "record_event", record_event)
+    monkeypatch.setattr(server, "_observe_runtime_event", lambda *args, **kwargs: None)
+
+    emitted = server._emit_persisted_runtime_event(
+        "task-schema-reject",
+        {"id": "session-schema-reject"},
+        broker,
+        {
+            "type": "model_request_failed",
+            "summary": "No role was supplied",
+            "raw_response": "sessionKey=must-not-survive",
+        },
+    )
+
+    assert [event["type"] for event in persisted] == [
+        "event_schema_validation_failure"
+    ]
+    assert [event["type"] for event in emitted] == [
+        "event_schema_validation_failure"
+    ]
+    assert "must-not-survive" not in str(persisted[0])
+
+
+def test_repaired_event_persistence_failure_never_rethrows_original(monkeypatch):
+    broker = ReplayEventBroker()
+
+    def no_request_log(_name):
+        raise ImportError
+
+    def record_event(task_id, event, *, envelope):
+        if event["type"] == "model_request_failed":
+            raise RuntimeError("event storage unavailable")
+        return replace(envelope, sequence=1)
+
+    monkeypatch.setattr(server.importlib, "import_module", no_request_log)
+    monkeypatch.setattr(server.task_manager, "record_event", record_event)
+    monkeypatch.setattr(server, "_observe_runtime_event", lambda *args, **kwargs: None)
+
+    emitted = server._emit_persisted_runtime_event(
+        "task-schema-storage-failure",
+        {"id": "session-schema-storage-failure"},
+        broker,
+        {
+            "type": "model_request_failed",
+            "role": "worker",
+            "reason": "recoverable missing error",
+        },
+    )
+
+    assert [event["type"] for event in emitted] == [
+        "event_schema_validation_repaired"
+    ]
+
+
+def test_schema_diagnostic_uses_feature_detected_request_log_hook(monkeypatch):
+    captured = []
+
+    class RequestLog:
+        @staticmethod
+        def record_event_schema_diagnostic(diagnostic):
+            captured.append(diagnostic)
+
+    monkeypatch.setattr(server.importlib, "import_module", lambda _name: RequestLog)
+
+    server._write_schema_diagnostic_to_request_log(
+        {
+            "type": "event_schema_validation_failure",
+            "action": "rejected",
+            "source_event_type": "model_request_failed",
+            "summary": "Rejected sessionKey=super-secret-value",
+            "validation_error": "missing error",
+        }
+    )
+
+    assert captured[0]["type"] == "event_schema_validation_failure"
+    assert "super-secret-value" not in str(captured[0])
+
+
 def test_stream_replays_only_events_after_client_sequence():
     task_id = "reconnect-task"
     broker = ReplayEventBroker()
@@ -790,6 +996,42 @@ def test_stream_replays_only_events_after_client_sequence():
     assert "reviewing" in response.text
     assert '"_seq": 2' in response.text
     assert task_id in server.active_queues
+
+
+def test_timeline_reports_retention_boundary_and_pagination(monkeypatch):
+    task_id = "retained-task"
+    retained = server.EventEnvelope(
+        task_id=task_id,
+        session_id="session-retained",
+        event_type="agent_completed",
+        payload={"agent_instance_id": "worker-retained", "role": "worker"},
+        sequence=10,
+    )
+
+    class Repository:
+        def replay_events(self, value, *, after_sequence=0, limit=1000):
+            assert value == task_id
+            assert limit == 1
+            return [retained] if after_sequence < 10 else []
+
+        def event_cursor(self, value):
+            assert value == task_id
+            return {
+                "latest_sequence": 12,
+                "retained_from_sequence": 10,
+            }
+
+    monkeypatch.setattr(server, "hierarchy_repository", Repository())
+    monkeypatch.setattr(server.task_manager, "get_task", lambda value: {"id": value})
+
+    page = server.get_task_timeline(task_id, after=0, limit=1)
+
+    assert page["events"][0]["sequence"] == 10
+    assert page["next_after"] == 10
+    assert page["latest_sequence"] == 12
+    assert page["retained_from_sequence"] == 10
+    assert page["has_more"] is True
+    assert page["history_incomplete"] is True
 
 
 def test_resumed_stream_replays_durable_then_live_sequences(monkeypatch):
@@ -823,6 +1065,148 @@ def test_resumed_stream_replays_durable_then_live_sequences(monkeypatch):
     assert response.text.index('"sequence": 40') < response.text.index('"_seq": 41')
 
 
+def test_resumed_stream_surfaces_retention_gap_before_replay(monkeypatch):
+    task_id = "retained-reconnect-task"
+    broker = ReplayEventBroker(initial_sequence=10)
+    server.active_queues[task_id] = broker
+    durable = server.EventEnvelope(
+        task_id=task_id,
+        session_id="session-retained",
+        event_type="agent_completed",
+        payload={"role": "worker"},
+        agent_instance_id="worker-retained",
+        sequence=10,
+    )
+    monkeypatch.setattr(
+        server.hierarchy_repository,
+        "event_cursor",
+        lambda value: {
+            "latest_sequence": 11,
+            "retained_from_sequence": 10,
+        },
+    )
+    monkeypatch.setattr(
+        server.hierarchy_repository,
+        "replay_events",
+        lambda value, *, after_sequence=0, limit=1000: (
+            [durable] if after_sequence < 10 else []
+        ),
+    )
+    broker.put({"type": "done", "sequence": 11})
+
+    response = TestClient(server.app).get(f"/api/stream/{task_id}?after=1")
+
+    assert response.status_code == 200
+    assert '"type": "timeline_gap"' in response.text
+    assert '"retained_from_sequence": 10' in response.text
+    assert response.text.index('"type": "timeline_gap"') < response.text.index(
+        '"sequence": 10'
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "project_mode"),
+    [
+        ("orchestrator", "edit"),
+        ("chat", "new_project"),
+    ],
+)
+def test_staging_auto_is_rejected_outside_new_project_orchestrator(
+    mode,
+    project_mode,
+    tmp_path,
+):
+    with pytest.raises(HTTPException) as exc_info:
+        server.run_task(
+            server.TaskRequest(
+                root=str(tmp_path),
+                task="Unsafe auto approval request",
+                mode=mode,
+                project_mode=project_mode,
+                approval_mode="staging_auto",
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "staging_auto" in exc_info.value.detail
+
+
+def test_staging_auto_decides_and_audits_managed_workspace_approval(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    captured = {}
+
+    def fake_run_hierarchy(**kwargs):
+        captured["execution_root"] = kwargs["root"]
+        captured["approved"] = kwargs["approval_callback"](
+            {
+                "workstream_id": "stream-auto",
+                "work_item_id": "item-auto",
+                "attempt_id": "attempt-auto",
+                "kind": "patch_apply",
+                "target": "src/app.py",
+                "reason": "high risk patch",
+                "patch_sha256": "a" * 64,
+                "additions": 5,
+                "deletions": 0,
+            }
+        )
+        return type(
+            "Result",
+            (),
+            {
+                "stopped_reason": "max_turns_reached",
+                "turns": [],
+                "final_state": {
+                    "turn_count": 1,
+                    "completed_tickets": [],
+                    "last_review_verdict": None,
+                },
+            },
+        )()
+
+    monkeypatch.setattr(server, "run_hierarchy", fake_run_hierarchy)
+    destination = tmp_path / "staging-auto-destination"
+    destination.mkdir()
+
+    created = server.run_task(
+        server.TaskRequest(
+            root=str(destination),
+            task="Build in managed staging",
+            mode="orchestrator",
+            project_mode="new_project",
+            approval_mode="staging_auto",
+            hierarchy_enabled=True,
+            create_zip=False,
+        )
+    )
+
+    task_id = created["task_id"]
+    assert captured["approved"] is True
+    assert server._is_managed_staging_workspace(
+        task_id,
+        captured["execution_root"],
+    )
+    approval = server.hierarchy_repository.list_approvals(task_id)[0]
+    assert approval["status"] == "approved"
+    assert "orchestrator-managed staging workspace" in approval["decision_reason"]
+    assert server.get_task(task_id)["settings"]["approval_mode"] == "staging_auto"
+    events = _FakeThread.last_args[19].events_after(0)
+    approval_events = [
+        event
+        for event in events
+        if str(event.get("type") or "").startswith("approval_")
+    ]
+    assert [event["type"] for event in approval_events] == [
+        "approval_requested",
+        "approval_decided",
+    ]
+    assert approval_events[1]["automated"] is True
+    assert approval_events[1]["approval_mode"] == "staging_auto"
+
+
 def test_new_project_accepts_empty_destination(monkeypatch, tmp_path):
     monkeypatch.setattr(server.threading, "Thread", _FakeThread)
     destination = tmp_path / "jarvis"
@@ -853,9 +1237,7 @@ def test_new_project_background_finalizes_artifact(monkeypatch, tmp_path):
         assert kwargs["max_turns"] == 7
         (root / "main.py").write_text("print('jarvis')\n", encoding="utf-8")
         kwargs["on_file_approved"]("main.py")
-        assert (destination / "main.py").read_text(
-            encoding="utf-8"
-        ) == "print('jarvis')\n"
+        assert (destination / "main.py").read_text(encoding="utf-8") == "print('jarvis')\n"
         return type(
             "Result",
             (),

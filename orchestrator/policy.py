@@ -1,4 +1,5 @@
 """Declarative, auditable authorization and execution policy decisions."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -68,15 +69,9 @@ class PolicyRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", PolicyAction(self.action))
         object.__setattr__(self, "risk_level", RiskLevel(self.risk_level))
-        object.__setattr__(
-            self, "approval_policy", ApprovalPolicy(self.approval_policy)
-        )
-        object.__setattr__(
-            self, "requested_isolation", IsolationLevel(self.requested_isolation)
-        )
-        object.__setattr__(
-            self, "actual_isolation", IsolationLevel(self.actual_isolation)
-        )
+        object.__setattr__(self, "approval_policy", ApprovalPolicy(self.approval_policy))
+        object.__setattr__(self, "requested_isolation", IsolationLevel(self.requested_isolation))
+        object.__setattr__(self, "actual_isolation", IsolationLevel(self.actual_isolation))
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,9 +85,7 @@ class PolicyDecision:
         return self.effect is PolicyEffect.ALLOW
 
 
-PolicyEvaluator = Callable[
-    [PolicyRequest, DeploymentProfile], tuple[PolicyEffect, str] | None
-]
+PolicyEvaluator = Callable[[PolicyRequest, DeploymentProfile], tuple[PolicyEffect, str] | None]
 AuditSink = Callable[[PolicyRequest, PolicyDecision], None]
 
 
@@ -106,12 +99,7 @@ class PolicyRule:
 def _normalize_resource(value: str) -> str | None:
     normalized = value.strip().replace("\\", "/")
     path = PurePosixPath(normalized)
-    if (
-        not normalized
-        or path.is_absolute()
-        or ":" in path.parts[0]
-        or ".." in path.parts
-    ):
+    if not normalized or path.is_absolute() or ":" in path.parts[0] or ".." in path.parts:
         return None
     return path.as_posix()
 
@@ -133,9 +121,7 @@ def _api_rule(
     request: PolicyRequest,
     _: DeploymentProfile,
 ) -> tuple[PolicyEffect, str] | None:
-    if request.host.casefold() not in {
-        value.casefold() for value in request.allowed_hosts
-    }:
+    if request.host.casefold() not in {value.casefold() for value in request.allowed_hosts}:
         return PolicyEffect.DENY, "host_not_allowed"
     if request.origin and request.origin.rstrip("/") not in request.allowed_origins:
         return PolicyEffect.DENY, "origin_not_allowed"
@@ -150,10 +136,17 @@ def _secret_rule(
     request: PolicyRequest,
     _: DeploymentProfile,
 ) -> tuple[PolicyEffect, str] | None:
-    if request.content is not None and scan_secrets(
-        request.content, candidate_type=request.action.value
-    ):
-        return PolicyEffect.DENY, "raw_secret_detected"
+    if request.action is PolicyAction.PROVIDER_REQUEST:
+        return PolicyEffect.ALLOW, "provider_content_passthrough"
+    if request.action is PolicyAction.EFFECT_APPLY and request.content is not None:
+        findings = scan_secrets(
+            request.content,
+            candidate_type=request.action.value,
+        )
+        return (
+            PolicyEffect.ALLOW,
+            "secret_scan_audit_only" if findings else "secret_boundary_satisfied",
+        )
     if request.secret_reference is not None and not is_encrypted_secret_reference(
         request.secret_reference
     ):
@@ -192,12 +185,9 @@ def _approval_rule(
 ) -> tuple[PolicyEffect, str] | None:
     if request.approval_status == "rejected":
         return PolicyEffect.DENY, "approval_rejected"
-    needs_approval = (
-        request.approval_policy is ApprovalPolicy.ALWAYS
-        or (
-            request.approval_policy is ApprovalPolicy.RISK_BASED
-            and request.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}
-        )
+    needs_approval = request.approval_policy is ApprovalPolicy.ALWAYS or (
+        request.approval_policy is ApprovalPolicy.RISK_BASED
+        and request.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}
     )
     if needs_approval and request.approval_status != "approved":
         return PolicyEffect.REQUIRE_APPROVAL, "risk_requires_approval"
@@ -319,7 +309,5 @@ class PolicyEngine:
     def require(self, request: PolicyRequest) -> PolicyDecision:
         decision = self.evaluate(request)
         if not decision.allowed:
-            raise PermissionError(
-                f"policy {decision.effect.value}: {', '.join(decision.reasons)}"
-            )
+            raise PermissionError(f"policy {decision.effect.value}: {', '.join(decision.reasons)}")
         return decision

@@ -20,7 +20,76 @@ _SENSITIVE_KEY_PARTS = (
     "refresh_token",
     "private_key",
 )
+_SENSITIVE_EXACT_KEYS = frozenset(
+    {
+        "account",
+        "credential_source",
+        "from_account",
+        "org_id",
+        "organization_id",
+        "organization_uuid",
+        "raw_org_id",
+        "source_cookie_file",
+        "to_account",
+    }
+)
+# Identifiers the orchestrator mints itself. They are long and random enough to
+# trip the high-entropy heuristic, and whether they do depends on nothing more
+# than the length of the role prefix: "manager_<24 hex>" is 32 characters and is
+# redacted, "worker_<24 hex>" is 31 and is not. Losing them is not a privacy win
+# and it corrupts the run: every manager collapses into one "[REDACTED]" agent
+# and every worker's parent link points at that same placeholder.
+_IDENTIFIER_KEYS = frozenset(
+    {
+        "account_ref",
+        "agent_id",
+        "agent_ids",
+        "agent_instance_id",
+        "assignment_id",
+        "attempt_id",
+        "blocked_by",
+        "call_id",
+        "called_agent_ids",
+        "completed_agent_ids",
+        "contract_id",
+        "event_id",
+        "execution_attempt_id",
+        "lease_id",
+        "logical_agent_id",
+        "logical_call_id",
+        "logical_request_id",
+        "affected_manager_ids",
+        "expected_manager_ids",
+        "manager_agent_id",
+        "manager_agent_ids",
+        "manager_id",
+        "reported_manager_ids",
+        "parent_agent_instance_id",
+        "primary_agent_ids",
+        "provider_attempt_id",
+        "request_fingerprint",
+        "wire_fingerprint",
+        "org_ref",
+        "session_id",
+        "task_id",
+        "tester_agent_id",
+        "tester_agent_ids",
+        "work_item_id",
+        "work_item_ids",
+        "abandoned_item_ids",
+        "completed_item_ids",
+        "skipped_item_ids",
+        "worker_agent_id",
+        "worker_agent_ids",
+        "workstream_id",
+        "workstream_ids",
+        "abandoned_workstream_ids",
+        "completed_workstream_ids",
+        "skipped_workstream_ids",
+    }
+)
 _PATTERNS = (
+    re.compile(r"(?im)^(\s*(?:set-)?cookie\s*:\s*)[^\r\n]+$"),
     re.compile(r"(?i)(sessionKey\s*[=:]\s*)[^\s;,'\"]+"),
     re.compile(r"(?i)(authorization\s*[=:]\s*bearer\s+)[^\s,'\"]+"),
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}"),
@@ -28,6 +97,10 @@ _PATTERNS = (
     re.compile(
         r"(?i)((?:api[_-]?key|password|secret)\s*[=:]\s*)"
         r"([^\s,;'\"}]{6,})"
+    ),
+    re.compile(
+        r"(?i)https?://[^\s<>'\"]+[?&](?:x-amz-signature|signature|sig|"
+        r"token|access_token|x-goog-signature)=[^\s<>'\"]+"
     ),
 )
 _SCANNER_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
@@ -153,20 +226,26 @@ def redact_candidate(
     return text
 
 
-def redact_text(value: str, *, max_chars: int = 60000) -> str:
+def redact_text(value: str, *, max_chars: int | None = 60000) -> str:
     text = redact_candidate(value)
     for pattern in _PATTERNS:
-        if pattern.groups >= 2 or pattern.groups == 1:
+        if "https?" in pattern.pattern:
+            text = pattern.sub("[REDACTED_SIGNED_URL]", text)
+        elif pattern.groups >= 1:
             text = pattern.sub(lambda match: match.group(1) + "[REDACTED]", text)
         else:
             text = pattern.sub("[REDACTED]", text)
-    if len(text) > max_chars:
+    if max_chars is not None and len(text) > max_chars:
         text = text[:max_chars] + f"\n[TRUNCATED {len(text) - max_chars} CHARS]"
     return text
 
 
 def redact_event(value: Any, *, key: str = "") -> Any:
     lowered = key.casefold()
+    if lowered in _IDENTIFIER_KEYS and isinstance(value, str):
+        return value
+    if lowered in _SENSITIVE_EXACT_KEYS:
+        return "[REDACTED]"
     if any(part in lowered for part in _SENSITIVE_KEY_PARTS):
         return "[REDACTED]"
     if isinstance(value, str):

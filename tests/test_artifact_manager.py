@@ -183,7 +183,7 @@ def test_unscannable_artifacts_are_rejected(
     )
     (staging / "candidate.bin").write_bytes(content)
 
-    with pytest.raises(ValueError, match="potential credentials"):
+    with pytest.raises(ValueError, match="cannot be safely packaged"):
         artifact_manager.finalize_workspace(task_id)
 
 

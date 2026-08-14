@@ -35,8 +35,11 @@ export function shortTaskTitle(task: {
   root?: string;
   id: string;
 }): string {
-  const fromText = truncateTitle(firstNonEmptyLine(task.name, task.prompt));
-  if (fromText) return fromText;
+  const rawName = firstNonEmptyLine(task.name);
+  const promptLikeName =
+    /^#{1,6}\s|^Bạn là\b|^You are\b/i.test(rawName) || Boolean(task.name?.includes('\n'));
+  const fromName = promptLikeName ? '' : truncateTitle(rawName);
+  if (fromName) return fromName;
   const fromRoot = pathBasename(task.root);
   if (fromRoot) return fromRoot;
   return task.id.slice(0, 8);

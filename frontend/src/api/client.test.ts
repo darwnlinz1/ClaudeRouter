@@ -22,6 +22,8 @@ describe('frontend API compatibility', () => {
           events: [{ sequence: 1, type: 'status' }],
           next_cursor: 'page-two',
           has_more: true,
+          latest_sequence: 2,
+          retained_from_sequence: 1,
         }),
       )
       .mockResolvedValueOnce(
@@ -34,9 +36,14 @@ describe('frontend API compatibility', () => {
       );
     vi.stubGlobal('fetch', fetchMock);
 
-    const events = await api.getTimeline('task-1');
+    const timeline = await api.getTimeline('task-1');
 
-    expect(events.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(timeline.events.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(timeline).toMatchObject({
+      latestSequence: 2,
+      retainedFromSequence: 1,
+      historyIncomplete: false,
+    });
     expect(String(fetchMock.mock.calls[0][0])).toContain('after=0');
     expect(String(fetchMock.mock.calls[1][0])).toContain('cursor=page-two');
   });
@@ -54,6 +61,46 @@ describe('frontend API compatibility', () => {
     await expect(api.getTask('task-1')).resolves.toMatchObject({
       id: 'task-1',
       name: 'Wrapped snapshot',
+    });
+  });
+
+  it('sends frontend fan-out caps without a hidden task-count limit', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ csrf_token: 'csrf-test' }))
+      .mockResolvedValueOnce(jsonResponse({ task_id: 'task-large' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.createHierarchyTask({
+      name: 'Large fan-out',
+      root: 'C:/workspace',
+      task: 'Build independent packages',
+      projectMode: 'new_project',
+      testCmd: 'python -m pytest -q',
+      settings: {
+        maxManagers: 20,
+        maxParallelManagers: 8,
+        maxWorkersPerManager: 21,
+        maxParallelWorkersPerManager: 20,
+        maxParallelWorkers: 32,
+        mockWhenUnavailable: false,
+        roleProfiles: {
+          director: { model: 'claude-sonnet-5', effort: 'max' },
+          manager: { model: 'claude-sonnet-5', effort: 'max' },
+          worker: { model: 'claude-sonnet-5', effort: 'max' },
+          tester: { model: 'claude-sonnet-5', effort: 'high' },
+        },
+      },
+    });
+
+    const requestInit = fetchMock.mock.calls[1][1] as RequestInit;
+    const payload = JSON.parse(String(requestInit.body));
+    expect(payload).toMatchObject({
+      max_managers: 20,
+      max_parallel_managers: 8,
+      max_workers_per_manager: 21,
+      max_parallel_workers_per_manager: 20,
+      max_parallel_workers: 32,
     });
   });
 });

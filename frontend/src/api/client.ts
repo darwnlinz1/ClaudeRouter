@@ -25,6 +25,13 @@ export class ApiError extends Error {
   }
 }
 
+export interface TimelineResult {
+  events: Record<string, unknown>[];
+  latestSequence: number;
+  retainedFromSequence: number;
+  historyIncomplete: boolean;
+}
+
 let sessionState: { apiBase: string; csrfToken: string } | null = null;
 let sessionRequest: Promise<string> | null = null;
 
@@ -133,16 +140,15 @@ export const api = {
     return response as TaskSummary;
   },
 
-  async getTimeline(
-    taskId: string,
-    after = 0,
-    signal?: AbortSignal,
-  ): Promise<Record<string, unknown>[]> {
+  async getTimeline(taskId: string, after = 0, signal?: AbortSignal): Promise<TimelineResult> {
     const result: Record<string, unknown>[] = [];
     let afterSequence = Math.max(0, after);
     let pageCursor: string | undefined;
+    let latestSequence = afterSequence;
+    let retainedFromSequence = 1;
+    let historyIncomplete = false;
     const pageSize = 5000;
-    for (let page = 0; page < 100; page += 1) {
+    for (;;) {
       const query = new URLSearchParams({ limit: String(pageSize) });
       if (pageCursor) query.set('cursor', pageCursor);
       else query.set('after', String(afterSequence));
@@ -154,6 +160,9 @@ export const api = {
             next_after?: number | string | null;
             next_cursor?: number | string | null;
             has_more?: boolean;
+            latest_sequence?: number;
+            retained_from_sequence?: number;
+            history_incomplete?: boolean;
             page?: {
               events?: Record<string, unknown>[];
               next_after?: number | string | null;
@@ -176,13 +185,26 @@ export const api = {
       const hasMore = Array.isArray(response)
         ? undefined
         : (response.has_more ?? pageBody?.has_more);
+      if (!Array.isArray(response)) {
+        const latest = Number(response.latest_sequence ?? latestSequence);
+        const retained = Number(response.retained_from_sequence ?? retainedFromSequence);
+        if (Number.isFinite(latest)) latestSequence = Math.max(latestSequence, latest);
+        if (Number.isFinite(retained) && retained > 0) retainedFromSequence = retained;
+        historyIncomplete =
+          historyIncomplete ||
+          response.history_incomplete === true ||
+          after < retainedFromSequence - 1;
+      }
       const explicitCursor = Array.isArray(response)
         ? undefined
         : (response.next_cursor ?? pageBody?.next_cursor);
       const explicitAfter = Array.isArray(response)
         ? undefined
         : (response.next_after ?? pageBody?.next_after);
-      if (hasMore === false || (!explicitCursor && !explicitAfter && events.length < pageSize)) {
+      if (
+        hasMore === false ||
+        (explicitCursor == null && explicitAfter == null && events.length < pageSize)
+      ) {
         break;
       }
       const observedAfter = Math.max(
@@ -200,7 +222,12 @@ export const api = {
       afterSequence = nextAfter;
       pageCursor = undefined;
     }
-    return result;
+    return {
+      events: result,
+      latestSequence,
+      retainedFromSequence,
+      historyIncomplete,
+    };
   },
 
   pickFolder(): Promise<{ root?: string; error?: string }> {
@@ -232,9 +259,6 @@ export const api = {
         max_workers_per_manager: input.settings.maxWorkersPerManager,
         max_parallel_workers_per_manager: input.settings.maxParallelWorkersPerManager ?? null,
         max_parallel_workers: input.settings.maxParallelWorkers,
-        max_model_calls: input.settings.maxModelCalls,
-        max_wall_clock_seconds: input.settings.maxWallClockSeconds,
-        max_estimated_input_tokens: input.settings.maxEstimatedInputTokens,
         director_model: input.settings.roleProfiles.director.model,
         director_effort: input.settings.roleProfiles.director.effort,
         manager_model: input.settings.roleProfiles.manager.model,

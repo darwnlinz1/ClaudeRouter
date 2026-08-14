@@ -20,6 +20,27 @@ account leases, and SQLite connections can drain. Before maintenance, stop new
 task admission and wait for active model calls, approvals, artifact writes,
 and effects to settle.
 
+## Launch a live new-project task
+
+Pass the complete prompt as a UTF-8 (optionally BOM-prefixed) file, or omit
+`--prompt-file` and pipe it through stdin:
+
+```powershell
+python scripts/launch_live_task.py C:\work\empty-destination `
+  --prompt-file C:\work\full-prompt.md `
+  --test-command "python -m pytest" `
+  --approval-mode staging_auto `
+  --wait
+```
+
+`staging_auto` is fail-closed: the API accepts it only for `new_project`, and
+each approval is automatically decided only while execution is exactly inside
+the orchestrator-managed staging workspace. Edit-mode and existing-project
+tasks remain manual. `--wait` captures the durable timeline as JSONL (use
+`--timeline-jsonl` to select the path) and prints a terminal diagnostics
+summary. The launcher keeps one same-origin cookie session and CSRF token for
+the request.
+
 ## Health and operator checks
 
 `GET /api/health` reports application version, canonical schema version,
@@ -51,7 +72,7 @@ label domains rather than identifiers.
 
 Default locations:
 
-- `~/.ai_orchestrator/orchestrator.sqlite3` — canonical state schema `14`;
+- `~/.ai_orchestrator/orchestrator.sqlite3` — canonical state schema `17`;
 - `~/.ai_orchestrator/account_leases.sqlite3` — account health and leases;
 - `~/.ai_orchestrator/artifacts` — staged and approved artifacts;
 - `~/.ai_orchestrator/snapshots` — scoped pre-mutation snapshots;
@@ -61,13 +82,11 @@ SQLite uses WAL mode and `synchronous=FULL`. Do not copy database files while
 the service is running or delete `-wal`/`-shm` sidecars. Use the administrative
 backup command, which uses SQLite's backup API.
 
-Schema 12 is limited to the additive durable-effect migration. It preserves
-version-11 receipts while adding nullable expected-after hash, fencing, and
-compensation fields plus indexes. Typed contracts remain embedded in immutable
-plan revisions, logical identities use deterministic fallback IDs, and
-handoff/contract correlation is carried by events. The canonical repository
-does not provide separate contract-version, identity, or handoff tables, so do
-not assume a backup contains those as independent record sets.
+Schema 17 remains additive. In addition to durable effects, typed contracts,
+logical identities, handoffs, managed retention, and sanitized provider-attempt
+records, it stores execution epochs/Manager rosters, remediation strategy
+claims, Manager terminal reports, the Director final review, and terminal
+disposition/log references. Backups must preserve these as independent records.
 
 ## Backup
 
@@ -156,11 +175,10 @@ python scripts/benchmark_runtime.py --assert-slo
 Record hardware, OS, Python version, endpoint security software, event count,
 command, exit code, and result hash with any benchmark report.
 
-## Acceptance evidence status
+## Acceptance
 
-The latest schema-14 result and source/log hashes are recorded in
-[acceptance evidence](acceptance-evidence.md). Operator commands in this
-document are procedures, not independent PASS claims; rerun after changes.
+Operator commands in this document are procedures, not independent PASS claims.
+Rerun the [acceptance matrix](acceptance-matrix.md) after changes.
 
 ## Capacity
 

@@ -223,7 +223,7 @@ class FencedRemoteClaimBroker:
         claim: ExecutionClaim,
         error: str,
         *,
-        retryable: bool = True,
+        retryable: bool = False,
         now: datetime | None = None,
     ) -> DurableJob:
         return self.queue.fail(

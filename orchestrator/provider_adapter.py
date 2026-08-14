@@ -214,6 +214,7 @@ class ProviderErrorInfo:
     retryable: bool = False
     status_code: int | None = None
     retry_after_seconds: int | None = None
+    classification: str | None = None
 
 
 class ProviderError(RuntimeError):
@@ -228,6 +229,7 @@ class ProviderError(RuntimeError):
         retryable: bool = False,
         status_code: int | None = None,
         retry_after_seconds: int | None = None,
+        classification: str | None = None,
     ) -> None:
         super().__init__(message)
         self.info = ProviderErrorInfo(
@@ -237,6 +239,7 @@ class ProviderError(RuntimeError):
             retryable=retryable,
             status_code=status_code,
             retry_after_seconds=retry_after_seconds,
+            classification=classification,
         )
 
 
@@ -273,13 +276,19 @@ class ProviderRateLimitError(ProviderError):
 
 class ProviderPayloadError(ProviderError):
     def __init__(
-        self, message: str, *, provider: str, status_code: int | None = 400
+        self,
+        message: str,
+        *,
+        provider: str,
+        status_code: int | None = 400,
+        classification: str = "malformed_input",
     ) -> None:
         super().__init__(
             message,
             provider=provider,
             code=ProviderErrorCode.PAYLOAD,
             status_code=status_code,
+            classification=classification,
         )
 
 

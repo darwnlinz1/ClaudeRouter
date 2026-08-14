@@ -23,8 +23,11 @@ Work from the repository root. `orchestrator/`, `frontend/`, `scripts/`,
 add a nested `.git`, or treat `orchestrator/` as a submodule.
 
 Do not commit generated/runtime secrets or data, including `.env`, cookies,
-salts, keys, databases, sidecars, logs, snapshots, backups, artifacts,
-acceptance results, caches, or `frontend/node_modules`.
+cookie JSON/txt dumps, salts, keys, databases, sidecars, logs, snapshots,
+backups, artifacts, acceptance results, caches, `frontend/node_modules`,
+GitNexus indexes (`.gitnexus/`), or generated agent skill files (`.claude/`,
+`AGENTS.md`, `CLAUDE.md`). The `cookies/` directory is gitignored except for
+its local `.gitignore`.
 
 Use `.env.example` only as a variable reference. The application reads the
 process environment and does not load `.env` automatically.
@@ -99,7 +102,7 @@ Run checks proportional to the change:
 
 ```powershell
 python -m ruff check orchestrator server.py scripts tests
-python -m mypy --strict orchestrator/budget.py orchestrator/models.py orchestrator/effects.py orchestrator/reconciliation.py
+python -m mypy --strict orchestrator/models.py orchestrator/effects.py orchestrator/reconciliation.py
 python -m pytest -q
 Push-Location frontend
 npm run lint

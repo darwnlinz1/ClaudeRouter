@@ -1,8 +1,18 @@
 import { defineConfig } from 'vitest/config';
+import type { Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 
+// The dev server injects styles as inline <style> tags, which the shipped
+// policy forbids, so the dev server would otherwise render unstyled.
+const devInlineStyles = (): Plugin => ({
+  name: 'dev-inline-styles',
+  apply: 'serve',
+  transformIndexHtml: (html) =>
+    html.replace("style-src 'self'", "style-src 'self' 'unsafe-inline'"),
+});
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), devInlineStyles()],
   base: './',
   server: {
     port: 5173,

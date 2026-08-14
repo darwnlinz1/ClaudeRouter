@@ -24,6 +24,9 @@ const STATUS_PHASE: Record<string, Phase> = {
   STOPPING: 'REVISION',
   COMPLETED: 'COMPLETED',
   DONE: 'COMPLETED',
+  PARTIAL: 'COMPLETED',
+  ABANDONED: 'COMPLETED',
+  SKIPPED: 'COMPLETED',
   FAILED: 'COMPLETED',
   STOPPED: 'COMPLETED',
   CANCELLED: 'COMPLETED',
@@ -57,8 +60,10 @@ export function isActiveStatus(status: string): boolean {
 export function statusTone(status: string): 'active' | 'success' | 'danger' | 'warn' | 'idle' {
   const normalized = status.toUpperCase();
   if (['COMPLETED', 'DONE', 'PASSED'].includes(normalized)) return 'success';
-  if (['FAILED', 'ERROR', 'CANCELLED'].includes(normalized)) return 'danger';
-  if (['WAITING_INPUT', 'STOPPING', 'REVISION'].includes(normalized)) return 'warn';
+  if (['FAILED', 'ERROR', 'CANCELLED', 'ABANDONED'].includes(normalized)) return 'danger';
+  if (['WAITING_INPUT', 'STOPPING', 'REVISION', 'PARTIAL', 'SKIPPED'].includes(normalized)) {
+    return 'warn';
+  }
   if (isActiveStatus(normalized)) return 'active';
   return 'idle';
 }

@@ -29,6 +29,10 @@ MUST_BE_ABSENT = ExpectedBefore.MUST_BE_ABSENT
 ExpectedBeforeValue = str | ExpectedBefore
 
 
+class EffectReplayConflictError(RuntimeError):
+    """Durable effect history disagrees with the current target generation."""
+
+
 @dataclass(frozen=True)
 class PreparedFileEffect:
     """A durable temp file plus the target state required for committing it."""

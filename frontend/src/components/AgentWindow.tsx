@@ -10,6 +10,7 @@ import {
   FileCode2,
   Gauge,
   ListChecks,
+  MessageSquareText,
   Pin,
   Radio,
   Save,
@@ -20,9 +21,9 @@ import {
 } from 'lucide-react';
 import { useWorkspaceContext } from './WorkspaceContext';
 
-type PrimaryTab = 'stream' | 'thinking' | 'diff' | 'tools';
+type PrimaryTab = 'stream' | 'thinking' | 'response' | 'diff' | 'tools';
 type StreamSub = 'activity' | 'goal' | 'action' | 'status';
-const PRIMARY_TABS: PrimaryTab[] = ['stream', 'thinking', 'diff', 'tools'];
+const PRIMARY_TABS: PrimaryTab[] = ['stream', 'thinking', 'response', 'diff', 'tools'];
 const STREAM_TABS: StreamSub[] = ['activity', 'goal', 'action', 'status'];
 
 function moveTabFocus<T extends string>(
@@ -95,15 +96,22 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
     );
   }
 
-  const shortTitle =
-    agent.role === 'worker' && agent.contextFiles[0]
-      ? `${agent.role.slice(0, 1).toUpperCase()}${agent.title.replace(/\D/g, '') || ''} · ${agent.contextFiles[0].split(/[/\\]/).pop()}`
-      : agent.title;
-  const identityMeta = `${agent.role} · ${agent.model ?? 'model n/a'} · ${agent.effort ?? 'effort n/a'}`;
+  const shortTitle = agent.label ?? agent.title;
+  // Only the account filename is ever shown; the cookie itself never leaves the
+  // backend.
+  const identityMeta = [
+    agent.label ? agent.title : agent.role,
+    agent.account,
+    agent.model ?? 'model n/a',
+  ]
+    .filter(Boolean)
+    .join(' · ');
   const stateLabel = (agent.executionState ?? agent.status).replaceAll('_', ' ');
 
   return (
-    <div className={`agent-window role-border-${agent.role}`}>
+    <div
+      className={`agent-window role-border-${agent.role} tab-${tab}${configOpen ? ' has-config' : ''}`}
+    >
       <header className="agent-summary">
         <div className={`agent-avatar role-${agent.role}`}>
           {agent.role.slice(0, 2).toUpperCase()}
@@ -211,6 +219,20 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
           title="Thinking"
         >
           <Brain size={13} /> <span>Thinking</span>
+          {agent.provisionalThinking && <i className="thinking-tab-dot" aria-hidden="true" />}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          className={tab === 'response' ? 'active' : ''}
+          aria-selected={tab === 'response'}
+          aria-controls={`agent-${agent.id}-response-panel`}
+          tabIndex={tab === 'response' ? 0 : -1}
+          onClick={() => setTab('response')}
+          onKeyDown={(event) => moveTabFocus(event, PRIMARY_TABS, 2, setTab)}
+          title="Response"
+        >
+          <MessageSquareText size={13} /> <span>Response</span>
         </button>
         <button
           type="button"
@@ -220,7 +242,7 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
           aria-controls={`agent-${agent.id}-diff-panel`}
           tabIndex={tab === 'diff' ? 0 : -1}
           onClick={() => setTab('diff')}
-          onKeyDown={(event) => moveTabFocus(event, PRIMARY_TABS, 2, setTab)}
+          onKeyDown={(event) => moveTabFocus(event, PRIMARY_TABS, 3, setTab)}
           title="Diff"
         >
           <ScrollText size={13} /> <span>Diff</span>
@@ -233,7 +255,7 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
           aria-controls={`agent-${agent.id}-tools-panel`}
           tabIndex={tab === 'tools' ? 0 : -1}
           onClick={() => setTab('tools')}
-          onKeyDown={(event) => moveTabFocus(event, PRIMARY_TABS, 3, setTab)}
+          onKeyDown={(event) => moveTabFocus(event, PRIMARY_TABS, 4, setTab)}
           title="Tools"
         >
           <Wrench size={13} /> <span>Tools</span>
@@ -310,7 +332,14 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
                     </div>
                   ))
                 ) : (
-                  <Empty label="No activity received yet." />
+                  <Empty
+                    label={streamQuery ? 'No activity matches this search' : 'No activity yet'}
+                    hint={
+                      streamQuery
+                        ? 'Clear the search box to see the full stream.'
+                        : 'Events appear here as soon as this agent emits its first update.'
+                    }
+                  />
                 )}
               </div>
             )}
@@ -415,15 +444,55 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
           role="tabpanel"
           aria-label="Thinking"
         >
-          {agent.thinking ? (
+          {agent.thinking || agent.provisionalThinking ? (
             <div className="prose-panel">
               <section>
-                <span className="eyebrow">Thinking</span>
-                <p className="mono">{agent.thinking}</p>
+                <div className="thinking-heading">
+                  <span className="eyebrow">Thinking</span>
+                  {agent.provisionalThinking && (
+                    <span className="thinking-live-badge" aria-label="Thinking live">
+                      Live
+                    </span>
+                  )}
+                </div>
+                {agent.thinking && <p className="mono">{agent.thinking}</p>}
+                {agent.provisionalThinking && (
+                  <p className="mono thinking-live" aria-live="polite" aria-atomic="false">
+                    {agent.provisionalThinking}
+                  </p>
+                )}
               </section>
             </div>
           ) : (
-            <Empty label="No thinking stream yet." />
+            <Empty
+              label="No thinking stream yet"
+              hint="Reasoning is streamed while the agent is working and kept here afterwards."
+            />
+          )}
+        </div>
+      )}
+
+      {tab === 'response' && (
+        <div
+          className="agent-section-body"
+          id={`agent-${agent.id}-response-panel`}
+          role="tabpanel"
+          aria-label="Response"
+        >
+          {agent.output ? (
+            <div className="prose-panel">
+              <section>
+                <span className="eyebrow">Agent response</span>
+                <p className="mono agent-response" aria-live="polite">
+                  {agent.output}
+                </p>
+              </section>
+            </div>
+          ) : (
+            <Empty
+              label="No response yet"
+              hint="The final answer for this agent will be shown here once the call completes."
+            />
           )}
         </div>
       )}
@@ -448,7 +517,10 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
               ))}
             </pre>
           ) : (
-            <Empty label="No patch has been submitted." />
+            <Empty
+              label="No patch submitted"
+              hint="Coders publish a unified diff when they finish an assignment."
+            />
           )}
         </div>
       )}
@@ -470,7 +542,7 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
                 </div>
               ))
             ) : (
-              <Empty label="No context files disclosed." />
+              <Empty label="No context files disclosed" />
             )}
           </div>
           <div className="test-list">
@@ -589,11 +661,12 @@ export function AgentWindow({ params }: IDockviewPanelProps<{ agentId: string }>
   );
 }
 
-function Empty({ label }: { label: string }) {
+function Empty({ label, hint }: { label: string; hint?: string }) {
   return (
     <div className="section-empty">
-      <Radio size={16} />
-      {label}
+      <Radio size={18} />
+      <strong>{label}</strong>
+      {hint && <span>{hint}</span>}
     </div>
   );
 }

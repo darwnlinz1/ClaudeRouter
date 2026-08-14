@@ -72,6 +72,7 @@ export function TaskDashboard({
   onToggleGraph,
 }: TaskDashboardProps) {
   const [view, setView] = useState<DashboardView>('overview');
+  const dashboardTask = state.task?.id === task.id ? state.task : task;
   const agents = useMemo(
     () =>
       Object.values(state.agents).filter(
@@ -98,11 +99,20 @@ export function TaskDashboard({
     undefined,
   );
   const completedAgents = agents.filter((agent) =>
-    ['passed', 'failed', 'stopped'].includes(agent.status),
+    ['passed', 'partial', 'abandoned', 'skipped', 'failed', 'stopped'].includes(agent.status),
   ).length;
   const progress = agents.length
     ? Math.round((completedAgents / agents.length) * 100)
-    : ['COMPLETED', 'DONE'].includes(task.status.toUpperCase())
+    : [
+          'COMPLETED',
+          'DONE',
+          'PARTIAL',
+          'ABANDONED',
+          'SKIPPED',
+          'FAILED',
+          'STOPPED',
+          'CANCELLED',
+        ].includes(dashboardTask.status.toUpperCase())
       ? 100
       : 0;
   const calls = useMemo(
@@ -131,8 +141,13 @@ export function TaskDashboard({
     setView(next);
   };
 
+  const fullscreenGraph = graphExpanded && view === 'agents';
+
   return (
-    <section className={`task-dashboard view-${view}`} aria-label="Task dashboard">
+    <section
+      className={`task-dashboard view-${view}${fullscreenGraph ? ' graph-fullscreen' : ''}`}
+      aria-label="Task dashboard"
+    >
       <header className="dashboard-header">
         <div>
           <span className="eyebrow">Workspace</span>
@@ -184,7 +199,7 @@ export function TaskDashboard({
         {view === 'overview' && (
           <Overview
             state={state}
-            task={task}
+            task={dashboardTask}
             progress={progress}
             completedAgents={completedAgents}
             agentCount={agents.length}
@@ -244,7 +259,7 @@ export function TaskDashboard({
             )}
           </div>
         )}
-        {view === 'changes' && <ChangesView state={state} task={task} />}
+        {view === 'changes' && <ChangesView state={state} task={dashboardTask} />}
         {view === 'tests' && (
           <div className="record-list test-record-list">
             {tests.map(({ agent, test }) => (
@@ -312,6 +327,43 @@ function Overview({
   const lease = state.projectLease;
   const sandbox = state.sandbox;
   const reconciliation = state.reconciliation;
+  const reportCounts = state.managerReports.counts;
+  const expectedReports =
+    reportCounts.expected || state.managers.length || state.fanout.plannedManagers;
+  const reportedReports = Math.min(expectedReports || reportCounts.reported, reportCounts.reported);
+  const reportBarrierComplete =
+    state.managerReports.barrierSatisfied ||
+    (expectedReports > 0 && reportedReports >= expectedReports);
+  const reportTone =
+    reportCounts.failed > 0 || reportCounts.abandoned > 0
+      ? 'failed'
+      : reportCounts.partial > 0 || reportCounts.skipped > 0
+        ? 'medium'
+        : reportBarrierComplete
+          ? 'balanced'
+          : 'unknown';
+  const reconciliationOutcomes = reconciliation?.workItems;
+  const nonSuccessfulOutcomes = reconciliationOutcomes
+    ? reconciliationOutcomes.partial +
+      reconciliationOutcomes.abandoned +
+      reconciliationOutcomes.skipped +
+      reconciliationOutcomes.blocked +
+      reconciliationOutcomes.failed +
+      reconciliationOutcomes.preflightFailed
+    : 0;
+  const hardFailures = reconciliationOutcomes
+    ? reconciliationOutcomes.abandoned +
+      reconciliationOutcomes.blocked +
+      reconciliationOutcomes.failed +
+      reconciliationOutcomes.preflightFailed
+    : 0;
+  const coverageComplete = reconciliation
+    ? (reconciliation.covered ?? reconciliation.balanced)
+    : false;
+  const reconciliationSuccessful = reconciliation
+    ? (reconciliation.successful ??
+      (coverageComplete && reconciliation.balanced && nonSuccessfulOutcomes === 0))
+    : false;
   return (
     <div className="overview-grid">
       <article className="overview-card overview-progress">
@@ -336,6 +388,32 @@ function Overview({
           <span style={{ width: `${progress}%` }} />
         </div>
         <small>{progress}% observed progress</small>
+      </article>
+
+      <article className="overview-card overview-manager-reports">
+        <CardHeading
+          icon={<ClipboardCheck size={16} />}
+          label="Manager reports"
+          tone={reportTone}
+        />
+        <strong
+          className="overview-value"
+          aria-label={`${reportedReports} of ${expectedReports} Manager terminal reports received`}
+        >
+          {reportedReports} / {expectedReports || '—'}
+        </strong>
+        <p>
+          {reportBarrierComplete
+            ? 'Terminal report coverage is complete; outcome quality is shown separately.'
+            : `${Math.max(0, expectedReports - reportedReports)} Manager terminal report${
+                expectedReports - reportedReports === 1 ? '' : 's'
+              } still pending.`}
+        </p>
+        <ManagerOutcomeCounts
+          completed={reportCounts.completed}
+          partial={reportCounts.partial}
+          abandoned={reportCounts.abandoned}
+        />
       </article>
 
       <article className="overview-card">
@@ -379,18 +457,32 @@ function Overview({
 
       <article className="overview-card overview-reconciliation">
         <CardHeading
-          icon={
-            reconciliation?.balanced ? <CheckCircle2 size={16} /> : <ClipboardCheck size={16} />
+          icon={coverageComplete ? <CheckCircle2 size={16} /> : <ClipboardCheck size={16} />}
+          label="Terminal coverage"
+          tone={
+            reconciliation
+              ? !coverageComplete || hardFailures > 0
+                ? 'failed'
+                : nonSuccessfulOutcomes > 0 || !reconciliationSuccessful
+                  ? 'medium'
+                  : 'balanced'
+              : 'unknown'
           }
-          label="Reconciliation"
-          tone={reconciliation ? (reconciliation.balanced ? 'balanced' : 'failed') : 'unknown'}
         />
         <strong className="overview-value">
-          {reconciliation ? (reconciliation.balanced ? 'Balanced' : 'Needs attention') : 'Pending'}
+          {reconciliation
+            ? coverageComplete
+              ? 'Coverage complete'
+              : 'Coverage incomplete'
+            : 'Pending'}
         </strong>
         <p>
           {reconciliation?.errors.join(' · ') ||
-            'Terminal partitions prove that planned work, agents, and calls all reconcile.'}
+            (coverageComplete
+              ? reconciliationSuccessful
+                ? 'All planned entities are terminal and successful.'
+                : 'All planned entities are terminal, but outcomes are not all successful.'
+              : 'Waiting for every planned work item, agent, and call to reach a terminal outcome.')}
         </p>
         {reconciliation && <ReconciliationCounts reconciliation={reconciliation} />}
       </article>
@@ -425,7 +517,9 @@ function Overview({
 }
 
 function PlanView({ state, contracts }: { state: WorkspaceState; contracts: WorkContract[] }) {
-  const visibleManagers = state.managers.slice(0, 24);
+  const reportCounts = state.managerReports.counts;
+  const expectedReports =
+    reportCounts.expected || state.managers.length || state.fanout.plannedManagers;
   return (
     <div className="plan-view">
       <div className="plan-summary">
@@ -438,6 +532,25 @@ function PlanView({ state, contracts }: { state: WorkspaceState; contracts: Work
           <strong>{contracts.length}</strong>
         </div>
         <div>
+          <span>Manager reports</span>
+          <strong>
+            {Math.min(expectedReports || reportCounts.reported, reportCounts.reported)} /{' '}
+            {expectedReports || '—'}
+          </strong>
+        </div>
+        <div className="outcome-completed">
+          <span>Completed</span>
+          <strong>{reportCounts.completed}</strong>
+        </div>
+        <div className="outcome-partial">
+          <span>Partial</span>
+          <strong>{reportCounts.partial}</strong>
+        </div>
+        <div className="outcome-abandoned">
+          <span>Abandoned</span>
+          <strong>{reportCounts.abandoned}</strong>
+        </div>
+        <div>
           <span>Selected / cap</span>
           <strong>
             {state.fanout.directorSelection?.selected ?? state.fanout.plannedManagers} /{' '}
@@ -445,36 +558,45 @@ function PlanView({ state, contracts }: { state: WorkspaceState; contracts: Work
           </strong>
         </div>
       </div>
-      {visibleManagers.map((manager) => (
+      {state.managers.map((manager) => (
         <article className="plan-workstream" key={manager.id}>
           <header>
             <div>
               <span className={`status-dot status-${manager.status}`} />
               <strong>{manager.title}</strong>
-              <small>{manager.workstreamId ?? manager.id}</small>
+              <small title={manager.workstreamId ?? manager.id}>
+                {manager.workstreamId ?? manager.id}
+              </small>
             </div>
-            <span>{manager.items.length} work items</span>
+            <span>
+              {manager.terminalReport
+                ? `${sentenceStatus(manager.terminalReport.outcome)} report`
+                : `${manager.items.length} work item${manager.items.length === 1 ? '' : 's'}`}
+            </span>
           </header>
           {manager.contract && <ContractSummary contract={manager.contract} />}
-          <div className="plan-items">
-            {manager.items.slice(0, 12).map((item) => (
-              <div key={item.id}>
-                <span className={`status-dot status-${item.status}`} />
-                <div>
-                  <strong>{item.title}</strong>
-                  <small>
-                    {item.contract ? `${item.contract.id} · v${item.contract.version}` : item.id}
-                  </small>
+          {manager.items.length ? (
+            <div className="plan-items">
+              {manager.items.map((item) => (
+                <div key={item.id}>
+                  <span className={`status-dot status-${item.status}`} />
+                  <div>
+                    <strong>{item.title}</strong>
+                    <small title={item.contract?.id ?? item.id}>
+                      {item.contract ? `${item.contract.id} · v${item.contract.version}` : item.id}
+                    </small>
+                  </div>
+                  <span>
+                    {item.dependencies.length
+                      ? `${item.dependencies.length} dependenc${item.dependencies.length === 1 ? 'y' : 'ies'}`
+                      : 'Ready'}
+                  </span>
                 </div>
-                <span>
-                  {item.dependencies.length ? `${item.dependencies.length} dependencies` : 'Ready'}
-                </span>
-              </div>
-            ))}
-            {manager.items.length > 12 && (
-              <small>+{manager.items.length - 12} more work items</small>
-            )}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <p className="inline-empty">This Manager has not published work items yet.</p>
+          )}
         </article>
       ))}
       {!state.managers.length && (
@@ -483,9 +605,6 @@ function PlanView({ state, contracts }: { state: WorkspaceState; contracts: Work
           title="No plan selected yet"
           detail="Director workstreams and Manager work contracts appear here."
         />
-      )}
-      {state.managers.length > visibleManagers.length && (
-        <p className="bounded-note">Showing 24 of {state.managers.length} workstreams.</p>
       )}
     </div>
   );
@@ -549,6 +668,33 @@ function ReconciliationCounts({ reconciliation }: { reconciliation: CompletionRe
           </strong>
         </span>
       ))}
+    </div>
+  );
+}
+
+function ManagerOutcomeCounts({
+  completed,
+  partial,
+  abandoned,
+}: {
+  completed: number;
+  partial: number;
+  abandoned: number;
+}) {
+  return (
+    <div className="manager-outcome-counts" aria-label="Manager report outcomes">
+      <span className="outcome-completed">
+        <small>Completed</small>
+        <strong>{completed}</strong>
+      </span>
+      <span className="outcome-partial">
+        <small>Partial</small>
+        <strong>{partial}</strong>
+      </span>
+      <span className="outcome-abandoned">
+        <small>Abandoned</small>
+        <strong>{abandoned}</strong>
+      </span>
     </div>
   );
 }

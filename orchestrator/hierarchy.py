@@ -6,11 +6,13 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 import threading
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,8 +22,11 @@ from . import (
     file_agent,
     llm_client,
     path_utils,
+    retry_policy,
     safety,
     state_store,
+    test_evidence,
+    worker_targets,
 )
 from .llm_client import ToolCallResult, call_agent
 from .models import (
@@ -48,6 +53,7 @@ from .scheduler import (
     HierarchicalScheduler,
     SchedulerLimits,
     SchedulingError,
+    max_parallelism_enabled,
     ready_work_items,
     scopes_conflict,
     validate_plan,
@@ -75,6 +81,38 @@ from .tools_schema import (
 
 logger = logging.getLogger(__name__)
 
+
+def _worker_launch_stagger_seconds() -> float:
+    """Spacing between worker launches inside one batch.
+
+    Every selected worker still starts immediately; this only stops a batch
+    from opening all of its provider connections in the same millisecond.
+    """
+    if max_parallelism_enabled():
+        return 0.0
+    try:
+        configured = float(os.environ.get("ORCH_WORKER_LAUNCH_STAGGER_SECONDS", "1.5"))
+    except ValueError:
+        configured = 1.5
+    return min(max(0.0, configured), 30.0)
+
+
+def _sleep_unless_cancelled(seconds: float, cancelled: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if cancelled():
+            return
+        time.sleep(min(0.25, max(0.01, deadline - time.monotonic())))
+
+
+def _log_terminal(tag: str, message: str) -> None:
+    """One line per milestone so a run can be followed in the terminal.
+
+    Only the account filename is ever printed, never credential contents.
+    """
+    logger.info("[%s] %s", tag, message)
+
+
 LLMCallFn = Callable[
     [str, str, list[dict[str, Any]]],
     ToolCallResult,
@@ -87,6 +125,15 @@ AgentConfigResolver = Callable[
     [str, str, str, str],
     tuple[str, str],
 ]
+
+
+class _AccountPoolFatalSignal(BaseException):
+    """Carry account exhaustion through legacy ``except Exception`` layers."""
+
+    def __init__(self, cause: llm_client.AccountPoolExhaustedError) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
 
 _PROJECT_LOCKS_GUARD = threading.RLock()
 _PROJECT_LOCKS: dict[str, threading.RLock] = {}
@@ -371,6 +418,58 @@ def _persist_plan_contract_versions(repository: Any, plan: TaskPlan) -> None:
             )
 
 
+def _advance_conflicting_contract_versions(
+    repository: Any,
+    plan: TaskPlan,
+) -> TaskPlan:
+    """Make planner contract revisions monotonic before immutable persistence."""
+
+    get_contract = getattr(repository, "get_contract", None)
+    if not callable(get_contract):
+        return plan
+
+    def reconcile(contract: WorkContract) -> WorkContract:
+        latest = get_contract(plan.task_id, contract.id)
+        if not isinstance(latest, WorkContract):
+            return contract
+        if replace(contract, version=latest.version) == latest:
+            return latest
+        if contract.version <= latest.version:
+            return replace(contract, version=latest.version + 1)
+        return contract
+
+    streams: list[Workstream] = []
+    for stream in plan.workstreams:
+        assert stream.contract is not None
+        stream_contract = reconcile(stream.contract)
+        items: list[WorkItem] = []
+        for item in stream.work_items:
+            assert item.contract is not None
+            item_contract = reconcile(item.contract)
+            items.append(
+                replace(
+                    item,
+                    contract=item_contract,
+                    metadata={
+                        **dict(item.metadata),
+                        "work_contract": to_dict(item_contract),
+                    },
+                )
+            )
+        streams.append(
+            replace(
+                stream,
+                contract=stream_contract,
+                work_items=tuple(items),
+                metadata={
+                    **dict(stream.metadata),
+                    "work_contract": to_dict(stream_contract),
+                },
+            )
+        )
+    return replace(plan, workstreams=tuple(streams))
+
+
 def _append_repository_handoff(repository: Any, handoff: HandoffEnvelope) -> None:
     """Append a typed handoff when the additive persistence hook is available."""
     hook = getattr(repository, "append_handoff", None)
@@ -394,6 +493,586 @@ def _list_repository_handoffs(repository: Any, task_id: str) -> list[Any]:
         preferred_args=(task_id,),
     )
     return list(values or ())
+
+
+def _optional_repository_hook(
+    repository: Any,
+    names: tuple[str, ...],
+    *,
+    values: dict[str, Any],
+    preferred_args: tuple[Any, ...],
+) -> Any:
+    """Call the first additive persistence API present on a rollout repository."""
+    for name in names:
+        hook = getattr(repository, name, None)
+        if callable(hook):
+            return _call_repository_hook(
+                hook,
+                values=values,
+                preferred_args=preferred_args,
+            )
+    return None
+
+
+def _persist_execution_epoch(repository: Any, payload: Mapping[str, Any]) -> None:
+    epoch_id = str(
+        payload.get("execution_epoch_id") or payload.get("execution_epoch") or ""
+    )
+    _optional_repository_hook(
+        repository,
+        ("create_execution_epoch", "begin_execution_epoch", "save_execution_epoch"),
+        values={
+            **dict(payload),
+            "execution_epoch_id": epoch_id,
+            "epoch_id": epoch_id,
+            "metadata": {
+                "expected_manager_ids": list(
+                    payload.get("expected_manager_ids") or []
+                )
+            },
+            "payload": dict(payload),
+            "epoch": dict(payload),
+        },
+        preferred_args=(
+            str(payload.get("task_id") or ""),
+            epoch_id,
+        ),
+    )
+    roster = list(payload.get("roster") or ())
+    if roster:
+        _optional_repository_hook(
+            repository,
+            (
+                "freeze_execution_roster",
+                "save_execution_roster",
+                "freeze_manager_roster",
+            ),
+            values={
+                "task_id": str(payload.get("task_id") or ""),
+                "execution_epoch_id": epoch_id,
+                "execution_epoch": epoch_id,
+                "epoch_id": epoch_id,
+                "roster": roster,
+            },
+            preferred_args=(
+                str(payload.get("task_id") or ""),
+                epoch_id,
+                roster,
+            ),
+        )
+
+
+def _persist_manager_terminal_report(repository: Any, report: Mapping[str, Any]) -> None:
+    epoch_id = str(
+        report.get("execution_epoch_id") or report.get("execution_epoch") or ""
+    )
+    _optional_repository_hook(
+        repository,
+        (
+            "record_manager_terminal_report",
+            "save_manager_terminal_report",
+            "settle_manager_report",
+        ),
+        values={
+            **dict(report),
+            "execution_epoch_id": epoch_id,
+            "epoch_id": epoch_id,
+            "manager_agent_id": report.get("manager_id"),
+            "disposition": report.get("status"),
+            "terminal_log_refs": list(report.get("log_refs") or []),
+            "report": dict(report),
+            "payload": dict(report),
+        },
+        preferred_args=(dict(report),),
+    )
+
+
+def _persist_manager_report_barrier(repository: Any, barrier: Mapping[str, Any]) -> None:
+    epoch_id = str(
+        barrier.get("execution_epoch_id") or barrier.get("execution_epoch") or ""
+    )
+    durable = _optional_repository_hook(
+        repository,
+        (
+            "manager_report_barrier",
+            "get_manager_report_barrier",
+            "manager_reports_barrier",
+            "save_manager_report_barrier",
+            "save_report_barrier",
+        ),
+        values={
+            **dict(barrier),
+            "execution_epoch_id": epoch_id,
+            "epoch_id": epoch_id,
+            "barrier": dict(barrier),
+            "payload": dict(barrier),
+        },
+        preferred_args=(
+            str(barrier.get("task_id") or ""),
+            epoch_id,
+        ),
+    )
+    if isinstance(durable, Mapping) and durable.get("satisfied") is False:
+        raise RuntimeError("Durable Manager report barrier is incomplete")
+
+
+def _persist_director_final_review(repository: Any, review: Mapping[str, Any]) -> None:
+    epoch_id = str(
+        review.get("execution_epoch_id") or review.get("execution_epoch") or ""
+    )
+    _optional_repository_hook(
+        repository,
+        (
+            "record_director_final_review",
+            "save_director_final_review",
+        ),
+        values={
+            **dict(review),
+            "execution_epoch_id": epoch_id,
+            "epoch_id": epoch_id,
+            "review": dict(review),
+            "terminal_disposition": review.get("verdict"),
+            "terminal_log_refs": list(review.get("log_refs") or []),
+            "payload": dict(review),
+        },
+        preferred_args=(dict(review),),
+    )
+
+
+def _reserve_director_final_review(
+    repository: Any,
+    *,
+    task_id: str,
+    execution_epoch: str,
+    review_context: Mapping[str, Any],
+) -> bool:
+    for name in (
+        "reserve_director_final_review",
+        "begin_director_final_review",
+        "reserve_final_review",
+    ):
+        hook = getattr(repository, name, None)
+        if not callable(hook):
+            continue
+        reserved = _call_repository_hook(
+            hook,
+            values={
+                "task_id": task_id,
+                "execution_epoch_id": execution_epoch,
+                "execution_epoch": execution_epoch,
+                "epoch_id": execution_epoch,
+                "review_context": dict(review_context),
+                "context": dict(review_context),
+            },
+            preferred_args=(task_id, execution_epoch),
+        )
+        return reserved is not None
+    return True
+
+
+def _manager_log_references(
+    repository: Any,
+    *,
+    task_id: str,
+    agent_ids: Iterable[str],
+) -> tuple[str, ...]:
+    hook = getattr(repository, "list_log_records", None)
+    if not callable(hook):
+        return ()
+    records = _call_repository_hook(
+        hook,
+        values={"task_id": task_id, "limit": 10000},
+        preferred_args=(task_id,),
+    )
+    wanted = {str(value) for value in agent_ids if value}
+    references = {
+        str(record.get("path") or record.get("log_id") or "")
+        for record in records or ()
+        if isinstance(record, Mapping)
+        and str(record.get("agent_instance_id") or "") in wanted
+        and (record.get("path") or record.get("log_id"))
+    }
+    return tuple(sorted(references))
+
+
+def _pin_manager_log_references(
+    repository: Any,
+    *,
+    task_id: str,
+    execution_epoch: str,
+    manager_id: str,
+    log_refs: tuple[str, ...],
+) -> None:
+    if not log_refs:
+        return
+    _optional_repository_hook(
+        repository,
+        ("pin_log_references", "pin_terminal_logs"),
+        values={
+            "task_id": task_id,
+            "execution_epoch": execution_epoch,
+            "manager_id": manager_id,
+            "log_refs": list(log_refs),
+            "references": list(log_refs),
+            "reason": "manager_terminal_report",
+            "terminal_evidence": True,
+            "pinned": True,
+        },
+        preferred_args=(task_id, list(log_refs)),
+    )
+
+
+def _persist_terminal_disposition(
+    repository: Any,
+    *,
+    task_id: str,
+    execution_epoch: str,
+    entity_kind: str,
+    entity_id: str,
+    disposition: str,
+    logical_agent_id: str | None,
+    reason_code: str,
+    summary: str,
+    log_refs: Iterable[str] = (),
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    payload = {
+        "task_id": task_id,
+        "execution_epoch_id": execution_epoch,
+        "execution_epoch": execution_epoch,
+        "epoch_id": execution_epoch,
+        "entity_kind": entity_kind,
+        "entity_id": entity_id,
+        "disposition": disposition,
+        "logical_agent_id": logical_agent_id,
+        "reason_code": reason_code,
+        "summary": summary,
+        "terminal_log_refs": list(log_refs),
+        "log_refs": list(log_refs),
+        "metadata": dict(metadata or {}),
+    }
+    _optional_repository_hook(
+        repository,
+        (
+            "record_terminal_disposition",
+            "save_terminal_disposition",
+            "record_agent_terminal_disposition",
+        ),
+        values={**payload, "payload": payload},
+        preferred_args=(payload,),
+    )
+
+
+def _complete_execution_epoch(
+    repository: Any,
+    *,
+    task_id: str,
+    execution_epoch: str,
+    disposition: str,
+    terminal_log_refs: Iterable[str] = (),
+) -> None:
+    _optional_repository_hook(
+        repository,
+        ("complete_execution_epoch", "finish_execution_epoch"),
+        values={
+            "task_id": task_id,
+            "execution_epoch_id": execution_epoch,
+            "execution_epoch": execution_epoch,
+            "epoch_id": execution_epoch,
+            "disposition": disposition,
+            "terminal_log_refs": list(terminal_log_refs),
+        },
+        preferred_args=(task_id, execution_epoch),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RemediationDecision:
+    action: str
+    reason: str
+    instructions: str = ""
+    remediation_attempt_id: str | None = None
+
+    @property
+    def retries(self) -> bool:
+        return self.action in {"retry", "replan", "remediate"}
+
+
+@dataclass(slots=True)
+class _FallbackCrisisStrategy:
+    """Retry a novel retryable crisis; exhaust repeated identical failures."""
+
+    seen_fingerprints: set[str] = field(default_factory=set)
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def next_remediation(self, context: Mapping[str, Any]) -> dict[str, str]:
+        if not bool(context.get("retryable")):
+            return {"action": "abandon", "reason": "crisis_not_retryable"}
+        fingerprint_payload = {
+            "scope": context.get("scope"),
+            "failure_kind": context.get("failure_kind"),
+            "affected_work_item_ids": sorted(context.get("affected_work_item_ids") or ()),
+            "errors": context.get("errors") or {},
+        }
+        fingerprint = hashlib.sha256(
+            canonical_json(fingerprint_payload).encode("utf-8")
+        ).hexdigest()
+        with self.lock:
+            if fingerprint in self.seen_fingerprints:
+                return {
+                    "action": "abandon",
+                    "reason": "repeated_crisis_without_new_strategy",
+                }
+            self.seen_fingerprints.add(fingerprint)
+        return {
+            "action": "retry",
+            "reason": "novel_retryable_crisis",
+            "instructions": str(context.get("suggested_instructions") or ""),
+        }
+
+
+def _decide_remediation(
+    crisis_strategy: Any,
+    context: Mapping[str, Any],
+) -> _RemediationDecision:
+    hook = None
+    for name in ("next_remediation", "decide_remediation"):
+        candidate = getattr(crisis_strategy, name, None)
+        if callable(candidate):
+            hook = candidate
+            break
+    if hook is None and callable(crisis_strategy):
+        hook = crisis_strategy
+    if hook is None:
+        return _RemediationDecision("abandon", "no_crisis_strategy_hook")
+    raw = _call_repository_hook(
+        hook,
+        values={
+            **dict(context),
+            "context": dict(context),
+            "crisis": dict(context),
+        },
+        preferred_args=(dict(context),),
+    )
+    if isinstance(raw, bool):
+        return _RemediationDecision(
+            "retry" if raw else "abandon",
+            "strategy_retry" if raw else "strategy_exhausted",
+        )
+    if isinstance(raw, str):
+        return _RemediationDecision(raw.casefold(), f"strategy_{raw.casefold()}")
+    if isinstance(raw, Mapping):
+        return _RemediationDecision(
+            str(raw.get("action") or raw.get("decision") or "abandon").casefold(),
+            str(raw.get("reason") or "strategy_decision"),
+            str(raw.get("instructions") or raw.get("next_instructions") or ""),
+            str(raw.get("remediation_attempt_id") or "") or None,
+        )
+    return _RemediationDecision("abandon", "strategy_returned_no_remediation")
+
+
+def _reserve_remediation_attempt(
+    repository: Any,
+    *,
+    context: Mapping[str, Any],
+    decision: _RemediationDecision,
+) -> tuple[_RemediationDecision, str | None]:
+    if not decision.retries:
+        return decision, None
+    if decision.remediation_attempt_id:
+        return decision, decision.remediation_attempt_id
+    hook = None
+    for name in (
+        "reserve_remediation_attempt",
+        "begin_remediation_attempt",
+        "claim_remediation_strategy",
+    ):
+        candidate = getattr(repository, name, None)
+        if callable(candidate):
+            hook = candidate
+            break
+    if hook is None:
+        return decision, None
+    failure_payload = {
+        "scope": context.get("scope"),
+        "failure_kind": context.get("failure_kind"),
+        "errors": context.get("errors") or {},
+        "affected_work_item_ids": sorted(
+            context.get("affected_work_item_ids") or ()
+        ),
+    }
+    failure_signature = hashlib.sha256(
+        canonical_json(failure_payload).encode("utf-8")
+    ).hexdigest()
+    strategy_name = (
+        decision.action
+        + ":"
+        + hashlib.sha256(decision.instructions.encode("utf-8")).hexdigest()[:16]
+    )
+    logical_agent_id = str(
+        context.get("manager_id")
+        or context.get("agent_instance_id")
+        or context.get("director_id")
+        or "director"
+    )
+    reserved = _call_repository_hook(
+        hook,
+        values={
+            "task_id": str(context.get("task_id") or ""),
+            "logical_agent_id": logical_agent_id,
+            "failure_signature": failure_signature,
+            "strategy": strategy_name,
+            "execution_epoch_id": context.get("execution_epoch"),
+            "execution_epoch": context.get("execution_epoch"),
+            "category": context.get("scope"),
+            "details": dict(context),
+            "terminal_log_refs": [],
+        },
+        preferred_args=(
+            str(context.get("task_id") or ""),
+            logical_agent_id,
+            failure_signature,
+            strategy_name,
+        ),
+    )
+    if reserved is None:
+        return (
+            _RemediationDecision(
+                "abandon",
+                "remediation_strategy_already_used_for_failure",
+            ),
+            None,
+        )
+    attempt_id = (
+        reserved.get("remediation_attempt_id")
+        if isinstance(reserved, Mapping)
+        else getattr(reserved, "remediation_attempt_id", None)
+    )
+    return decision, str(attempt_id or "") or None
+
+
+def _complete_remediation_attempt(
+    repository: Any,
+    remediation_attempt_id: str | None,
+    *,
+    details: Mapping[str, Any],
+) -> None:
+    if not remediation_attempt_id:
+        return
+    hook = getattr(repository, "complete_remediation_attempt", None)
+    if not callable(hook):
+        return
+    _call_repository_hook(
+        hook,
+        values={
+            "remediation_attempt_id": remediation_attempt_id,
+            "attempt_id": remediation_attempt_id,
+            "status": "applied",
+            "details": dict(details),
+            "terminal_disposition": None,
+            "terminal_log_refs": [],
+        },
+        preferred_args=(remediation_attempt_id,),
+    )
+
+
+def _build_manager_terminal_report(
+    *,
+    repository: Any,
+    task_id: str,
+    session_id: str,
+    execution_epoch: str,
+    stream: Workstream,
+    manager_id: str,
+    item_statuses: Mapping[str, WorkStatus],
+    item_evidence: Mapping[str, Mapping[str, Any]],
+    synthesized: bool,
+    reasons: Iterable[str] = (),
+) -> dict[str, Any]:
+    completed_item_ids: list[str] = []
+    abandoned_item_ids: list[str] = []
+    skipped_item_ids: list[str] = []
+    artifacts: set[str] = set()
+    report_reasons = {str(reason) for reason in reasons if str(reason).strip()}
+    for item in stream.work_items:
+        status = WorkStatus(item_statuses.get(item.id, item.status))
+        evidence = item_evidence.get(item.id, {})
+        if status == WorkStatus.APPROVED:
+            completed_item_ids.append(item.id)
+            artifacts.update(
+                str(value)
+                for value in (
+                    evidence.get("completed_file_paths")
+                    or evidence.get("package_files")
+                    or item.write_scopes
+                )
+                if str(value).strip()
+            )
+        elif status in {WorkStatus.ABANDONED, WorkStatus.FAILED}:
+            abandoned_item_ids.append(item.id)
+        else:
+            skipped_item_ids.append(item.id)
+        if status != WorkStatus.APPROVED:
+            reason = (
+                evidence.get("error")
+                or evidence.get("failure_kind")
+                or evidence.get("status")
+            )
+            if reason:
+                report_reasons.add(str(reason))
+
+    if not stream.work_items:
+        report_status = (
+            "completed"
+            if stream.status == WorkStatus.APPROVED
+            else "abandoned"
+        )
+    elif not abandoned_item_ids and not skipped_item_ids:
+        report_status = "completed"
+    elif completed_item_ids:
+        report_status = "partial"
+    else:
+        report_status = "abandoned"
+    child_agent_ids = [
+        manager_id,
+        str(stream.metadata.get("tester_agent_id") or ""),
+        *[
+            str(item.metadata.get("worker_agent_id") or "")
+            for item in stream.work_items
+        ],
+    ]
+    log_refs = _manager_log_references(
+        repository,
+        task_id=task_id,
+        agent_ids=child_agent_ids,
+    )
+    report = {
+        "type": "manager_terminal_report",
+        "task_id": task_id,
+        "session_id": session_id,
+        "execution_epoch": execution_epoch,
+        "execution_epoch_id": execution_epoch,
+        "role": "manager",
+        "agent_instance_id": manager_id,
+        "manager_id": manager_id,
+        "workstream_id": stream.id,
+        "status": report_status,
+        "completed_item_ids": sorted(completed_item_ids),
+        "abandoned_item_ids": sorted(abandoned_item_ids),
+        "skipped_item_ids": sorted(skipped_item_ids),
+        "artifacts": sorted(artifacts),
+        "reasons": sorted(report_reasons),
+        "log_refs": list(log_refs),
+        "synthesized": bool(synthesized),
+    }
+    _pin_manager_log_references(
+        repository,
+        task_id=task_id,
+        execution_epoch=execution_epoch,
+        manager_id=manager_id,
+        log_refs=log_refs,
+    )
+    return report
 
 
 def _validate_execution_slots(*, label: str, slots: int, maximum: int) -> None:
@@ -499,22 +1178,75 @@ def _director_plan_from_result(
     )
 
 
-def _package_files(item: WorkItem) -> list[str]:
-    """Resolve ordered file list for a major work package."""
+def _declared_worker_target(path: str) -> str:
+    """Accept directory-shaped planner targets; reject unsupported concrete files."""
+    normalized = str(path).replace("\\", "/").strip()
+    if worker_targets.is_possible_directory_target(normalized):
+        return normalized
+    return worker_targets.ensure_worker_target(normalized)
+
+
+def _package_files(item: WorkItem, root: Path | None = None) -> list[str]:
+    """Resolve ordered file list for a major work package.
+
+    Directory targets such as ``tests/fixtures/`` are expanded into concrete
+    text files when ``root`` is provided. An empty or missing directory is
+    reported as ``DirectoryWorkerTarget`` so callers can treat it as advisory
+    instead of a fatal unsupported Worker target.
+    """
     primary = str(item.metadata.get("file_path") or "").replace("\\", "/").strip()
     scopes = [
         str(scope).replace("\\", "/").strip() for scope in item.write_scopes if str(scope).strip()
     ]
-    files: list[str] = []
+    declared: list[str] = []
     if primary:
-        files.append(primary)
+        declared.append(primary)
     for scope in scopes:
-        # Skip directory wildcards — workers patch concrete files.
-        if scope.endswith("/") or scope.endswith("/**") or scope.endswith("/*"):
+        if scope not in declared:
+            declared.append(scope)
+
+    files: list[str] = []
+    directory_targets: list[str] = []
+    for target in declared:
+        if worker_targets.is_directory_shaped_target(target) or (
+            root is not None and worker_targets.is_on_disk_directory_target(root, target)
+        ):
+            if target not in directory_targets:
+                directory_targets.append(target)
             continue
-        if scope not in files:
-            files.append(scope)
+        if target not in files:
+            files.append(target)
+
+    if directory_targets and root is not None:
+        remaining = max(config.MAX_FILES_PER_WORK_PACKAGE - len(files), 0)
+        expansions: list[dict[str, Any]] = []
+        for directory in directory_targets:
+            expanded = worker_targets.expand_directory_worker_target(
+                root,
+                directory,
+                max_files=remaining,
+            )
+            expansions.append({"from": directory, "files": list(expanded)})
+            for path in expanded:
+                if path not in files:
+                    files.append(path)
+                    remaining = max(config.MAX_FILES_PER_WORK_PACKAGE - len(files), 0)
+            if remaining == 0:
+                break
+        if expansions:
+            item.metadata["expanded_directory_targets"] = expansions
+            if files:
+                item.metadata["package_files"] = list(files)
+                if primary in directory_targets:
+                    item.metadata["directory_target"] = primary
+                    item.metadata["file_path"] = files[0]
+
     if not files:
+        if directory_targets:
+            raise worker_targets.DirectoryWorkerTarget(
+                directory_targets[0],
+                "directory target has no concrete text files to expand",
+            )
         raise RuntimeError(f"Work item {item.id} thiếu file trong write_scopes/file_path")
     if len(files) > config.MAX_FILES_PER_WORK_PACKAGE:
         raise RuntimeError(
@@ -525,10 +1257,10 @@ def _package_files(item: WorkItem) -> list[str]:
 
 
 def _normalize_work_item_scopes(value: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
-    primary = str(value["file_path"]).replace("\\", "/").strip()
+    primary = _declared_worker_target(str(value["file_path"]))
     scopes: list[str] = []
     for raw_scope in value.get("write_scopes") or []:
-        scope = str(raw_scope).replace("\\", "/").strip()
+        scope = _declared_worker_target(str(raw_scope))
         if scope and scope not in scopes:
             scopes.append(scope)
     if primary and primary not in scopes:
@@ -576,6 +1308,7 @@ def _load_planner_sources(
             raise FileNotFoundError(f"Selected source file does not exist: {normalized}")
         if not absolute.is_file():
             raise IsADirectoryError(f"Selected source path is not a file: {normalized}")
+        worker_targets.read_prompt_text(normalized, absolute)
         key = (normalized.casefold(), modifier)
         if key in seen:
             continue
@@ -653,7 +1386,17 @@ def _depends_on(
 
 
 def _looks_like_artifact_path(value: str) -> bool:
+    """Decide whether a contract entry names a file at all.
+
+    Planners mix prose into these fields, and prose often contains a slash:
+    "USER GOAL section 5 (resolution/fps/mirror config, DSHOW/MSMF backend)"
+    was being measured against the write scopes as though it were a filename,
+    which failed the work item over a file nobody ever intended to exist. A
+    real path carries no whitespace, and that alone separates the two.
+    """
     normalized = value.strip().replace("\\", "/")
+    if not normalized or any(character.isspace() for character in normalized):
+        return False
     return "/" in normalized or normalized.startswith(".") or bool(Path(normalized).suffix)
 
 
@@ -661,22 +1404,48 @@ _PATH_ANNOTATION_RE = re.compile(r"\s*\([^()]*\)\s*$")
 
 
 def _strip_path_annotation(value: str) -> str:
-    """Drop a planner's trailing note from a path.
+    """Reduce a planner's annotated path to the path itself.
 
-    Models routinely answer with ``data/config.json (created at runtime)`` in a
-    field the contract treats as a literal path, which then fails scope checks
-    against a file nobody ever asked for. The note is only removed when what is
-    left is a bare path token, so prose entries such as an acceptance criterion
-    ending in parentheses survive untouched.
+    Models routinely describe the file instead of just naming it, in fields the
+    contract treats as literal paths::
+
+        data/config.json (schema only, created at runtime)
+        app/capture.py: WebcamCapture class exposing start/stop
+
+    Both forms then fail scope checks against a file nobody ever asked for. The
+    annotation is only removed when what remains is a bare path token, so prose
+    entries survive untouched, and a Windows drive prefix such as ``C:/x`` is
+    left alone because ``C`` on its own does not look like a path.
     """
     text = str(value).strip()
+    token = _bare_path_token(text)
+    if token is not None:
+        return token
+    head, separator, tail = text.partition(":")
+    if separator and tail:
+        head_token = _bare_path_token(head)
+        # A lone drive letter is not a path, which keeps "C:/x" intact.
+        if head_token and ("/" in head_token.replace("\\", "/") or Path(head_token).suffix):
+            return head_token
+    return text
+
+
+def _bare_path_token(text: str) -> str | None:
+    """Return ``text`` as a path token with trailing notes removed, else None."""
+    candidate = text.strip()
     while True:
-        candidate = _PATH_ANNOTATION_RE.sub("", text).strip()
-        if candidate == text:
-            return text
-        if not candidate or any(character.isspace() for character in candidate):
-            return text
-        text = candidate
+        stripped = _PATH_ANNOTATION_RE.sub("", candidate).strip()
+        if stripped == candidate:
+            break
+        candidate = stripped
+    if not candidate or any(character.isspace() for character in candidate):
+        return None
+    # "./x" and "x" name the same file; keeping both spellings around makes
+    # scope comparisons disagree with themselves.
+    normalized = candidate.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized or candidate
 
 
 def _clean_path_tuple(values: Iterable[str]) -> tuple[str, ...]:
@@ -718,15 +1487,43 @@ def _contract_approval_issues(
     ):
         issues.append("durable patch/artifact evidence is missing")
     if contract.test_requirements:
-        test_status = str(evidence.get("test_status") or "").casefold()
-        syntax_status = str(evidence.get("syntax_status") or "").casefold()
-        syntax_only = all(
-            any(token in requirement.casefold() for token in ("syntax", "parse", "compile"))
-            for requirement in contract.test_requirements
-        )
-        if test_status != "passed" and not (syntax_only and syntax_status == "passed"):
+        if not test_evidence.item_test_evidence_complete(
+            contract.test_requirements,
+            evidence,
+            allow_deferred_integration=True,
+        ):
             issues.append("declared test requirements lack passing evidence")
     return issues
+
+
+# Only conditions that make execution impossible or unsafe stop plan admission.
+#
+# Everything else a planner can get wrong is bookkeeping: a contract that forgot
+# to list its test requirements, an expected output phrased slightly differently
+# from the write scope, a read scope nobody enumerated. Those used to fail the
+# item before it ever reached the model, which cost the run real work over
+# paperwork. Overlapping scopes are advisory too: inference may run concurrently
+# while the ticket executor serializes filesystem effects.
+_BLOCKING_PREFLIGHT_CODES = frozenset(
+    {
+        # Bounded mode cannot order a malformed DAG. Maximum-parallelism mode
+        # deliberately ignores dependency edges, so validate_plan will not emit
+        # this issue there.
+        "invalid_dependencies",
+        # Nothing concrete for a worker to write.
+        "missing_concrete_target",
+        "empty_workstream",
+        # Path escapes the project root, or a symlink is in the way.
+        "unsafe_target",
+        "unsupported_worker_target",
+        # Edit-only runs must not invent files.
+        "new_file_forbidden",
+        # Typed behavioral tests need a real post-review integration command.
+        "integration_test_not_configured",
+        # The manager never produced a plan for this workstream.
+        "manager_plan_failed",
+    }
+)
 
 
 def _preflight_plan(
@@ -735,9 +1532,15 @@ def _preflight_plan(
     plan: TaskPlan,
     limits: SchedulerLimits,
     allow_new_files: bool,
+    test_cmd: list[str] | None = None,
     available_artifacts: tuple[str, ...] = (),
+    warnings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Validate the complete planned DAG before any Worker is announced."""
+    """Validate the complete planned DAG before any Worker is announced.
+
+    Returns only blocking issues. Advisory findings are appended to ``warnings``
+    when the caller supplies a list to collect them.
+    """
     issues: list[dict[str, Any]] = []
 
     def add_issue(
@@ -748,15 +1551,17 @@ def _preflight_plan(
         work_item_ids: tuple[str, ...] = (),
         paths: tuple[str, ...] = (),
     ) -> None:
-        issues.append(
-            {
-                "code": code,
-                "message": message,
-                "workstream_id": workstream_id,
-                "work_item_ids": list(work_item_ids),
-                "paths": list(paths),
-            }
-        )
+        record = {
+            "code": code,
+            "message": message,
+            "workstream_id": workstream_id,
+            "work_item_ids": list(work_item_ids),
+            "paths": list(paths),
+        }
+        if code in _BLOCKING_PREFLIGHT_CODES:
+            issues.append(record)
+        elif warnings is not None:
+            warnings.append(record)
 
     dag_valid = True
     try:
@@ -785,6 +1590,18 @@ def _preflight_plan(
             add_issue(
                 "contract_tests_missing",
                 f"Contract {contract.id!r} has no test requirements",
+                workstream_id=workstream_id,
+                work_item_ids=item_ids,
+            )
+        if (
+            strict
+            and test_evidence.requires_integration_test(contract.test_requirements)
+            and not test_cmd
+        ):
+            add_issue(
+                "integration_test_not_configured",
+                f"Contract {contract.id!r} has non-syntax test requirements but no "
+                "integration test command is configured",
                 workstream_id=workstream_id,
                 work_item_ids=item_ids,
             )
@@ -858,20 +1675,11 @@ def _preflight_plan(
                     paths=(normalized,),
                 )
 
-        if parent_contract is not None:
-            parent_scopes = (
-                *parent_contract.read_scopes,
-                *parent_contract.write_scopes,
-            )
-            for scope in contract.read_scopes:
-                if not any(_scope_covers(parent, scope) for parent in parent_scopes):
-                    add_issue(
-                        "contract_read_scope_mismatch",
-                        f"Read scope {scope!r} is outside the workstream contract",
-                        workstream_id=workstream_id,
-                        work_item_ids=item_ids,
-                        paths=(scope,),
-                    )
+        # A work item reading a file its workstream did not enumerate is a gap in
+        # the planner's paperwork, not a hazard: read scopes only steer which
+        # files are shown to the agent. Write ownership is what must not overlap,
+        # and that is still checked above and across the whole plan. Failing the
+        # item here stopped real work over a file it merely wanted to read.
 
     work_entries: list[tuple[Workstream, WorkItem, tuple[str, ...]]] = []
     for stream in plan.workstreams:
@@ -916,7 +1724,16 @@ def _preflight_plan(
             )
             item_paths: tuple[str, ...] = ()
             try:
-                item_paths = tuple(_package_files(item))
+                item_paths = tuple(_package_files(item, root=root))
+            except worker_targets.DirectoryWorkerTarget as exc:
+                add_issue(
+                    "directory_target_unexpanded",
+                    str(exc),
+                    workstream_id=stream.id,
+                    work_item_ids=(item.id,),
+                    paths=(exc.path,),
+                )
+                continue
             except (RuntimeError, ValueError) as exc:
                 add_issue(
                     "missing_concrete_target",
@@ -925,6 +1742,14 @@ def _preflight_plan(
                     work_item_ids=(item.id,),
                 )
                 continue
+            if item.metadata.get("expanded_directory_targets"):
+                add_issue(
+                    "directory_target_expanded",
+                    f"Work item {item.id!r} directory target(s) expanded into concrete files",
+                    workstream_id=stream.id,
+                    work_item_ids=(item.id,),
+                    paths=item_paths,
+                )
             primary = str(item.metadata.get("file_path") or "").replace("\\", "/")
             if not primary or primary not in item_paths:
                 add_issue(
@@ -945,11 +1770,11 @@ def _preflight_plan(
             file_outputs: list[str] = []
             for output in item.contract.expected_outputs:
                 raw_output = str(output).strip().replace("\\", "/")
-                if (
-                    "/" not in raw_output
-                    and not Path(raw_output).suffix
-                    and raw_output not in item_paths
-                ):
+                if worker_targets.is_runtime_only_artifact(raw_output):
+                    continue
+                # Same rule as everywhere else: prose is not a file, even when
+                # it happens to contain a slash.
+                if not _looks_like_artifact_path(raw_output) and raw_output not in item_paths:
                     continue
                 try:
                     file_outputs.append(path_utils.normalize_rel_path(raw_output))
@@ -975,15 +1800,21 @@ def _preflight_plan(
                     paths=item_paths,
                 )
             for target in item_paths:
-                if (
-                    target in {"", "."}
-                    or target.endswith("/")
-                    or target.endswith("/**")
-                    or target.endswith("/*")
-                ):
+                if target in {"", "."}:
                     add_issue(
                         "missing_concrete_target",
                         f"Work item {item.id!r} target is not a concrete file: {target!r}",
+                        workstream_id=stream.id,
+                        work_item_ids=(item.id,),
+                        paths=(target,),
+                    )
+                    continue
+                if worker_targets.is_directory_shaped_target(target) or (
+                    worker_targets.is_on_disk_directory_target(root, target)
+                ):
+                    add_issue(
+                        "directory_target_unexpanded",
+                        f"Work item {item.id!r} directory target is advisory, not unsupported: {target!r}",
                         workstream_id=stream.id,
                         work_item_ids=(item.id,),
                         paths=(target,),
@@ -998,24 +1829,42 @@ def _preflight_plan(
                         paths=(target,),
                     )
                 try:
+                    worker_targets.ensure_worker_target(target)
                     path_utils.ensure_context_path_safe(target)
+                    # resolve_under_root already refuses anything that escapes
+                    # the project or crosses a symlink, so spelling is not a
+                    # safety question. A planner writing "./.gitignore" instead
+                    # of ".gitignore" used to lose its work item to that.
                     normalized, absolute = path_utils.resolve_under_root(root, target)
-                    if normalized != target:
-                        raise path_utils.PathEscapeError(f"Target is not normalized: {target!r}")
+                    worker_targets.ensure_worker_target(normalized, absolute_path=absolute)
                     if absolute.exists() and not absolute.is_file():
-                        raise IsADirectoryError(f"Target is not a regular file: {normalized}")
+                        raise worker_targets.DirectoryWorkerTarget(
+                            normalized,
+                            "directory target must be expanded into concrete files",
+                        )
                     if not absolute.exists() and not allow_new_files:
                         raise FileNotFoundError(
                             f"New file is not allowed in edit mode: {normalized}"
                         )
+                except worker_targets.DirectoryWorkerTarget as exc:
+                    add_issue(
+                        "directory_target_unexpanded",
+                        str(exc),
+                        workstream_id=stream.id,
+                        work_item_ids=(item.id,),
+                        paths=(target,),
+                    )
                 except (
                     FileNotFoundError,
                     IsADirectoryError,
                     path_utils.PathEscapeError,
                     path_utils.SensitivePathError,
+                    worker_targets.UnsupportedWorkerTarget,
                 ) as exc:
                     add_issue(
-                        "unsafe_target"
+                        "unsupported_worker_target"
+                        if isinstance(exc, worker_targets.UnsupportedWorkerTarget)
+                        else "unsafe_target"
                         if not isinstance(exc, FileNotFoundError)
                         else "new_file_forbidden",
                         str(exc),
@@ -1071,14 +1920,182 @@ def _preflight_plan(
     return issues
 
 
+def _stream_produced_paths(stream: Workstream) -> set[str]:
+    """Every file a workstream claims it will write."""
+    produced: set[str] = set()
+    sources: list[str] = [*stream.write_scopes]
+    if stream.contract is not None:
+        sources.extend(stream.contract.write_scopes)
+        sources.extend(stream.contract.expected_outputs)
+    for item in stream.work_items:
+        sources.extend(item.write_scopes)
+        if item.contract is not None:
+            sources.extend(item.contract.write_scopes)
+            sources.extend(item.contract.expected_outputs)
+    for value in sources:
+        text = str(value).strip().replace("\\", "/").rstrip("/")
+        if text and _looks_like_artifact_path(text):
+            produced.add(text)
+    return produced
+
+
+def _stream_consumed_paths(stream: Workstream) -> set[str]:
+    """Every file a workstream says it needs to read."""
+    consumed: set[str] = set()
+    sources: list[str] = []
+    if stream.contract is not None:
+        sources.extend(stream.contract.input_artifacts)
+    for item in stream.work_items:
+        if item.contract is not None:
+            sources.extend(item.contract.input_artifacts)
+    for value in sources:
+        text = str(value).strip().replace("\\", "/").rstrip("/")
+        if text and _looks_like_artifact_path(text):
+            consumed.add(text)
+    return consumed
+
+
+def _item_produced_paths(item: WorkItem) -> set[str]:
+    sources: list[str] = [*item.write_scopes]
+    if item.contract is not None:
+        sources.extend(item.contract.write_scopes)
+        sources.extend(item.contract.expected_outputs)
+    return {
+        text
+        for value in sources
+        if (text := str(value).strip().replace("\\", "/").rstrip("/"))
+        and _looks_like_artifact_path(text)
+    }
+
+
+def _item_consumed_paths(item: WorkItem) -> set[str]:
+    sources = list(item.contract.input_artifacts) if item.contract is not None else []
+    return {
+        text
+        for value in sources
+        if (text := str(value).strip().replace("\\", "/").rstrip("/"))
+        and _looks_like_artifact_path(text)
+    }
+
+
+def _relax_item_dependencies(stream: Workstream) -> tuple[Workstream, list[dict[str, Any]]]:
+    """Same rule as for workstreams, applied to the items inside one."""
+    produced = {item.id: _item_produced_paths(item) for item in stream.work_items}
+    consumed = {item.id: _item_consumed_paths(item) for item in stream.work_items}
+    dropped: list[dict[str, Any]] = []
+    items: list[WorkItem] = []
+    changed = False
+
+    for item in stream.work_items:
+        keep: list[str] = []
+        for dependency in item.dependencies:
+            upstream_writes = produced.get(dependency)
+            if upstream_writes is None:
+                keep.append(dependency)
+                continue
+            justified = any(
+                _scope_covers(written, other) or _scope_covers(other, written)
+                for written in upstream_writes
+                for other in (*consumed.get(item.id, ()), *produced.get(item.id, ()))
+            )
+            if justified:
+                keep.append(dependency)
+                continue
+            dropped.append(
+                {
+                    "workstream_id": stream.id,
+                    "work_item_id": item.id,
+                    "dependency": dependency,
+                    "reason": "no shared artifact or write scope",
+                }
+            )
+        if len(keep) != len(item.dependencies):
+            changed = True
+            items.append(replace(item, dependencies=tuple(keep)))
+        else:
+            items.append(item)
+
+    if not changed:
+        return stream, dropped
+    return replace(stream, work_items=tuple(items)), dropped
+
+
+def _relax_decorative_dependencies(
+    streams: list[Workstream],
+) -> tuple[list[Workstream], list[dict[str, Any]]]:
+    """Drop workstream edges that no file actually justifies.
+
+    A dependency serialises execution, so a plan that chains every workstream
+    runs one at a time however many workers it planned. Planners add these edges
+    for narrative order ("API before the UI that calls it") even when the goal
+    already specifies the contract between them and nothing is actually read.
+
+    An edge is kept when it is load bearing, which means either the downstream
+    stream reads a file the upstream stream writes, or the two claim overlapping
+    write scopes and therefore must not run together. Everything else is
+    removed. Nothing is weakened by this: a stream that really does need a file
+    it never declared is still stopped at runtime by the missing-input check.
+    """
+    produced = {stream.id: _stream_produced_paths(stream) for stream in streams}
+    consumed = {stream.id: _stream_consumed_paths(stream) for stream in streams}
+    dropped: list[dict[str, Any]] = []
+    relaxed: list[Workstream] = []
+
+    for stream in streams:
+        keep: list[str] = []
+        for dependency in stream.dependencies:
+            upstream_writes = produced.get(dependency)
+            if upstream_writes is None:
+                keep.append(dependency)
+                continue
+            reads_upstream_output = any(
+                _scope_covers(written, needed) or _scope_covers(needed, written)
+                for written in upstream_writes
+                for needed in consumed.get(stream.id, ())
+            )
+            writes_collide = any(
+                _scope_covers(written, mine) or _scope_covers(mine, written)
+                for written in upstream_writes
+                for mine in produced.get(stream.id, ())
+            )
+            if reads_upstream_output or writes_collide:
+                keep.append(dependency)
+                continue
+            dropped.append(
+                {
+                    "workstream_id": stream.id,
+                    "dependency": dependency,
+                    "reason": "no shared artifact or write scope",
+                }
+            )
+        settled = (
+            replace(stream, dependencies=tuple(keep))
+            if len(keep) != len(stream.dependencies)
+            else stream
+        )
+        settled, item_drops = _relax_item_dependencies(settled)
+        dropped.extend(item_drops)
+        relaxed.append(settled)
+    return relaxed, dropped
+
+
 def _runtime_missing_contract_inputs(
     root: Path,
     contract: WorkContract,
 ) -> tuple[str, ...]:
     """Check path-like inputs only when their dependency gate has opened."""
     missing: list[str] = []
+    # A file this contract is itself going to write is not a missing input; the
+    # planner often lists its own output among the artifacts it works on, and
+    # blocking on that would stop the very agent that creates the file.
+    own_outputs = {
+        str(scope).strip().replace("\\", "/").rstrip("/")
+        for scope in (*contract.write_scopes, *contract.expected_outputs)
+    }
     for artifact in contract.input_artifacts:
         if not _looks_like_artifact_path(artifact):
+            continue
+        if artifact.strip().replace("\\", "/").rstrip("/") in own_outputs:
             continue
         try:
             _, absolute = path_utils.resolve_under_root(root, artifact)
@@ -1088,6 +2105,53 @@ def _runtime_missing_contract_inputs(
         if not absolute.is_file():
             missing.append(artifact)
     return tuple(missing)
+
+
+def _contract_input_context(
+    root: Path,
+    contract: WorkContract,
+    *,
+    max_chars: int = 200_000,
+) -> str:
+    """Load declared UTF-8 inputs so Workers can implement against real APIs."""
+
+    blocks: list[str] = []
+    remaining = max_chars
+    own_outputs = {
+        str(value).strip().replace("\\", "/").rstrip("/")
+        for value in (*contract.write_scopes, *contract.expected_outputs)
+    }
+    declared_inputs = tuple(
+        dict.fromkeys((*contract.input_artifacts, *contract.read_scopes))
+    )
+    for artifact in declared_inputs:
+        normalized = str(artifact).strip().replace("\\", "/").rstrip("/")
+        if (
+            not normalized
+            or normalized in own_outputs
+            or not _looks_like_artifact_path(normalized)
+        ):
+            continue
+        try:
+            relative, absolute = path_utils.resolve_under_root(root, normalized)
+            if not absolute.is_file():
+                continue
+            content = worker_targets.read_prompt_text(relative, absolute)
+        except (
+            OSError,
+            ValueError,
+            path_utils.PathEscapeError,
+            worker_targets.UnsupportedPromptSource,
+        ):
+            continue
+        if remaining <= 0:
+            break
+        selected = content[:remaining]
+        blocks.append(f"### {relative}\n```\n{selected}\n```")
+        remaining -= len(selected)
+    if not blocks:
+        return ""
+    return "\n\n## DECLARED INPUT ARTIFACT CONTEXT\n" + "\n\n".join(blocks)
 
 
 def _planner_contract(
@@ -1103,6 +2167,21 @@ def _planner_contract(
     """Build a validated contract while keeping legacy planner fixtures usable."""
     acceptance = tuple(value.get("acceptance_criteria") or fallback_acceptance)
     write_scopes = _clean_path_tuple(value.get("write_scopes") or fallback_write_scopes)
+    inputs = _clean_path_tuple(value.get("input_artifacts") or fallback_inputs)
+    declared_reads = _clean_path_tuple(value.get("read_scopes") or ())
+    # Naming a file as an input *is* declaring the intent to read it. Planners
+    # routinely list one and forget the other, and rejecting the contract over
+    # that bookkeeping gap killed work items for a file they were only going to
+    # read. Read scopes are not a security boundary here -- writes are -- so the
+    # coherent reading is to widen, not to refuse.
+    read_scopes = tuple(
+        dict.fromkeys(
+            (
+                *declared_reads,
+                *(artifact for artifact in inputs if _looks_like_artifact_path(artifact)),
+            )
+        )
+    )
     outputs = _clean_path_tuple(
         value.get("expected_outputs")
         or fallback_outputs
@@ -1115,9 +2194,9 @@ def _planner_contract(
     return WorkContract(
         id=str(value.get("contract_id") or f"{fallback_id}-contract"),
         version=int(value.get("contract_version") or 1),
-        input_artifacts=_clean_path_tuple(value.get("input_artifacts") or fallback_inputs),
+        input_artifacts=inputs,
         expected_outputs=outputs,
-        read_scopes=_clean_path_tuple(value.get("read_scopes") or ()),
+        read_scopes=read_scopes,
         write_scopes=write_scopes,
         acceptance_criteria=acceptance,
         test_requirements=tests,
@@ -1263,7 +2342,7 @@ def _manager_stream_from_result(
     )
 
 
-def run_hierarchy(
+def _run_hierarchy_impl(
     *,
     root: Path,
     task_description: str,
@@ -1285,11 +2364,11 @@ def run_hierarchy(
     on_file_approved: ApprovedFileSink | None = None,
     repository: StateRepository | None = None,
     project_lease: Any | None = None,
-    max_attempts_per_item: int = 2,
     resume_session: bool = False,
     agent_config_resolver: AgentConfigResolver | None = None,
     approval_callback: ApprovalCallback | None = None,
     cancelled: CancellationCallback | None = None,
+    crisis_strategy: Any | None = None,
 ) -> SessionResult:
     """Execute a durable, bounded two-level plan.
 
@@ -1300,8 +2379,6 @@ def run_hierarchy(
     one project lock to preserve the local working tree.
     """
     root = root.resolve()
-    if max_attempts_per_item < 1:
-        raise ValueError("max_attempts_per_item must be positive")
     if config.MAX_FILES_PER_WORK_PACKAGE < 1:
         raise ValueError("ORCH_MAX_FILES_PER_WORK_PACKAGE must be positive")
     bounds = limits or SchedulerLimits()
@@ -1362,11 +2439,107 @@ def run_hierarchy(
     rules = state_store.load_rules_text(paths)
     decisions = state_store.load_decisions_text(paths)
     result = SessionResult()
+    crisis_strategy = crisis_strategy or retry_policy.PolicyCrisisStrategy(
+        repository=repo,
+    )
     model_call_outcomes: dict[str, str] = {}
     called_agent_ids: set[str] = set()
+    started_agent_ids: set[str] = set()
+    model_start_counts: dict[str, int] = {}
     agent_call_purposes: dict[str, set[str]] = {}
     agent_dispositions: dict[str, str] = {}
+    agent_no_call_reasons: dict[str, str] = {}
+    # Operator-facing names ("Manager 2", "Worker 2.3") and the account each
+    # agent is currently on. The opaque logical id stays the identity; this is
+    # only how the run is narrated in the UI and the terminal.
+    agent_labels: dict[str, str] = {}
+    agent_accounts: dict[str, str] = {}
     event_state_lock = threading.RLock()
+
+    def register_agent_labels(current_plan: TaskPlan | None, manager_id_by_stream: dict[str, str]):
+        """Number agents the way an operator reads them, 1-based and by parent."""
+        labels: dict[str, str] = {director_id: "Director"}
+        if current_plan is not None:
+            for stream_index, stream in enumerate(current_plan.workstreams, start=1):
+                manager_id = str(
+                    stream.manager_agent_id or manager_id_by_stream.get(stream.id) or ""
+                )
+                if manager_id:
+                    labels[manager_id] = f"Manager {stream_index}"
+                tester_id = str(stream.metadata.get("tester_agent_id") or "")
+                if tester_id:
+                    labels[tester_id] = f"Tester {stream_index}"
+                for item_index, item in enumerate(stream.work_items, start=1):
+                    worker_id = str(item.metadata.get("worker_agent_id") or "")
+                    if worker_id:
+                        labels[worker_id] = f"Worker {stream_index}.{item_index}"
+        with event_state_lock:
+            agent_labels.update(labels)
+
+    def agent_display(agent_id: str) -> str:
+        label = agent_labels.get(agent_id) or agent_id
+        account = agent_accounts.get(agent_id)
+        return f"{label} · {account}" if account else label
+
+    def release_known_agent_accounts() -> None:
+        llm_client.release_task_account_cohort(task_id)
+
+    logged_agent_milestones: set[tuple[str, str]] = set()
+
+    def _log_agent_event(event_type: str, agent_id: str, event: dict[str, Any]) -> None:
+        label = agent_labels.get(agent_id)
+        if not label:
+            return
+        # preflight_failed and agent_failed describe one event to two consumers,
+        # and a re-announced worker repeats its spawn. The terminal should read
+        # as one line per thing that happened.
+        milestone = {
+            "agent_planned": "planned",
+            "agent_started": "spawn",
+            "preflight_failed": "failed",
+            "agent_failed": "failed",
+            "workstream_failed": "failed",
+        }.get(event_type)
+        if milestone:
+            key = (agent_id, milestone)
+            if key in logged_agent_milestones:
+                return
+            logged_agent_milestones.add(key)
+        account = agent_accounts.get(agent_id)
+        if event_type in {"agent_planned", "agent_started"}:
+            details = [f"account={account or 'unassigned'}"]
+            if event.get("work_item_id"):
+                details.append(f"work_item={event['work_item_id']}")
+            elif event.get("workstream_id"):
+                details.append(f"workstream={event['workstream_id']}")
+            tag = "AGENT PLANNED" if event_type == "agent_planned" else "AGENT SPAWN"
+            _log_terminal(tag, f"{label} | " + " | ".join(details))
+        elif event_type == "model_request_started":
+            _log_terminal(
+                "MODEL CALL",
+                f"{label} | logical_request={event.get('logical_request_id') or '-'} | "
+                f"attempt={event.get('attempt') or 1}",
+            )
+        elif event_type in {"agent_blocked", "workstream_blocked"}:
+            reason = event.get("failure_kind") or event.get("reason") or "unknown"
+            _log_terminal("AGENT BLOCKED", f"{label} | reason={reason}")
+        elif event_type in {"preflight_failed", "agent_failed", "workstream_failed"}:
+            reason = (
+                event.get("failure_kind")
+                or event.get("error")
+                # workstream_failed carries neither of the above; its "why" is
+                # in the summary, and a line reading "unknown" helps nobody.
+                or event.get("summary")
+                or event.get("verdict")
+                or "unknown"
+            )
+            _log_terminal("AGENT FAILED", f"{label} | reason={str(reason)[:160]}")
+        elif event_type == "execution_result" and event.get("accepted"):
+            _log_terminal("AGENT COMPLETE", label)
+
+    # The Director is nameable before anything is planned, so its own call is
+    # narrated too rather than the terminal staying silent until managers exist.
+    agent_labels[director_id] = "Director"
 
     def contextual_event(event: dict[str, Any]) -> None:
         event.setdefault("task_id", task_id)
@@ -1381,6 +2554,26 @@ def run_hierarchy(
         event_type = str(event.get("type") or "")
         agent_id = str(event.get("agent_instance_id") or "").strip()
         if agent_id:
+            if event_type == "agent_started":
+                with event_state_lock:
+                    started_agent_ids.add(agent_id)
+            account = str(event.get("account") or "").strip()
+            if account and account != "[REDACTED]":
+                with event_state_lock:
+                    previous_account = agent_accounts.get(agent_id)
+                    agent_accounts[agent_id] = account
+                if previous_account and previous_account != account:
+                    _log_terminal(
+                        "ACCOUNT SWITCH",
+                        f"{agent_labels.get(agent_id, agent_id)} | "
+                        f"{previous_account} -> {account} | "
+                        f"reason={event.get('reason') or event.get('failure_kind') or 'retry'}",
+                    )
+            label = agent_labels.get(agent_id)
+            if label:
+                event.setdefault("agent_label", label)
+                event.setdefault("agent_display_name", agent_display(agent_id))
+            _log_agent_event(event_type, agent_id, event)
             disposition: str | None = None
             if event_type in {"agent_blocked", "workstream_blocked"}:
                 disposition = "blocked"
@@ -1391,13 +2584,39 @@ def run_hierarchy(
                     or event.get("failure_kind") in {"preflight", "plan_preflight"}
                     else "failed"
                 )
-            elif event_type in {"agent_cancelled", "agent_skipped"}:
+            elif event_type == "agent_abandoned":
+                disposition = "abandoned"
+            elif event_type in {"agent_cancelled", "agent_skipped", "workstream_skipped"}:
                 disposition = "skipped"
             elif event_type == "workstream_failed":
-                disposition = "skipped" if event.get("status") == "cancelled" else "failed"
+                disposition = (
+                    "skipped"
+                    if event.get("status") == "cancelled"
+                    else "abandoned"
+                    if event.get("status") == "abandoned"
+                    else "failed"
+                )
             if disposition is not None:
                 with event_state_lock:
                     agent_dispositions[agent_id] = disposition
+                    reason = str(
+                        event.get("failure_kind")
+                        or event.get("reason")
+                        or event.get("status")
+                        or ""
+                    ).strip()
+                    if reason:
+                        agent_no_call_reasons[agent_id] = reason
+            if event_type == "model_request_started":
+                purpose = str(
+                    event.get("call_purpose")
+                    or getattr(llm_client.thread_local, "call_purpose", None)
+                    or "other"
+                )
+                with event_state_lock:
+                    called_agent_ids.add(agent_id)
+                    model_start_counts[agent_id] = model_start_counts.get(agent_id, 0) + 1
+                    agent_call_purposes.setdefault(agent_id, set()).add(purpose)
         call_id = str(event.get("call_id") or event.get("logical_request_id") or "").strip()
         if call_id:
             with event_state_lock:
@@ -1431,14 +2650,35 @@ def run_hierarchy(
             "complete_plan": "review",
         }.get(tool_name, tool_name or "other")
         agent_id = str(getattr(llm_client.thread_local, "agent_instance_id", None) or "").strip()
-        if agent_id:
-            with event_state_lock:
-                called_agent_ids.add(agent_id)
-                agent_call_purposes.setdefault(agent_id, set()).add(purpose)
+        with event_state_lock:
+            starts_before = model_start_counts.get(agent_id, 0) if agent_id else 0
         previous_purpose = getattr(llm_client.thread_local, "call_purpose", None)
         llm_client.thread_local.call_purpose = purpose
         try:
-            return raw_llm_call(system_prompt, user_message, tools)
+            try:
+                response = raw_llm_call(system_prompt, user_message, tools)
+            except llm_client.AccountPoolExhaustedError as exc:
+                if purpose in {"execute", "test"}:
+                    raise _AccountPoolFatalSignal(exc) from exc
+                raise
+            # Test adapters and custom local providers may not emit transport
+            # events. Count them only after they actually return a response;
+            # production calls are counted at model_request_started above.
+            if agent_id:
+                with event_state_lock:
+                    if model_start_counts.get(agent_id, 0) == starts_before:
+                        called_agent_ids.add(agent_id)
+                        agent_call_purposes.setdefault(agent_id, set()).add(purpose)
+            return response
+        except BaseException:
+            # A local adapter can fail without transport events, but invoking
+            # it is still a factual model-call attempt for coverage.
+            if agent_id:
+                with event_state_lock:
+                    if model_start_counts.get(agent_id, 0) == starts_before:
+                        called_agent_ids.add(agent_id)
+                        agent_call_purposes.setdefault(agent_id, set()).add(purpose)
+            raise
         finally:
             llm_client.thread_local.call_purpose = previous_purpose
 
@@ -1601,6 +2841,7 @@ def run_hierarchy(
                 "handoff_count": len(previous_handoffs),
             }
         )
+    llm_client.reserve_account_cohort(task_id, (director_id,))
     contextual_event(
         {
             "type": "agent_started",
@@ -1663,6 +2904,7 @@ def run_hierarchy(
     )
     # Full DAG validation is deferred until every Manager sub-plan exists so
     # dependency failures share the structured whole-plan preflight path.
+    plan = _advance_conflicting_contract_versions(repo, plan)
     _persist_plan_contract_versions(repo, plan)
     repo.save_plan(
         plan,
@@ -1717,15 +2959,197 @@ def run_hierarchy(
         )
         for stream in plan.workstreams
     }
+    expected_manager_ids = tuple(manager_ids[stream.id] for stream in plan.workstreams)
+    llm_client.reserve_account_cohort(task_id, expected_manager_ids)
+    epoch_digest = hashlib.sha256(
+        (
+            f"{task_id}\0{session_id}\0{plan.revision}\0"
+            + "\0".join(expected_manager_ids)
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    execution_epoch = f"epoch_{epoch_digest}"
+    execution_epoch_event = {
+        "type": "execution_epoch_started",
+        "task_id": task_id,
+        "session_id": session_id,
+        "role": "director",
+        "agent_instance_id": director_id,
+        "execution_epoch": execution_epoch,
+        "execution_epoch_id": execution_epoch,
+        "expected_manager_ids": list(expected_manager_ids),
+        "expected_manager_count": len(expected_manager_ids),
+        "plan_revision": plan.revision,
+        "roster": [
+            {
+                "manager_agent_id": manager_ids[stream.id],
+                "workstream_id": stream.id,
+                "contract_id": stream.contract.id if stream.contract is not None else None,
+                "contract_version": (
+                    stream.contract.version if stream.contract is not None else None
+                ),
+                "roster_position": position,
+                "metadata": {"title": stream.title},
+            }
+            for position, stream in enumerate(plan.workstreams)
+        ],
+        "status": "running",
+    }
+    _persist_execution_epoch(repo, execution_epoch_event)
+    contextual_event(execution_epoch_event)
+    manager_terminal_reports: dict[str, dict[str, Any]] = {}
+    manager_report_lock = threading.RLock()
+    report_barrier_emitted = False
+    director_final_review_count = 0
+
+    def settle_manager(
+        stream: Workstream,
+        *,
+        statuses: Mapping[str, WorkStatus],
+        evidence: Mapping[str, Mapping[str, Any]],
+        synthesized: bool = False,
+        reasons: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        """Persist and emit exactly one terminal report for one frozen Manager."""
+        manager_id = str(stream.manager_agent_id or manager_ids[stream.id])
+        with manager_report_lock:
+            existing = manager_terminal_reports.get(manager_id)
+            if existing is not None:
+                return existing
+            for item in stream.work_items:
+                item_status = WorkStatus(statuses.get(item.id, item.status))
+                disposition = (
+                    "completed"
+                    if item_status == WorkStatus.APPROVED
+                    else "abandoned"
+                    if item_status in {WorkStatus.ABANDONED, WorkStatus.FAILED}
+                    else "cancelled"
+                    if item_status == WorkStatus.CANCELLED
+                    else "skipped"
+                )
+                item_reason = str(
+                    item_evidence.get(item.id, {}).get("failure_kind")
+                    or item_evidence.get(item.id, {}).get("status")
+                    or disposition
+                )
+                worker_id = str(item.metadata.get("worker_agent_id") or "")
+                item_log_refs = _manager_log_references(
+                    repo,
+                    task_id=task_id,
+                    agent_ids=(worker_id,),
+                )
+                _persist_terminal_disposition(
+                    repo,
+                    task_id=task_id,
+                    execution_epoch=execution_epoch,
+                    entity_kind="work_item",
+                    entity_id=item.id,
+                    disposition=disposition,
+                    logical_agent_id=worker_id or None,
+                    reason_code=item_reason,
+                    summary=str(
+                        item_evidence.get(item.id, {}).get("error")
+                        or item_evidence.get(item.id, {}).get("reviewer_feedback")
+                        or item_reason
+                    ),
+                    log_refs=item_log_refs,
+                    metadata={"workstream_id": stream.id},
+                )
+            report = _build_manager_terminal_report(
+                repository=repo,
+                task_id=task_id,
+                session_id=session_id,
+                execution_epoch=execution_epoch,
+                stream=stream,
+                manager_id=manager_id,
+                item_statuses=statuses,
+                item_evidence=evidence,
+                synthesized=synthesized,
+                reasons=reasons,
+            )
+            _persist_manager_terminal_report(repo, report)
+            _persist_terminal_disposition(
+                repo,
+                task_id=task_id,
+                execution_epoch=execution_epoch,
+                entity_kind="manager",
+                entity_id=manager_id,
+                disposition=str(report["status"]),
+                logical_agent_id=manager_id,
+                reason_code=(
+                    "completed"
+                    if report["status"] == "completed"
+                    else "manager_terminal_report"
+                ),
+                summary="; ".join(report["reasons"]) or str(report["status"]),
+                log_refs=report["log_refs"],
+                metadata={"workstream_id": stream.id},
+            )
+            manager_terminal_reports[manager_id] = report
+            contextual_event(report)
+        release_ids = {
+            manager_id,
+            str(stream.metadata.get("tester_agent_id") or ""),
+            *(
+                str(item.metadata.get("worker_agent_id") or "")
+                for item in stream.work_items
+            ),
+        }
+        for agent_id in release_ids:
+            if agent_id:
+                llm_client.release_reserved_agent_account(task_id, agent_id)
+        if report["status"] != "completed":
+            hook = getattr(crisis_strategy, "on_abandonment", None)
+            if callable(hook):
+                _call_repository_hook(
+                    hook,
+                    values={
+                        **report,
+                        "report": report,
+                        "context": report,
+                    },
+                    preferred_args=(report,),
+                )
+        return report
+
+    def emit_manager_report_barrier() -> dict[str, Any]:
+        nonlocal report_barrier_emitted
+        with manager_report_lock:
+            reported_manager_ids = sorted(manager_terminal_reports)
+            expected = sorted(expected_manager_ids)
+            barrier = {
+                "type": "manager_report_barrier",
+                "task_id": task_id,
+                "session_id": session_id,
+                "role": "director",
+                "agent_instance_id": director_id,
+                "execution_epoch": execution_epoch,
+                "execution_epoch_id": execution_epoch,
+                "expected_manager_ids": expected,
+                "reported_manager_ids": reported_manager_ids,
+                "expected_count": len(expected),
+                "reported_count": len(reported_manager_ids),
+                "satisfied": reported_manager_ids == expected,
+                "status": "satisfied" if reported_manager_ids == expected else "blocked",
+            }
+            if not barrier["satisfied"]:
+                missing = sorted(set(expected) - set(reported_manager_ids))
+                raise RuntimeError(f"Manager report barrier incomplete; missing: {missing}")
+            if not report_barrier_emitted:
+                _persist_manager_report_barrier(repo, barrier)
+                contextual_event(barrier)
+                report_barrier_emitted = True
+            return barrier
+
+    register_agent_labels(plan, manager_ids)
     for stream in plan.workstreams:
         contextual_event(
             {
-                "type": "agent_started",
+                "type": "agent_planned",
                 "role": "manager",
                 "agent_instance_id": manager_ids[stream.id],
                 "workstream_id": stream.id,
                 "workstream_title": stream.title,
-                "status": "queued",
+                "status": "planned",
                 "goal": stream.goal,
                 "title": stream.title,
                 "dependencies": list(stream.dependencies),
@@ -1838,7 +3262,7 @@ def run_hierarchy(
                 )
         contextual_event(
             {
-                "type": "agent_progress",
+                "type": "agent_started",
                 "role": "manager",
                 "agent_instance_id": manager_id,
                 "workstream_id": stream.id,
@@ -1851,13 +3275,19 @@ def run_hierarchy(
             }
         )
         manager_result: ToolCallResult | None = None
+        planned: Workstream | None = None
+        previous_planner_error = ""
         for planner_attempt in range(1, config.PLANNER_COUNT_RETRIES + 2):
             planner_prompt = prompt
             if planner_attempt > 1:
                 planner_prompt += (
-                    "\n\n## REQUIRED CORRECTION\nChoose between 1 and "
-                    f"{coder_cap} coder work items. requested_worker_count must "
-                    "equal work_items.length and must not exceed the cap."
+                    "\n\n## REQUIRED CORRECTION\n"
+                    f"The previous plan was rejected: {previous_planner_error}\n"
+                    "Return a corrected plan. Every file_path and write_scopes "
+                    "entry must be one concrete text/code file, never a directory. "
+                    f"Choose between 1 and {coder_cap} coder work items. "
+                    "requested_worker_count must equal work_items.length and "
+                    "must not exceed the cap."
                 )
             candidate = llm_call(
                 MANAGER_PLAN_PROMPT,
@@ -1876,11 +3306,23 @@ def run_hierarchy(
                     maximum=coder_cap,
                     label="Manager",
                 )
-            except RuntimeError as exc:
+                if error is None:
+                    planned_candidate = _manager_stream_from_result(
+                        candidate,
+                        stream,
+                        bounds,
+                        max_coder_count=coder_cap,
+                    )
+                else:
+                    planned_candidate = None
+            except (RuntimeError, ValueError) as exc:
                 error = str(exc)
-            if error is None:
+                planned_candidate = None
+            if error is None and planned_candidate is not None:
                 manager_result = candidate
+                planned = planned_candidate
                 break
+            previous_planner_error = str(error or "invalid Manager plan")
             contextual_event(
                 {
                     "type": "planner_count_rejected",
@@ -1893,24 +3335,27 @@ def run_hierarchy(
                     "max_coder_count": coder_cap,
                 }
             )
-        if manager_result is None:
+        if manager_result is None or planned is None:
             raise RuntimeError(f"Manager did not return a valid plan within maximum {coder_cap}")
-        planned = _manager_stream_from_result(
-            manager_result,
-            stream,
-            bounds,
-            max_coder_count=coder_cap,
-        )
         if prior_stream is not None:
             prior_by_id = {item.id.split(":", 1)[-1]: item for item in prior_stream.work_items}
+            reconciled_items: list[WorkItem] = []
+            preserved_approved_ids: list[str] = []
             for item in planned.work_items:
                 short_id = item.id.split(":", 1)[-1]
                 prior_item = prior_by_id.get(short_id)
                 if prior_item is None:
+                    reconciled_items.append(item)
                     continue
                 was_approved = prior_item.id in previous_item_evidence
                 if was_approved and item.contract != prior_item.contract:
-                    raise RuntimeError(f"Approved item {item.id!r} changed its Work Contract")
+                    # Resume may re-ask a Manager for the remaining work. The
+                    # model is not allowed to invalidate accepted evidence by
+                    # rewriting an already-approved contract; preserve that
+                    # durable item and continue planning unfinished siblings.
+                    reconciled_items.append(prior_item)
+                    preserved_approved_ids.append(prior_item.id)
+                    continue
                 if (
                     item.contract != prior_item.contract
                     and item.contract.id == prior_item.contract.id
@@ -1920,6 +3365,23 @@ def run_hierarchy(
                         f"Changed Work Contract {item.contract.id!r} must "
                         "increment contract_version"
                     )
+                reconciled_items.append(item)
+            planned = replace(planned, work_items=tuple(reconciled_items))
+            if preserved_approved_ids:
+                contextual_event(
+                    {
+                        "type": "agent_progress",
+                        "role": "manager",
+                        "agent_instance_id": manager_id,
+                        "manager_id": manager_id,
+                        "workstream_id": stream.id,
+                        "status": "preserved_approved_contracts",
+                        "summary": (
+                            "Resume kept previously approved Work Contracts unchanged."
+                        ),
+                        "work_item_ids": preserved_approved_ids,
+                    }
+                )
         planned = replace(
             planned,
             manager_agent_id=manager_id,
@@ -1970,11 +3432,16 @@ def run_hierarchy(
         )
         return planned
 
-    # Eager-plan every Manager selected by the Director. Execution still
-    # follows the workstream DAG and separate parallel slots.
+    # Eager-plan every Manager selected by the Director. In maximum-parallelism
+    # mode no execution cap is allowed to leave a planned Manager idle.
     planned_revision = plan.revision
     with ThreadPoolExecutor(
-        max_workers=max(1, min(len(plan.workstreams), bounds.max_parallel_managers)),
+        max_workers=max(
+            1,
+            len(plan.workstreams)
+            if max_parallelism_enabled()
+            else min(len(plan.workstreams), bounds.max_parallel_managers),
+        ),
         thread_name_prefix="manager-plan",
     ) as pool:
         plan_futures = {
@@ -1988,6 +3455,8 @@ def run_hierarchy(
             try:
                 planned_by_id[stream.id] = future.result()
             except Exception as exc:
+                if isinstance(exc, llm_client.AccountPoolExhaustedError):
+                    raise
                 plan_errors[stream.id] = str(exc)
                 contextual_event(
                     {
@@ -2016,6 +3485,24 @@ def run_hierarchy(
                     },
                 )
             )
+    # Manager sub-plans are in, so the real inputs and outputs of every stream
+    # are known and a declared ordering can be checked against them instead of
+    # taken on trust.
+    ordered_streams, relaxed_dependencies = _relax_decorative_dependencies(ordered_streams)
+    if relaxed_dependencies:
+        contextual_event(
+            {
+                "type": "plan_dependencies_relaxed",
+                "role": "director",
+                "agent_instance_id": director_id,
+                "status": "ready",
+                "dropped": relaxed_dependencies,
+                "summary": (
+                    f"Released {len(relaxed_dependencies)} workstream dependency(ies) that no "
+                    "shared file justified, so those streams run in parallel."
+                ),
+            }
+        )
     plan = replace(
         plan,
         revision=planned_revision + 1,
@@ -2034,12 +3521,143 @@ def run_hierarchy(
         },
         updated_at=utc_now(),
     )
+    plan = _advance_conflicting_contract_versions(repo, plan)
     _persist_plan_contract_versions(repo, plan)
-    # Resolve and announce every planned logical child before preflight.  A
-    # preflight failure may correctly prevent model transport, but it must not
-    # make planned Workers/Testers disappear from the durable timeline or UI.
+    # Admit the plan before minting or announcing Worker/Tester identities.
+    # Contract paperwork is advisory; this list now contains only conditions
+    # that make execution impossible or unsafe. A rejected plan therefore
+    # cannot produce ghost Worker nodes that immediately become FAILED.
+    preflight_warnings: list[dict[str, Any]] = []
+    preflight_issues = _preflight_plan(
+        root=root,
+        plan=plan,
+        limits=bounds,
+        allow_new_files=allow_new_files,
+        test_cmd=test_cmd,
+        available_artifacts=persisted_handoff_artifacts,
+        warnings=preflight_warnings,
+    )
+    preflight_stopped_stream_ids: set[str] = set()
+    preflight_item_evidence: dict[str, dict[str, Any]] = {}
+    if preflight_issues:
+        admission_issues = list(preflight_issues)
+        directly_rejected = {
+            str(issue["workstream_id"])
+            for issue in admission_issues
+            if issue.get("workstream_id")
+        }
+        if any(not issue.get("workstream_id") for issue in admission_issues):
+            directly_rejected = {stream.id for stream in plan.workstreams}
+        preflight_stopped_stream_ids = set(directly_rejected)
+        if not max_parallelism_enabled():
+            changed = True
+            while changed:
+                changed = False
+                for stream in plan.workstreams:
+                    if stream.id in preflight_stopped_stream_ids:
+                        continue
+                    if any(
+                        dependency in preflight_stopped_stream_ids
+                        for dependency in stream.dependencies
+                    ):
+                        preflight_stopped_stream_ids.add(stream.id)
+                        changed = True
+
+        admitted_streams: list[Workstream] = []
+        for stream in plan.workstreams:
+            if stream.id not in preflight_stopped_stream_ids:
+                admitted_streams.append(stream)
+                continue
+            directly_failed = stream.id in directly_rejected
+            item_status = WorkStatus.FAILED if directly_failed else WorkStatus.BLOCKED
+            stopped_items = []
+            for item in stream.work_items:
+                stopped_items.append(replace(item, status=item_status))
+                preflight_item_evidence[item.id] = {
+                    "accepted": False,
+                    "status": "plan_rejected" if directly_failed else "blocked",
+                    "failure_kind": (
+                        "plan_admission" if directly_failed else "dependency"
+                    ),
+                    "retryable": False,
+                    "error": (
+                        "Plan admission rejected before Worker identity creation"
+                        if directly_failed
+                        else "Upstream plan was rejected before execution"
+                    ),
+                    "contract_id": item.contract.id,
+                    "contract_version": item.contract.version,
+                    "package_files": list(item.write_scopes),
+                }
+            admitted_streams.append(
+                replace(
+                    stream,
+                    status=WorkStatus.FAILED if directly_failed else WorkStatus.BLOCKED,
+                    work_items=tuple(stopped_items),
+                )
+            )
+            contextual_event(
+                {
+                    "type": "workstream_failed" if directly_failed else "workstream_blocked",
+                    "role": "manager",
+                    "agent_instance_id": stream.manager_agent_id,
+                    "workstream_id": stream.id,
+                    "status": "plan_rejected" if directly_failed else "blocked",
+                    "failure_kind": (
+                        "plan_admission" if directly_failed else "dependency"
+                    ),
+                    "summary": (
+                        "Workstream was rejected before any Worker or Tester "
+                        "identity was announced."
+                    ),
+                }
+            )
+
+        plan = replace(
+            plan,
+            workstreams=tuple(admitted_streams),
+            metadata={
+                **dict(plan.metadata),
+                "admission_issues": admission_issues,
+            },
+            updated_at=utc_now(),
+        )
+        contextual_event(
+            {
+                "type": (
+                    "plan_admission_rejected"
+                    if len(preflight_stopped_stream_ids) == len(plan.workstreams)
+                    else "plan_admission_partial"
+                ),
+                "role": "director",
+                "agent_instance_id": director_id,
+                "status": (
+                    "rejected"
+                    if len(preflight_stopped_stream_ids) == len(plan.workstreams)
+                    else "degraded"
+                ),
+                "failure_kind": "unsafe_or_unexecutable_plan",
+                "issues": admission_issues,
+                "rejected_workstream_ids": sorted(preflight_stopped_stream_ids),
+                "summary": (
+                    f"{len(preflight_stopped_stream_ids)} workstream(s) were rejected "
+                    "before any child identity was announced; safe workstreams continue."
+                ),
+            }
+        )
+        # The legacy post-announcement preflight failure branch below must
+        # never run. Rejected streams are already settled without child IDs.
+        preflight_issues = []
+    # Resolve and announce every admitted logical child. A queued event
+    # describes a planned identity; the actual spawn is emitted
+    # only after the ticket executor has built a runnable prompt.
     announced_streams: list[Workstream] = []
-    for stream in plan.workstreams:
+    pending_child_events: list[dict[str, Any]] = []
+    pending_delegations: list[tuple[str, str, WorkItem, str]] = []
+    for stream_index, stream in enumerate(plan.workstreams, start=1):
+        if stream.id in preflight_stopped_stream_ids:
+            announced_streams.append(stream)
+            continue
         manager_id = (
             stream.manager_agent_id
             or manager_ids.get(stream.id)
@@ -2050,14 +3668,19 @@ def run_hierarchy(
                 assignment_id=stream.id,
             )
         )
+        # Name each agent as its id is minted: the announcement below is the
+        # first event anyone sees, and a later bulk registration would leave
+        # every queued Worker showing a raw id in the UI and the terminal.
+        agent_labels[manager_id] = f"Manager {stream_index}"
         stamped_items: list[WorkItem] = []
-        for item in stream.work_items:
+        for item_index, item in enumerate(stream.work_items, start=1):
             worker_id = _resolve_repository_agent_id(
                 repo,
                 task_id=task_id,
                 role="worker",
                 assignment_id=item.id,
             )
+            agent_labels[worker_id] = f"Worker {stream_index}.{item_index}"
             stamped_items.append(
                 replace(
                     item,
@@ -2067,15 +3690,15 @@ def run_hierarchy(
                     },
                 )
             )
-            contextual_event(
+            pending_child_events.append(
                 {
-                    "type": "agent_started",
+                    "type": "agent_planned",
                     "role": "worker",
                     "agent_instance_id": worker_id,
                     "manager_id": manager_id,
                     "workstream_id": stream.id,
                     "work_item_id": item.id,
-                    "status": "queued",
+                    "status": "planned",
                     "goal": item.goal,
                     "title": item.title,
                     "contract": to_dict(item.contract),
@@ -2084,7 +3707,7 @@ def run_hierarchy(
                 }
             )
             if item.id in previous_item_evidence:
-                contextual_event(
+                pending_child_events.append(
                     {
                         "type": "agent_skipped",
                         "role": "worker",
@@ -2096,22 +3719,14 @@ def run_hierarchy(
                         "reason": "approved_resume_evidence",
                     }
                 )
-            signal(
-                manager_id,
-                worker_id,
-                "delegate_work_item",
-                f"Manager giao work item: {item.title}",
-                workstream_id=stream.id,
-                work_item_id=item.id,
-                contract=item.contract,
-                artifacts=item.contract.input_artifacts,
-            )
+            pending_delegations.append((manager_id, worker_id, item, stream.id))
         tester_id = _resolve_repository_agent_id(
             repo,
             task_id=task_id,
             role="tester",
             assignment_id=stream.id,
         )
+        agent_labels[tester_id] = f"Tester {stream_index}"
         announced_streams.append(
             replace(
                 stream,
@@ -2122,14 +3737,14 @@ def run_hierarchy(
                 },
             )
         )
-        contextual_event(
+        pending_child_events.append(
             {
-                "type": "agent_started",
+                "type": "agent_planned",
                 "role": "tester",
                 "agent_instance_id": tester_id,
                 "manager_id": manager_id,
                 "workstream_id": stream.id,
-                "status": "queued",
+                "status": "planned",
                 "goal": f"Review completed workstream: {stream.title}",
                 "title": f"Tester · {stream.title}",
                 "model": reviewer_model,
@@ -2139,7 +3754,7 @@ def run_hierarchy(
         if stream.work_items and all(
             item.id in previous_item_evidence for item in stream.work_items
         ):
-            contextual_event(
+            pending_child_events.append(
                 {
                     "type": "agent_skipped",
                     "role": "tester",
@@ -2150,11 +3765,38 @@ def run_hierarchy(
                     "reason": "approved_resume_evidence",
                 }
             )
+    planned_child_ids = [
+        str(item.metadata.get("worker_agent_id"))
+        for stream in announced_streams
+        for item in stream.work_items
+        if item.metadata.get("worker_agent_id")
+    ] + [
+        str(stream.metadata.get("tester_agent_id"))
+        for stream in announced_streams
+        if stream.metadata.get("tester_agent_id")
+    ]
+    if planned_child_ids:
+        llm_client.reserve_account_cohort(task_id, planned_child_ids)
+    for event in pending_child_events:
+        contextual_event(event)
+    for manager_id, worker_id, item, workstream_id in pending_delegations:
+        signal(
+            manager_id,
+            worker_id,
+            "delegate_work_item",
+            f"Manager giao work item: {item.title}",
+            workstream_id=workstream_id,
+            work_item_id=item.id,
+            contract=item.contract,
+            artifacts=item.contract.input_artifacts,
+        )
     plan = replace(
         plan,
         workstreams=tuple(announced_streams),
         updated_at=utc_now(),
     )
+    # Worker and tester ids only exist once the manager sub-plans are announced.
+    register_agent_labels(plan, manager_ids)
     planned_manager_ids = [
         str(stream.manager_agent_id or manager_ids[stream.id]) for stream in plan.workstreams
     ]
@@ -2201,26 +3843,38 @@ def run_hierarchy(
             "max_parallel_managers": bounds.max_parallel_managers,
             "max_parallel_workers_per_manager": bounds.worker_parallel_cap,
             "max_parallel_workers": bounds.max_parallel_workers,
-            "dependency_aware": True,
+            "dependency_aware": not max_parallelism_enabled(),
             "summary": (
                 f"Planned {len(planned_worker_ids)} coders + "
-                f"{len(planned_tester_ids)} testers; execution follows DAG "
-                f"dependencies with at most {bounds.max_parallel_workers} "
-                "concurrent worker pipelines."
+                f"{len(planned_tester_ids)} testers; "
+                + (
+                    "all coder model calls may start immediately."
+                    if max_parallelism_enabled()
+                    else (
+                        "execution follows DAG dependencies with at most "
+                        f"{bounds.max_parallel_workers} concurrent worker pipelines."
+                    )
+                )
             ),
         }
     )
-    preflight_issues = _preflight_plan(
-        root=root,
-        plan=plan,
-        limits=bounds,
-        allow_new_files=allow_new_files,
-        available_artifacts=persisted_handoff_artifacts,
-    )
-    # Streams settled by preflight before the executor starts, so the scheduler
-    # below skips them instead of re-running work that already has a verdict.
-    preflight_stopped_stream_ids: set[str] = set()
-    preflight_item_evidence: dict[str, dict[str, Any]] = {}
+    if preflight_warnings:
+        contextual_event(
+            {
+                "type": "plan_contract_warnings",
+                "role": "director",
+                "agent_instance_id": director_id,
+                "status": "ready",
+                "issues": preflight_warnings,
+                "summary": (
+                    f"{len(preflight_warnings)} contract detail(s) look inconsistent; "
+                    "execution continues."
+                ),
+            }
+        )
+    # Admission already settled rejected streams before child IDs were minted.
+    # The legacy branch remains only for replay compatibility and is unreachable
+    # for newly planned runs.
     if preflight_issues:
         preflight_evidence: dict[str, dict[str, Any]] = dict(previous_item_evidence)
         directly_failed_streams = {
@@ -2503,7 +4157,9 @@ def run_hierarchy(
                     call_outcomes=model_call_outcomes,
                     director_agent_id=director_id,
                     called_agent_ids=called_agent_ids,
+                    started_agent_ids=started_agent_ids,
                     agent_dispositions=agent_dispositions,
+                    agent_no_call_reasons=agent_no_call_reasons,
                     agent_call_purposes=agent_call_purposes,
                 )
             contextual_event(
@@ -2560,6 +4216,7 @@ def run_hierarchy(
             }
             llm_client.thread_local.event_sink = None
             llm_client.thread_local.agent_instance_id = None
+            release_known_agent_accounts()
             return result
 
     plan = replace(
@@ -2571,8 +4228,14 @@ def run_hierarchy(
     plan_lock = threading.RLock()
 
     project_lock = _project_lock_for(root)
-    worker_semaphore = threading.BoundedSemaphore(bounds.max_parallel_workers)
-    worker_submission_semaphore = threading.BoundedSemaphore(bounds.max_parallel_workers)
+    planned_worker_count = sum(len(stream.work_items) for stream in plan.workstreams)
+    worker_capacity = (
+        max(1, planned_worker_count)
+        if max_parallelism_enabled()
+        else bounds.max_parallel_workers
+    )
+    worker_semaphore = threading.BoundedSemaphore(worker_capacity)
+    worker_submission_semaphore = threading.BoundedSemaphore(worker_capacity)
     tester_locks = {
         str(stream.metadata["tester_agent_id"]): threading.Lock()
         for stream in plan.workstreams
@@ -2628,15 +4291,22 @@ def run_hierarchy(
         file_path: str,
         exc: BaseException,
     ) -> TicketExecutionResult:
+        if isinstance(exc, llm_client.AccountPoolExhaustedError):
+            raise exc
         error = f"{type(exc).__name__}: {exc}"
-        was_cancelled = isinstance(exc, llm_client.ModelRequestAborted) or task_cancelled()
-        preflight = isinstance(
-            exc,
-            (
-                FileNotFoundError,
-                IsADirectoryError,
-                safety.GitError,
-            ),
+        decision = retry_policy.classify_exception(exc)
+        was_cancelled = decision.failure_kind == "cancelled" or task_cancelled()
+        safety_rejection = decision.failure_kind in {
+            "safety",
+            "unsupported_binary",
+            "unsupported_worker_target",
+        } or isinstance(exc, safety.GitError)
+        failure_kind = (
+            "cancelled"
+            if was_cancelled
+            else "safety"
+            if isinstance(exc, safety.GitError)
+            else decision.failure_kind
         )
         return TicketExecutionResult(
             accepted=False,
@@ -2647,7 +4317,7 @@ def run_hierarchy(
             reviewer_verdict="not_run",
             next_instructions=(
                 "Kiểm tra project mode/path trước khi giao lại."
-                if preflight
+                if safety_rejection
                 else "Manager cần đổi chiến lược trước lần thử tiếp theo."
             ),
             patch_sha256=None,
@@ -2657,10 +4327,8 @@ def run_hierarchy(
             test_status="not_run",
             test_output="",
             error=error[:2000],
-            failure_kind=(
-                "cancelled" if was_cancelled else "preflight" if preflight else "backend_failure"
-            ),
-            retryable=not preflight and not was_cancelled,
+            failure_kind=failure_kind,
+            retryable=retry_policy.retryable_for_failure(failure_kind),
         )
 
     def execute_item(
@@ -2696,7 +4364,9 @@ def run_hierarchy(
                 "manager_id": manager_id,
                 "workstream_id": stream.id,
                 "work_item_id": item.id,
-                "status": "waiting_for_slot",
+                "status": (
+                    "starting" if max_parallelism_enabled() else "waiting_for_slot"
+                ),
                 "goal": item.goal,
                 "title": item.title,
             }
@@ -2709,7 +4379,7 @@ def run_hierarchy(
                 "manager_id": manager_id,
                 "workstream_id": stream.id,
                 "work_item_id": item.id,
-                "status": "queued",
+                "status": "waiting_for_worker_output",
                 "goal": f"Review {item.title}",
                 "title": f"Tester · {item.title}",
             }
@@ -2719,19 +4389,20 @@ def run_hierarchy(
         try:
             llm_client.thread_local.task_id = task_id
 
-            claim_acquired = scheduler.scope_claims.wait_acquire(
-                worker_id,
-                item.write_scopes,
-                timeout=config.SCOPE_CLAIM_TIMEOUT_SECONDS,
-                cancelled=task_cancelled,
-            )
-            if not claim_acquired:
-                if task_cancelled():
-                    raise llm_client.ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!")
-                raise RuntimeError(
-                    "Không lấy được write-scope claim sau "
-                    f"{config.SCOPE_CLAIM_TIMEOUT_SECONDS:g} giây"
+            if not max_parallelism_enabled():
+                claim_acquired = scheduler.scope_claims.wait_acquire(
+                    worker_id,
+                    item.write_scopes,
+                    timeout=config.SCOPE_CLAIM_TIMEOUT_SECONDS,
+                    cancelled=task_cancelled,
                 )
+                if not claim_acquired:
+                    if task_cancelled():
+                        raise llm_client.ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!")
+                    raise RuntimeError(
+                        "Không lấy được write-scope claim sau "
+                        f"{config.SCOPE_CLAIM_TIMEOUT_SECONDS:g} giây"
+                    )
             while not worker_semaphore.acquire(timeout=0.25):
                 if task_cancelled():
                     raise llm_client.ModelRequestAborted("🛑 Task đã bị hủy cưỡng chế!")
@@ -2742,50 +4413,58 @@ def run_hierarchy(
                 item.contract,
             )
             if missing_item_inputs:
-                error = (
-                    f"Work item {item.id!r} inputs were not materialized after "
-                    f"dependencies completed: {', '.join(missing_item_inputs)}"
-                )
+                # An absent input is a fact about the workspace, not a verdict
+                # on this agent. Whoever writes that file may still be running,
+                # or the planner may have named a file the goal never promised.
+                # Telling the worker is strictly better than refusing to let it
+                # start, which cost the run an agent it had already planned.
                 contextual_event(
                     {
-                        "type": "preflight_failed",
+                        "type": "agent_progress",
                         "role": "worker",
                         "agent_instance_id": worker_id,
                         "manager_id": manager_id,
                         "workstream_id": stream.id,
                         "work_item_id": item.id,
-                        "status": "preflight_failed",
-                        "error": error,
-                        "failure_kind": "missing_contract_input",
-                        "issues": [
-                            {
-                                "code": "missing_contract_input",
-                                "message": error,
-                                "paths": list(missing_item_inputs),
-                            }
-                        ],
+                        "status": "running",
+                        "summary": (
+                            "Starting without "
+                            f"{', '.join(missing_item_inputs)}; "
+                            "those inputs do not exist yet."
+                        ),
+                        "missing_inputs": list(missing_item_inputs),
                     }
-                )
-                return failed_execution(
-                    str(item.metadata.get("file_path") or item.id),
-                    FileNotFoundError(error),
                 )
             contextual_event(
                 {
-                    "type": "agent_started",
+                    # The ticket executor emits agent_started only after it has
+                    # validated the target and built the actual Worker prompt.
+                    # Until then this is preparation, not a spawned model call.
+                    "type": "agent_progress",
                     "role": "worker",
                     "agent_instance_id": worker_id,
                     "manager_id": manager_id,
                     "workstream_id": stream.id,
                     "work_item_id": item.id,
-                    "status": "running",
+                    "status": "starting",
                     "goal": item.goal,
                     "title": item.title,
                 }
             )
 
+            missing_input_note = (
+                "\n\n## INPUTS NOT PRESENT YET\n"
+                + "\n".join(f"- {path}" for path in missing_item_inputs)
+                + "\nWrite against the contract and the goal rather than reading "
+                "these files, and do not assume their contents.\n"
+                if missing_item_inputs
+                else ""
+            )
+            declared_input_context = _contract_input_context(root, item.contract)
             instructions = (
                 str(item.metadata["instructions"])
+                + missing_input_note
+                + declared_input_context
                 + "\n\n## TYPED WORK CONTRACT\n"
                 + json.dumps(
                     to_dict(item.contract),
@@ -2799,13 +4478,14 @@ def run_hierarchy(
                 instructions += (
                     "\n\n## MANAGER RECOVERY INSTRUCTIONS\n" + instruction_overrides[item.id]
                 )
-            previous_numbers = [attempt.number for attempt in repo.list_attempts(task_id, item.id)]
+            persisted_attempts = repo.list_attempts(task_id, item.id)
+            previous_numbers = [attempt.number for attempt in persisted_attempts]
             first_attempt_number = max(previous_numbers, default=0) + 1
             completed_files = completed_package_files.setdefault(item.id, set())
-            for attempt_number in range(
-                first_attempt_number,
-                first_attempt_number + max_attempts_per_item,
-            ):
+            work_lease_id = f"task/{task_id}/work-item/{item.id}"
+            # One invocation is one factual Attempt. Any subsequent invocation
+            # must be authorized by the crisis strategy in execute_stream.
+            for attempt_number in (first_attempt_number,):
                 active_worker_model, active_worker_effort = _resolve_agent_config(
                     agent_config_resolver,
                     agent_id=worker_id,
@@ -2821,7 +4501,7 @@ def run_hierarchy(
                     effort=reviewer_effort,
                 )
                 attempt_id = new_id("attempt")
-                if not scheduler.acquire_work_lease(item.id, worker_id, 900):
+                if not scheduler.acquire_work_lease(work_lease_id, worker_id, 900):
                     raise RuntimeError(f"Work item {item.id} đang có lease khác")
                 attempt = Attempt(
                     id=attempt_id,
@@ -2857,7 +4537,7 @@ def run_hierarchy(
                 file_index = 0
                 target_file = str(item.metadata.get("file_path") or item.id)
                 try:
-                    package_files = _package_files(item)
+                    package_files = _package_files(item, root=root)
                     pending_files = [path for path in package_files if path not in completed_files]
                     if not pending_files:
                         prior = item_evidence.get(item.id, {})
@@ -2878,6 +4558,7 @@ def run_hierarchy(
                             syntax_status=str(prior.get("syntax_status") or "not_run"),
                             test_status=str(prior.get("test_status") or "not_run"),
                             test_output=str(prior.get("test_output") or ""),
+                            test_scope=str(prior.get("test_scope") or "item"),
                         )
                         file_index = len(package_files)
                     for target_file in pending_files:
@@ -2906,7 +4587,6 @@ def run_hierarchy(
                             allow_new_files=allow_new_files,
                             llm_call=llm_call,
                             on_event=contextual_event,
-                            on_file_approved=on_file_approved,
                             execution_lock=project_lock,
                             tester_lock=tester_locks[tester_id],
                             effect_repository=repo,
@@ -2930,11 +4610,60 @@ def run_hierarchy(
                             ),
                             approval_callback=approval_callback,
                             cancelled=task_cancelled,
+                            defer_tests_to_integration=bool(
+                                item.metadata.get("contract_mode") == "typed"
+                                and item.contract is not None
+                                and test_evidence.requires_integration_test(
+                                    item.contract.test_requirements
+                                )
+                            ),
                         )
                         if not last.accepted:
                             break
                         completed_files.add(target_file)
                 except BaseException as exc:
+                    if isinstance(exc, _AccountPoolFatalSignal):
+                        repo.save_attempt(
+                            replace(
+                                attempt,
+                                status=AttemptStatus.FAILED,
+                                finished_at=utc_now(),
+                                evidence={
+                                    "accepted": False,
+                                    "status": "failed",
+                                    "failure_kind": "account_pool_exhausted",
+                                    "retryable": False,
+                                    "error": str(exc.cause),
+                                    "contract_id": item.contract.id,
+                                    "contract_version": item.contract.version,
+                                    "package_files": package_files,
+                                    "completed_file_paths": sorted(completed_files),
+                                },
+                                error=str(exc.cause),
+                            )
+                        )
+                        raise exc.cause
+                    if isinstance(exc, llm_client.AccountPoolExhaustedError):
+                        repo.save_attempt(
+                            replace(
+                                attempt,
+                                status=AttemptStatus.FAILED,
+                                finished_at=utc_now(),
+                                evidence={
+                                    "accepted": False,
+                                    "status": "failed",
+                                    "failure_kind": "account_pool_exhausted",
+                                    "retryable": False,
+                                    "error": str(exc),
+                                    "contract_id": item.contract.id,
+                                    "contract_version": item.contract.version,
+                                    "package_files": package_files,
+                                    "completed_file_paths": sorted(completed_files),
+                                },
+                                error=str(exc),
+                            )
+                        )
+                        raise
                     last = failed_execution(target_file, exc)
                     contextual_event(
                         {
@@ -2952,8 +4681,6 @@ def run_hierarchy(
                             "status": (
                                 "cancelled"
                                 if last.failure_kind == "cancelled"
-                                else "preflight_failed"
-                                if last.failure_kind == "preflight"
                                 else "failed"
                             ),
                             "error": last.error,
@@ -3022,7 +4749,7 @@ def run_hierarchy(
                         error=last.error or None,
                     )
                 )
-                scheduler.release_work_lease(item.id, worker_id)
+                scheduler.release_work_lease(work_lease_id, worker_id)
                 contextual_event(
                     {
                         "type": "execution_result",
@@ -3055,18 +4782,14 @@ def run_hierarchy(
                         "attempt_id": attempt_id,
                     },
                 )
-                if last.accepted:
-                    break
-                if not last.retryable:
-                    break
-                instructions += "\n\n## RETRY EVIDENCE\n" + (
-                    last.next_instructions or last.error or last.execution_result
-                )
             assert last is not None
             return last
         finally:
             llm_client.thread_local.execution_attempt_id = None
-            scheduler.release_work_lease(item.id, worker_id)
+            scheduler.release_work_lease(
+                f"task/{task_id}/work-item/{item.id}",
+                worker_id,
+            )
             if claim_acquired:
                 scheduler.scope_claims.release(worker_id)
             if worker_slot_acquired:
@@ -3103,69 +4826,23 @@ def run_hierarchy(
             stream.contract,
         )
         if missing_stream_inputs:
-            error = (
-                f"Workstream {stream.id!r} inputs were not materialized after "
-                f"dependencies completed: {', '.join(missing_stream_inputs)}"
-            )
-            for item in stream.work_items:
-                if statuses[item.id] == WorkStatus.APPROVED:
-                    continue
-                statuses[item.id] = WorkStatus.BLOCKED
-                item_statuses[item.id] = WorkStatus.BLOCKED
-                item_evidence[item.id] = {
-                    "accepted": False,
-                    "status": "blocked",
-                    "error": error,
-                    "failure_kind": "dependency_input",
-                    "retryable": False,
-                    "blocked_by": list(stream.dependencies),
-                }
-                contextual_event(
-                    {
-                        "type": "agent_blocked",
-                        "role": "worker",
-                        "agent_instance_id": item.metadata.get("worker_agent_id"),
-                        "manager_id": manager_id,
-                        "workstream_id": stream.id,
-                        "work_item_id": item.id,
-                        "status": "blocked",
-                        "failure_kind": "dependency_input",
-                        "blocked_by": list(stream.dependencies),
-                        "summary": error,
-                    }
-                )
+            # Blocking the whole workstream here cost five planned coders their
+            # turn because one declared input had not appeared yet. The worker
+            # is told what is absent and writes against the contract instead.
             contextual_event(
                 {
-                    "type": "agent_blocked",
-                    "role": "tester",
-                    "agent_instance_id": tester_id,
-                    "manager_id": manager_id,
-                    "workstream_id": stream.id,
-                    "status": "blocked",
-                    "failure_kind": "dependency_input",
-                    "blocked_by": list(stream.dependencies),
-                    "summary": "Tester was not called because workstream inputs are missing.",
-                }
-            )
-            contextual_event(
-                {
-                    "type": "preflight_failed",
+                    "type": "agent_progress",
                     "role": "manager",
                     "agent_instance_id": manager_id,
                     "workstream_id": stream.id,
-                    "status": "preflight_failed",
-                    "error": error,
-                    "failure_kind": "dependency_input",
-                    "issues": [
-                        {
-                            "code": "missing_contract_input",
-                            "message": error,
-                            "paths": list(missing_stream_inputs),
-                        }
-                    ],
+                    "status": "running",
+                    "summary": (
+                        f"Starting without {', '.join(missing_stream_inputs)}; "
+                        "those inputs do not exist yet."
+                    ),
+                    "missing_inputs": list(missing_stream_inputs),
                 }
             )
-            return stream.id, False
         contextual_event(
             {
                 "type": "workstream_started",
@@ -3176,8 +4853,102 @@ def run_hierarchy(
                 "goal": stream.goal,
             }
         )
-        max_recovery_cycles = max(0, config.MANAGER_RECOVERY_CYCLES)
-        for recovery_cycle in range(max_recovery_cycles + 1):
+
+        def abandon_incomplete(reason: str) -> None:
+            for item in stream.work_items:
+                current = statuses.get(item.id, WorkStatus.PENDING)
+                if current in {WorkStatus.APPROVED, WorkStatus.CANCELLED}:
+                    continue
+                worker_id = str(item.metadata.get("worker_agent_id") or "")
+                attempted = bool(repo.list_attempts(task_id, item.id)) or worker_id in {
+                    *started_agent_ids,
+                    *called_agent_ids,
+                }
+                terminal_status = (
+                    WorkStatus.ABANDONED if attempted else WorkStatus.SKIPPED
+                )
+                statuses[item.id] = terminal_status
+                item_statuses[item.id] = terminal_status
+                existing = dict(item_evidence.get(item.id) or {})
+                failure_kind = (
+                    "agent_abandoned"
+                    if terminal_status == WorkStatus.ABANDONED
+                    else "dependency_skipped"
+                )
+                item_evidence[item.id] = {
+                    **existing,
+                    "accepted": False,
+                    "status": terminal_status.value,
+                    "failure_kind": failure_kind,
+                    "retryable": False,
+                    "error": str(existing.get("error") or reason),
+                }
+                if terminal_status == WorkStatus.ABANDONED:
+                    contextual_event(
+                        {
+                            "type": "agent_abandoned",
+                            "role": "worker",
+                            "agent_instance_id": worker_id,
+                            "manager_id": manager_id,
+                            "workstream_id": stream.id,
+                            "work_item_id": item.id,
+                            "status": "abandoned",
+                            "reason": reason,
+                            "failure_kind": "agent_abandoned",
+                            "artifacts": sorted(
+                                completed_package_files.get(item.id, set())
+                            ),
+                            "log_refs": [],
+                        }
+                    )
+                    contextual_event(
+                        {
+                            "type": "work_item_abandoned",
+                            "role": "worker",
+                            "agent_instance_id": worker_id,
+                            "manager_id": manager_id,
+                            "workstream_id": stream.id,
+                            "work_item_id": item.id,
+                            "status": "abandoned",
+                            "reason": reason,
+                            "failure_kind": "agent_abandoned",
+                            "artifacts": sorted(
+                                completed_package_files.get(item.id, set())
+                            ),
+                            "log_refs": [],
+                        }
+                    )
+                else:
+                    contextual_event(
+                        {
+                            "type": "agent_skipped",
+                            "role": "worker",
+                            "agent_instance_id": worker_id,
+                            "manager_id": manager_id,
+                            "workstream_id": stream.id,
+                            "work_item_id": item.id,
+                            "status": "skipped",
+                            "reason": reason,
+                        }
+                    )
+                    contextual_event(
+                        {
+                            "type": "work_item_skipped",
+                            "role": "worker",
+                            "agent_instance_id": worker_id,
+                            "manager_id": manager_id,
+                            "workstream_id": stream.id,
+                            "work_item_id": item.id,
+                            "status": "skipped",
+                            "reason": reason,
+                            "blocked_by": list(item.dependencies),
+                        }
+                    )
+                if worker_id:
+                    llm_client.release_agent_account(worker_id)
+
+        recovery_cycle = 0
+        while True:
             while any(status == WorkStatus.PENDING for status in statuses.values()):
                 if task_cancelled():
                     for item_id, status in list(statuses.items()):
@@ -3222,7 +4993,7 @@ def run_hierarchy(
                                 "status": "blocked",
                                 "error": "blocked by failed dependency",
                                 "failure_kind": "dependency",
-                                "retryable": True,
+                                "retryable": retry_policy.retryable_for_failure("dependency"),
                             }
                             item = next(
                                 candidate
@@ -3256,15 +5027,19 @@ def run_hierarchy(
                         continue
                     selected = ready[:1]
                 with ThreadPoolExecutor(
-                    max_workers=min(
-                        len(selected),
-                        stream.requested_worker_count,
-                        bounds.worker_parallel_cap,
+                    max_workers=(
+                        len(selected)
+                        if max_parallelism_enabled()
+                        else min(
+                            len(selected),
+                            stream.requested_worker_count,
+                            bounds.worker_parallel_cap,
+                        )
                     ),
                     thread_name_prefix=f"workers-{stream.id}",
                 ) as pool:
                     futures = {}
-                    for item in selected:
+                    for launch_index, item in enumerate(selected):
                         submission_acquired = False
                         while not submission_acquired:
                             submission_acquired = worker_submission_semaphore.acquire(timeout=0.25)
@@ -3275,6 +5050,14 @@ def run_hierarchy(
                         if task_cancelled():
                             worker_submission_semaphore.release()
                             continue
+                        # Workers start as soon as they are selected, but a short
+                        # gap between launches keeps a whole batch from hitting
+                        # the provider on the same instant.
+                        if launch_index and _worker_launch_stagger_seconds():
+                            _sleep_unless_cancelled(
+                                _worker_launch_stagger_seconds(),
+                                task_cancelled,
+                            )
                         try:
                             future = pool.submit(execute_item, stream, item, tester_id)
                         except BaseException:
@@ -3289,7 +5072,10 @@ def run_hierarchy(
                         try:
                             execution = future.result()
                         except Exception as exc:
+                            if isinstance(exc, llm_client.AccountPoolExhaustedError):
+                                raise
                             was_cancelled = task_cancelled()
+                            retry_decision = retry_policy.classify_exception(exc)
                             terminal_status = (
                                 WorkStatus.CANCELLED if was_cancelled else WorkStatus.FAILED
                             )
@@ -3298,8 +5084,12 @@ def run_hierarchy(
                             item_evidence[item.id] = {
                                 "accepted": False,
                                 "error": f"{type(exc).__name__}: {exc}",
-                                "failure_kind": ("cancelled" if was_cancelled else "scheduler"),
-                                "retryable": not was_cancelled,
+                                "failure_kind": (
+                                    "cancelled" if was_cancelled else retry_decision.failure_kind
+                                ),
+                                "retryable": (
+                                    False if was_cancelled else retry_decision.retryable
+                                ),
                                 "contract_id": item.contract.id,
                                 "contract_version": item.contract.version,
                             }
@@ -3409,8 +5199,8 @@ def run_hierarchy(
                 f"## WORKSTREAM\n{stream.title}\n{stream.goal}\n\n"
                 "## ACCEPTANCE\n- "
                 + "\n- ".join(stream.acceptance_criteria)
-                + "\n\n## RECOVERY CYCLE\n"
-                + f"{recovery_cycle}/{max_recovery_cycles}\n"
+                + "\n\n## REMEDIATION GENERATION\n"
+                + f"{recovery_cycle}\n"
                 + "\n## ITEM STATUS\n"
                 + json.dumps(
                     {key: value.value for key, value in statuses.items()},
@@ -3436,31 +5226,18 @@ def run_hierarchy(
                 and manager_review.tool_input.get("verdict") == "approved"
             )
             if approved:
-                event_type = "workstream_completed"
-            elif recovery_cycle < max_recovery_cycles:
-                event_type = "manager_replan_created"
-            else:
-                event_type = "workstream_failed"
-            contextual_event(
-                {
-                    "type": event_type,
-                    "role": "manager",
-                    "agent_instance_id": manager_id,
-                    "workstream_id": stream.id,
-                    "status": (
-                        "approved"
-                        if approved
-                        else "replanning"
-                        if event_type == "manager_replan_created"
-                        else "failed"
-                    ),
-                    "recovery_cycle": recovery_cycle,
-                    "verdict": manager_review.tool_input.get("verdict"),
-                    "summary": manager_review.tool_input.get("summary"),
-                    "next_instructions": manager_review.tool_input.get("next_instructions"),
-                }
-            )
-            if approved:
+                contextual_event(
+                    {
+                        "type": "workstream_completed",
+                        "role": "manager",
+                        "agent_instance_id": manager_id,
+                        "workstream_id": stream.id,
+                        "status": "approved",
+                        "remediation_generation": recovery_cycle,
+                        "verdict": manager_review.tool_input.get("verdict"),
+                        "summary": manager_review.tool_input.get("summary"),
+                    }
+                )
                 signal(
                     manager_id,
                     director_id,
@@ -3477,34 +5254,151 @@ def run_hierarchy(
                 item_id
                 for item_id, status in statuses.items()
                 if status in {WorkStatus.FAILED, WorkStatus.BLOCKED}
-                and item_evidence.get(item_id, {}).get("retryable", True)
+                and item_evidence.get(item_id, {}).get("retryable") is True
             ]
-            if recovery_cycle >= max_recovery_cycles or not retryable_ids:
+            affected_ids = retryable_ids or [
+                item_id
+                for item_id, status in statuses.items()
+                if status != WorkStatus.APPROVED
+            ]
+            if not affected_ids and statuses:
+                # The backend evidence passed but the Manager rejected the
+                # workstream contract. Reopen those factual outputs only when
+                # the crisis strategy supplies a remediation.
+                affected_ids = list(statuses)
+            next_instructions = str(
+                manager_review.tool_input.get("next_instructions") or ""
+            ).strip()
+            crisis_id = new_id("crisis")
+            failure_kinds = sorted(
+                {
+                    str(item_evidence.get(item_id, {}).get("failure_kind") or "manager_review")
+                    for item_id in affected_ids
+                }
+            )
+            crisis_context = {
+                "crisis_id": crisis_id,
+                "scope": "workstream",
+                "task_id": task_id,
+                "session_id": session_id,
+                "execution_epoch": execution_epoch,
+                "manager_id": manager_id,
+                "workstream_id": stream.id,
+                "failure_kind": ",".join(failure_kinds) or "manager_review",
+                "reason": str(
+                    manager_review.tool_input.get("summary")
+                    or "Manager requested remediation"
+                ),
+                "retryable": bool(retryable_ids or next_instructions),
+                "affected_manager_ids": [manager_id],
+                "affected_work_item_ids": affected_ids,
+                "errors": {
+                    item_id: item_evidence.get(item_id, {}).get("error")
+                    for item_id in affected_ids
+                },
+                "suggested_instructions": next_instructions,
+            }
+            contextual_event({"type": "crisis_detected", **crisis_context})
+            remediation = _decide_remediation(crisis_strategy, crisis_context)
+            remediation, remediation_attempt_id = _reserve_remediation_attempt(
+                repo,
+                context=crisis_context,
+                decision=remediation,
+            )
+            if not remediation.retries or not affected_ids:
+                reason = remediation.reason or crisis_context["reason"]
+                for item_id in affected_ids:
+                    if statuses.get(item_id) == WorkStatus.APPROVED:
+                        statuses[item_id] = WorkStatus.FAILED
+                        item_statuses[item_id] = WorkStatus.FAILED
+                        item_evidence[item_id] = {
+                            **dict(item_evidence.get(item_id) or {}),
+                            "accepted": False,
+                            "failure_kind": "manager_review",
+                            "retryable": False,
+                            "error": reason,
+                        }
+                abandon_incomplete(reason)
+                has_approved = any(
+                    statuses.get(item.id) == WorkStatus.APPROVED
+                    for item in stream.work_items
+                )
+                contextual_event(
+                    {
+                        "type": "remediation_exhausted",
+                        **crisis_context,
+                        "reason": reason,
+                    }
+                )
+                contextual_event(
+                    {
+                        "type": (
+                            "workstream_completed" if has_approved else "workstream_failed"
+                        ),
+                        "role": "manager",
+                        "agent_instance_id": manager_id,
+                        "workstream_id": stream.id,
+                        "status": "partial" if has_approved else "abandoned",
+                        "failure_kind": "remediation_exhausted",
+                        "summary": reason,
+                    }
+                )
                 signal(
                     manager_id,
                     director_id,
                     "workstream_result",
-                    f"Manager báo workstream {stream.title}: revise",
+                    f"Manager báo workstream {stream.title}: "
+                    f"{'partial' if has_approved else 'revise'}",
                     workstream_id=stream.id,
                     contract=stream.contract,
                     artifacts=stream.contract.expected_outputs,
-                    evidence={"status": "revise"},
+                    evidence={"status": "partial" if has_approved else "revise"},
                 )
-                return stream.id, False
-            next_instructions = str(
-                manager_review.tool_input.get("next_instructions") or ""
-            ).strip()
-            for item_id in retryable_ids:
+                # Keep the DAG alive when this stream still produced approved
+                # work. Downstream workers already tolerate missing inputs.
+                return stream.id, has_approved
+
+            remediation_event = {
+                "crisis_id": crisis_id,
+                "scope": "workstream",
+                "role": "manager",
+                "agent_instance_id": manager_id,
+                "manager_id": manager_id,
+                "workstream_id": stream.id,
+                "action": remediation.action,
+                "reason": remediation.reason,
+                "instructions": remediation.instructions or next_instructions,
+                "affected_manager_ids": [manager_id],
+                "affected_work_item_ids": affected_ids,
+            }
+            contextual_event({"type": "remediation_started", **remediation_event})
+            contextual_event(
+                {
+                    "type": "manager_replan_created",
+                    **remediation_event,
+                    "status": "replanning",
+                    "remediation_generation": recovery_cycle + 1,
+                    "summary": manager_review.tool_input.get("summary"),
+                    "next_instructions": remediation_event["instructions"],
+                }
+            )
+            for item_id in affected_ids:
                 statuses[item_id] = WorkStatus.PENDING
                 item_statuses[item_id] = WorkStatus.PENDING
-                if next_instructions:
-                    instruction_overrides[item_id] = next_instructions
+                if remediation_event["instructions"]:
+                    instruction_overrides[item_id] = remediation_event["instructions"]
             # Items blocked only by a retried dependency must become schedulable.
             for item_id, status in list(statuses.items()):
                 if status == WorkStatus.BLOCKED:
                     statuses[item_id] = WorkStatus.PENDING
                     item_statuses[item_id] = WorkStatus.PENDING
-        return stream.id, False
+            recovery_cycle += 1
+            contextual_event({"type": "remediation_applied", **remediation_event})
+            _complete_remediation_attempt(
+                repo,
+                remediation_attempt_id,
+                details=remediation_event,
+            )
 
     def run_ready_stream(stream: Workstream) -> tuple[str, bool]:
         return execute_stream(stream)
@@ -3574,7 +5468,7 @@ def run_hierarchy(
             if not ready_streams:
                 for stream in snapshot.workstreams:
                     if stream_status.get(stream.id) == WorkStatus.PENDING:
-                        stream_status[stream.id] = WorkStatus.BLOCKED
+                        stream_status[stream.id] = WorkStatus.SKIPPED
                         blocked_by = [
                             dependency
                             for dependency in stream.dependencies
@@ -3586,53 +5480,58 @@ def run_hierarchy(
                                 WorkStatus.READY,
                             }:
                                 continue
-                            item_statuses[item.id] = WorkStatus.BLOCKED
+                            item_statuses[item.id] = WorkStatus.SKIPPED
                             item_evidence[item.id] = {
                                 "accepted": False,
-                                "status": "blocked",
-                                "error": "blocked by failed upstream workstream",
-                                "failure_kind": "dependency",
+                                "status": "skipped",
+                                "error": "skipped because an upstream workstream was abandoned",
+                                "failure_kind": "dependency_skipped",
                                 "retryable": False,
                                 "blocked_by": blocked_by,
                             }
                             contextual_event(
                                 {
-                                    "type": "agent_blocked",
+                                    "type": "agent_skipped",
                                     "role": "worker",
                                     "agent_instance_id": item.metadata.get("worker_agent_id"),
                                     "manager_id": stream.manager_agent_id,
                                     "workstream_id": stream.id,
                                     "work_item_id": item.id,
-                                    "status": "blocked",
-                                    "failure_kind": "dependency",
+                                    "status": "skipped",
+                                    "reason": "upstream_workstream_abandoned",
                                     "blocked_by": blocked_by,
-                                    "summary": (
-                                        "Worker was not started because an upstream "
-                                        "workstream did not complete."
-                                    ),
+                                }
+                            )
+                            contextual_event(
+                                {
+                                    "type": "work_item_skipped",
+                                    "role": "worker",
+                                    "agent_instance_id": item.metadata.get("worker_agent_id"),
+                                    "manager_id": stream.manager_agent_id,
+                                    "workstream_id": stream.id,
+                                    "work_item_id": item.id,
+                                    "status": "skipped",
+                                    "reason": "upstream_workstream_abandoned",
+                                    "blocked_by": blocked_by,
                                 }
                             )
                         tester_id = stream.metadata.get("tester_agent_id")
                         if tester_id:
                             contextual_event(
                                 {
-                                    "type": "agent_blocked",
+                                    "type": "agent_skipped",
                                     "role": "tester",
                                     "agent_instance_id": tester_id,
                                     "manager_id": stream.manager_agent_id,
                                     "workstream_id": stream.id,
-                                    "status": "blocked",
-                                    "failure_kind": "dependency",
+                                    "status": "skipped",
+                                    "reason": "upstream_workstream_abandoned",
                                     "blocked_by": blocked_by,
-                                    "summary": (
-                                        "Tester was not called because its upstream "
-                                        "workstream dependency failed."
-                                    ),
                                 }
                             )
                         contextual_event(
                             {
-                                "type": "workstream_blocked",
+                                "type": "workstream_skipped",
                                 "role": "manager",
                                 "agent_instance_id": (
                                     stream.manager_agent_id
@@ -3645,9 +5544,10 @@ def run_hierarchy(
                                     )
                                 ),
                                 "workstream_id": stream.id,
-                                "status": "blocked",
+                                "status": "skipped",
+                                "reason": "upstream_workstream_abandoned",
                                 "blocked_by": blocked_by,
-                                "summary": "Blocked by failed upstream workstream",
+                                "summary": "Skipped after upstream workstream abandonment",
                             }
                         )
                 return
@@ -3664,6 +5564,8 @@ def run_hierarchy(
                     try:
                         stream_id, approved = future.result()
                     except Exception as exc:
+                        if isinstance(exc, llm_client.AccountPoolExhaustedError):
+                            raise
                         stream_id, approved = stream.id, False
                         contextual_event(
                             {
@@ -3685,77 +5587,420 @@ def run_hierarchy(
                             item_statuses.get(item.id) == WorkStatus.CANCELLED
                             for item in stream.work_items
                         )
-                        else WorkStatus.FAILED
+                        else WorkStatus.ABANDONED
                     )
 
     integration_status = "not_run"
     integration_output = ""
     integration_details: dict[str, Any] = {}
-    integration_retryable = True
-    director_verdict = "revise"
-    director_summary = "Hierarchy failed before integration approval."
-    all_approved = False
+    integration_required = bool(test_cmd) or any(
+        item.metadata.get("contract_mode") == "typed"
+        and item.contract is not None
+        and test_evidence.requires_integration_test(item.contract.test_requirements)
+        for stream in plan.workstreams
+        for item in stream.work_items
+    )
+    backend_gate_approved = False
     cancelled_run = False
-    max_director_recovery = max(0, config.DIRECTOR_RECOVERY_CYCLES)
-    for director_cycle in range(max_director_recovery + 1):
+    integration_generation = 0
+
+    # Integration remediation is still execution. It must finish before any
+    # Manager publishes its immutable terminal report.
+    while True:
         drain_workstreams()
         if task_cancelled() or any(
             status == WorkStatus.CANCELLED for status in stream_status.values()
         ):
             cancelled_run = True
-            director_verdict = "revise"
-            director_summary = "Task stopped before hierarchy completion."
             break
-        workstreams_approved = all(
+        any_workstream_approved = any(
             status == WorkStatus.APPROVED for status in stream_status.values()
         )
-        integration_status = "not_run"
-        integration_output = ""
-        integration_details = {}
-        integration_retryable = True
-        backend_gate_approved = workstreams_approved
-        if workstreams_approved:
-            with project_lock:
-                (
-                    integration_status,
-                    integration_output,
-                    integration_details,
-                ) = safety.run_sandbox_tests_detailed(
-                    root,
-                    test_cmd,
-                    cancelled=task_cancelled,
-                )
-            sandbox_outcome = str(integration_details.get("sandbox_outcome") or "")
-            integration_retryable = sandbox_outcome not in {
-                "blocked",
-                "unavailable",
+        if not any_workstream_approved:
+            integration_status = "not_run"
+            break
+        if not integration_required:
+            integration_status = "not_required"
+            backend_gate_approved = True
+            break
+
+        with project_lock:
+            (
+                integration_status,
+                integration_output,
+                integration_details,
+            ) = safety.run_sandbox_tests_detailed(
+                root,
+                test_cmd,
+                cancelled=task_cancelled,
+            )
+        if task_cancelled():
+            cancelled_run = True
+            break
+        sandbox_outcome = str(integration_details.get("sandbox_outcome") or "")
+        integration_retryable = (
+            integration_status == "failed"
+            and sandbox_outcome not in {"blocked", "unavailable"}
+        )
+        backend_gate_approved = test_evidence.integration_test_passed(integration_status)
+        for stream in plan.workstreams:
+            for item in stream.work_items:
+                if (
+                    item.metadata.get("contract_mode") != "typed"
+                    or item.contract is None
+                    or not test_evidence.requires_integration_test(
+                        item.contract.test_requirements
+                    )
+                ):
+                    continue
+                evidence = item_evidence.setdefault(item.id, {})
+                evidence["integration_status"] = integration_status
+                evidence["test_status"] = integration_status
+                evidence["test_scope"] = "integration"
+                evidence["test_output"] = integration_output[-12000:]
+                persisted_item_attempts = repo.list_attempts(task_id, item.id)
+                if persisted_item_attempts:
+                    latest_attempt = max(
+                        persisted_item_attempts,
+                        key=lambda value: value.number,
+                    )
+                    repo.save_attempt(
+                        replace(
+                            latest_attempt,
+                            evidence={
+                                **dict(latest_attempt.evidence),
+                                "integration_status": integration_status,
+                                "test_status": integration_status,
+                                "test_scope": "integration",
+                                "test_output": integration_output[-12000:],
+                            },
+                        )
+                    )
+        contextual_event(
+            {
+                "type": "integration_result",
+                "role": "director",
+                "agent_instance_id": director_id,
+                "status": (
+                    "blocked"
+                    if sandbox_outcome in {"blocked", "unavailable"}
+                    else integration_status
+                ),
+                "accepted": backend_gate_approved,
+                "retryable": integration_retryable,
+                "failure_kind": (
+                    "sandbox_unavailable"
+                    if sandbox_outcome == "unavailable"
+                    else "sandbox_blocked"
+                    if sandbox_outcome == "blocked"
+                    else ""
+                ),
+                "command": " ".join(test_cmd or []),
+                "detail": integration_output[-12000:],
+                **integration_details,
             }
-            backend_gate_approved = integration_status != "failed"
+        )
+        if backend_gate_approved:
+            break
+
+        normalized_output = integration_output.replace("\\", "/").casefold()
+        affected_stream_ids = [
+            stream.id
+            for stream in plan.workstreams
+            if any(
+                str(scope).replace("\\", "/").casefold() in normalized_output
+                for scope in stream.write_scopes
+                if str(scope).strip()
+            )
+        ] or [stream.id for stream in plan.workstreams]
+        affected_item_ids = [
+            item.id
+            for stream in plan.workstreams
+            if stream.id in affected_stream_ids
+            for item in stream.work_items
+        ]
+        crisis_id = new_id("crisis")
+        crisis_context = {
+            "crisis_id": crisis_id,
+            "scope": "integration",
+            "task_id": task_id,
+            "session_id": session_id,
+            "execution_epoch": execution_epoch,
+            "failure_kind": (
+                "sandbox_unavailable"
+                if sandbox_outcome == "unavailable"
+                else "sandbox_blocked"
+                if sandbox_outcome == "blocked"
+                else "integration_failed"
+            ),
+            "reason": integration_output[-2000:] or "Integration gate failed",
+            "retryable": integration_retryable,
+            "affected_manager_ids": [
+                manager_ids[stream.id]
+                for stream in plan.workstreams
+                if stream.id in affected_stream_ids
+            ],
+            "affected_work_item_ids": affected_item_ids,
+            "errors": {"integration": integration_output[-12000:]},
+            "suggested_instructions": integration_output[-4000:],
+        }
+        contextual_event({"type": "crisis_detected", **crisis_context})
+        remediation = _decide_remediation(crisis_strategy, crisis_context)
+        remediation, remediation_attempt_id = _reserve_remediation_attempt(
+            repo,
+            context=crisis_context,
+            decision=remediation,
+        )
+        if not remediation.retries:
             contextual_event(
                 {
-                    "type": "integration_result",
-                    "role": "director",
-                    "agent_instance_id": director_id,
-                    "status": (
-                        "blocked"
-                        if sandbox_outcome in {"blocked", "unavailable"}
-                        else integration_status
-                    ),
-                    "accepted": backend_gate_approved,
-                    "retryable": integration_retryable,
-                    "failure_kind": (
-                        "sandbox_unavailable"
-                        if sandbox_outcome == "unavailable"
-                        else "sandbox_blocked"
-                        if sandbox_outcome == "blocked"
-                        else ""
-                    ),
-                    "command": " ".join(test_cmd or []),
-                    "detail": integration_output[-12000:],
-                    **integration_details,
+                    "type": "remediation_exhausted",
+                    **crisis_context,
+                    "reason": remediation.reason,
                 }
             )
+            for stream in plan.workstreams:
+                if stream.id not in affected_stream_ids:
+                    continue
+                stream_status[stream.id] = WorkStatus.ABANDONED
+                for item in stream.work_items:
+                    if item.id not in affected_item_ids:
+                        continue
+                    item_statuses[item.id] = WorkStatus.ABANDONED
+                    item_evidence[item.id] = {
+                        **dict(item_evidence.get(item.id) or {}),
+                        "accepted": False,
+                        "status": "abandoned",
+                        "failure_kind": "integration_failed",
+                        "retryable": False,
+                        "error": remediation.reason,
+                    }
+                    contextual_event(
+                        {
+                            "type": "agent_abandoned",
+                            "role": "worker",
+                            "agent_instance_id": item.metadata.get("worker_agent_id"),
+                            "manager_id": stream.manager_agent_id,
+                            "workstream_id": stream.id,
+                            "work_item_id": item.id,
+                            "status": "abandoned",
+                            "reason": remediation.reason,
+                            "failure_kind": "integration_failed",
+                            "artifacts": sorted(
+                                completed_package_files.get(item.id, set())
+                            ),
+                            "log_refs": [],
+                        }
+                    )
+                    contextual_event(
+                        {
+                            "type": "work_item_abandoned",
+                            "role": "worker",
+                            "agent_instance_id": item.metadata.get("worker_agent_id"),
+                            "manager_id": stream.manager_agent_id,
+                            "workstream_id": stream.id,
+                            "work_item_id": item.id,
+                            "status": "abandoned",
+                            "reason": remediation.reason,
+                            "failure_kind": "integration_failed",
+                            "artifacts": sorted(
+                                completed_package_files.get(item.id, set())
+                            ),
+                            "log_refs": [],
+                        }
+                    )
+            break
 
+        remediation_event = {
+            "crisis_id": crisis_id,
+            "scope": "integration",
+            "role": "director",
+            "agent_instance_id": director_id,
+            "action": remediation.action,
+            "reason": remediation.reason,
+            "instructions": remediation.instructions or integration_output[-4000:],
+            "affected_manager_ids": crisis_context["affected_manager_ids"],
+            "affected_work_item_ids": affected_item_ids,
+        }
+        contextual_event({"type": "remediation_started", **remediation_event})
+        contextual_event(
+            {
+                "type": "director_replan_created",
+                **remediation_event,
+                "status": "replanning",
+                "remediation_generation": integration_generation + 1,
+                "workstream_ids": affected_stream_ids,
+                "summary": remediation.reason,
+            }
+        )
+        for stream in plan.workstreams:
+            if stream.id not in affected_stream_ids:
+                continue
+            stream_status[stream.id] = WorkStatus.PENDING
+            for item in stream.work_items:
+                item_statuses[item.id] = WorkStatus.PENDING
+                completed_package_files.setdefault(item.id, set()).clear()
+                if remediation_event["instructions"]:
+                    instruction_overrides[item.id] = remediation_event["instructions"]
+        integration_generation += 1
+        contextual_event({"type": "remediation_applied", **remediation_event})
+        _complete_remediation_attempt(
+            repo,
+            remediation_attempt_id,
+            details=remediation_event,
+        )
+
+    # Convert every non-cancellation legacy/transient state into the explicit
+    # abandonment model before reports are frozen.
+    if not cancelled_run:
+        for stream in plan.workstreams:
+            for item in stream.work_items:
+                current = item_statuses.get(item.id, WorkStatus.PENDING)
+                if current in {
+                    WorkStatus.APPROVED,
+                    WorkStatus.ABANDONED,
+                    WorkStatus.SKIPPED,
+                }:
+                    continue
+                worker_id = str(item.metadata.get("worker_agent_id") or "")
+                attempted = bool(repo.list_attempts(task_id, item.id)) or worker_id in {
+                    *started_agent_ids,
+                    *called_agent_ids,
+                }
+                terminal_status = (
+                    WorkStatus.ABANDONED if attempted else WorkStatus.SKIPPED
+                )
+                item_statuses[item.id] = terminal_status
+                prior = dict(item_evidence.get(item.id) or {})
+                reason = str(
+                    prior.get("error")
+                    or prior.get("failure_kind")
+                    or "work did not reach approval"
+                )
+                item_evidence[item.id] = {
+                    **prior,
+                    "accepted": False,
+                    "status": terminal_status.value,
+                    "failure_kind": (
+                        "agent_abandoned"
+                        if terminal_status == WorkStatus.ABANDONED
+                        else "dependency_skipped"
+                    ),
+                    "retryable": False,
+                    "error": reason,
+                }
+                contextual_event(
+                    {
+                        "type": (
+                            "agent_abandoned"
+                            if terminal_status == WorkStatus.ABANDONED
+                            else "agent_skipped"
+                        ),
+                        "role": "worker",
+                        "agent_instance_id": worker_id,
+                        "manager_id": stream.manager_agent_id,
+                        "workstream_id": stream.id,
+                        "work_item_id": item.id,
+                        "status": terminal_status.value,
+                        "reason": reason,
+                        "failure_kind": item_evidence[item.id]["failure_kind"],
+                        "artifacts": sorted(
+                            completed_package_files.get(item.id, set())
+                        ),
+                        "log_refs": [],
+                    }
+                )
+                contextual_event(
+                    {
+                        "type": (
+                            "work_item_abandoned"
+                            if terminal_status == WorkStatus.ABANDONED
+                            else "work_item_skipped"
+                        ),
+                        "role": "worker",
+                        "agent_instance_id": worker_id,
+                        "manager_id": stream.manager_agent_id,
+                        "workstream_id": stream.id,
+                        "work_item_id": item.id,
+                        "status": terminal_status.value,
+                        "reason": reason,
+                        "failure_kind": item_evidence[item.id]["failure_kind"],
+                        "artifacts": sorted(
+                            completed_package_files.get(item.id, set())
+                        ),
+                        "log_refs": [],
+                        "blocked_by": list(item.dependencies),
+                    }
+                )
+            statuses_for_stream = [
+                item_statuses.get(item.id, WorkStatus.SKIPPED)
+                for item in stream.work_items
+            ]
+            if statuses_for_stream and all(
+                status == WorkStatus.APPROVED for status in statuses_for_stream
+            ):
+                stream_status[stream.id] = WorkStatus.APPROVED
+            elif any(
+                status == WorkStatus.ABANDONED for status in statuses_for_stream
+            ) or stream_status.get(stream.id) in {
+                WorkStatus.RUNNING,
+                WorkStatus.FAILED,
+                WorkStatus.BLOCKED,
+                WorkStatus.ABANDONED,
+            }:
+                stream_status[stream.id] = WorkStatus.ABANDONED
+            else:
+                stream_status[stream.id] = WorkStatus.SKIPPED
+
+    terminal_streams = tuple(
+        replace(
+            stream,
+            status=stream_status[stream.id],
+            work_items=tuple(
+                replace(item, status=item_statuses.get(item.id, WorkStatus.SKIPPED))
+                for item in stream.work_items
+            ),
+        )
+        for stream in plan.workstreams
+    )
+
+    # N Managers must produce N reports, even when a report is synthesized for
+    # an exit that occurred before workstream execution.
+    for stream in terminal_streams:
+        manager_id = str(stream.manager_agent_id or manager_ids[stream.id])
+        settle_manager(
+            stream,
+            statuses={
+                item.id: item_statuses.get(item.id, WorkStatus.SKIPPED)
+                for item in stream.work_items
+            },
+            evidence=item_evidence,
+            synthesized=manager_id not in started_agent_ids,
+            reasons=(
+                str(stream.metadata.get("plan_error") or ""),
+                "task_cancelled" if cancelled_run else "",
+            ),
+        )
+    barrier = emit_manager_report_barrier()
+
+    director_verdict = "revise"
+    director_summary = "Task stopped before Director final review."
+    director_review: ToolCallResult | None = None
+    if not cancelled_run and not task_cancelled():
+        review_context = {
+            "manager_report_barrier": barrier,
+            "integration_status": integration_status,
+            "manager_report_count": len(manager_terminal_reports),
+        }
+        if not _reserve_director_final_review(
+            repo,
+            task_id=task_id,
+            execution_epoch=execution_epoch,
+            review_context=review_context,
+        ):
+            raise RuntimeError(
+                "Director final review was already reserved for this execution epoch"
+            )
         active_director_model, active_director_effort = _resolve_agent_config(
             agent_config_resolver,
             agent_id=director_id,
@@ -3777,126 +6022,85 @@ def run_hierarchy(
         llm_client.thread_local.agent_instance_id = director_id
         final_prompt = (
             f"## USER GOAL\n{task_description}\n\n"
-            "## WORKSTREAM STATUS\n"
+            "## IMMUTABLE MANAGER TERMINAL REPORTS\n"
             + json.dumps(
-                {
-                    stream.id: {
-                        "title": stream.title,
-                        "status": stream_status[stream.id].value,
-                    }
-                    for stream in plan.workstreams
-                },
+                list(manager_terminal_reports.values()),
                 ensure_ascii=False,
                 indent=2,
-            )
+            )[-30000:]
+            + "\n\n## REPORT BARRIER\n"
+            + json.dumps(barrier, ensure_ascii=False, indent=2)
             + f"\n\n## INTEGRATION GATE\n{integration_status}\n"
             + integration_output[-12000:]
-            + "\n\n## ITEM EVIDENCE\n"
-            + json.dumps(item_evidence, ensure_ascii=False, indent=2)[-20000:]
-            + f"\n\n## RECOVERY CYCLE\n{director_cycle}/{max_director_recovery}"
+            + "\n\nThis is the one and only final review. Call complete_plan exactly once."
         )
         director_review = llm_call(
             DIRECTOR_REVIEW_PROMPT,
             final_prompt,
             DIRECTOR_REVIEW_TOOLS,
         )
+        director_final_review_count += 1
         director_verdict = str(director_review.tool_input.get("verdict", "revise"))
         director_summary = str(director_review.tool_input.get("summary", ""))
-        all_approved = (
-            backend_gate_approved
-            and director_review.tool_name == "complete_plan"
-            and director_verdict == "approved"
-        )
-        if all_approved:
-            break
-
-        retryable_stream_ids = []
-        if integration_status == "failed" and integration_retryable:
-            normalized_output = integration_output.replace("\\", "/").casefold()
-            affected = [
-                stream.id
-                for stream in plan.workstreams
-                if any(
-                    str(scope).replace("\\", "/").casefold() in normalized_output
-                    for scope in stream.write_scopes
-                    if str(scope).strip()
-                )
-            ]
-            # A global integration error often does not name a path. One
-            # bounded Director cycle may then re-open every stream.
-            retryable_stream_ids.extend(affected or [stream.id for stream in plan.workstreams])
-        for stream in plan.workstreams:
-            if stream_status.get(stream.id) != WorkStatus.FAILED:
-                continue
-            if any(
-                item_evidence.get(item.id, {}).get("retryable", True)
-                for item in stream.work_items
-                if item_statuses.get(item.id)
-                in {WorkStatus.FAILED, WorkStatus.BLOCKED, WorkStatus.PENDING}
-            ):
-                if stream.id not in retryable_stream_ids:
-                    retryable_stream_ids.append(stream.id)
-        changed = True
-        while changed:
-            changed = False
-            for stream in plan.workstreams:
-                if (
-                    stream_status.get(stream.id) != WorkStatus.BLOCKED
-                    or stream.id in retryable_stream_ids
-                ):
-                    continue
-                if any(dependency in retryable_stream_ids for dependency in stream.dependencies):
-                    retryable_stream_ids.append(stream.id)
-                    changed = True
-        if director_cycle >= max_director_recovery or not retryable_stream_ids:
-            break
-        contextual_event(
-            {
-                "type": "director_replan_created",
-                "role": "director",
-                "agent_instance_id": director_id,
-                "status": "replanning",
-                "recovery_cycle": director_cycle + 1,
-                "workstream_ids": retryable_stream_ids,
-                "summary": director_summary,
-            }
-        )
-        for stream in plan.workstreams:
-            if stream.id not in retryable_stream_ids:
-                continue
-            stream_status[stream.id] = WorkStatus.PENDING
-            for item in stream.work_items:
-                if (
-                    integration_status == "failed"
-                    or item_statuses.get(item.id) != WorkStatus.APPROVED
-                ):
-                    item_statuses[item.id] = WorkStatus.PENDING
-                    if director_summary:
-                        instruction_overrides[item.id] = director_summary
-
-    final_streams = tuple(
-        replace(
-            stream,
-            status=stream_status[stream.id],
-            work_items=tuple(
-                replace(item, status=item_statuses.get(item.id, WorkStatus.PENDING))
-                for item in stream.work_items
+        final_review_event = {
+            "type": "director_final_review",
+            "task_id": task_id,
+            "session_id": session_id,
+            "role": "director",
+            "agent_instance_id": director_id,
+            "execution_epoch": execution_epoch,
+            "execution_epoch_id": execution_epoch,
+            "verdict": director_verdict,
+            "summary": director_summary,
+            "remaining_risks": list(
+                director_review.tool_input.get("remaining_risks") or []
             ),
+            "integration_status": integration_status,
+            "manager_reports_expected": len(expected_manager_ids),
+            "manager_reports_reported": len(manager_terminal_reports),
+            "final_review_number": director_final_review_count,
+            "status": "completed",
+        }
+        _persist_director_final_review(repo, final_review_event)
+        contextual_event(final_review_event)
+    elif task_cancelled():
+        cancelled_run = True
+
+    all_work_completed = all(
+        stream.status == WorkStatus.APPROVED
+        and all(item.status == WorkStatus.APPROVED for item in stream.work_items)
+        for stream in terminal_streams
+    )
+    all_approved = bool(
+        all_work_completed
+        and backend_gate_approved
+        and director_review is not None
+        and director_review.tool_name == "complete_plan"
+        and director_verdict == "approved"
+    )
+    has_partial_work = any(
+        stream.status in {WorkStatus.ABANDONED, WorkStatus.SKIPPED}
+        or any(
+            item.status in {WorkStatus.ABANDONED, WorkStatus.SKIPPED}
+            for item in stream.work_items
         )
-        for stream in plan.workstreams
+        for stream in terminal_streams
+    )
+    final_status = (
+        PlanStatus.CANCELLED
+        if cancelled_run
+        else PlanStatus.COMPLETED
+        if all_approved
+        else PlanStatus.PARTIAL
+        if has_partial_work
+        else PlanStatus.FAILED
     )
     running_revision = plan.revision
     final_plan = replace(
         plan,
         revision=running_revision + 1,
-        status=(
-            PlanStatus.COMPLETED
-            if all_approved
-            else PlanStatus.CANCELLED
-            if cancelled_run
-            else PlanStatus.FAILED
-        ),
-        workstreams=final_streams,
+        status=final_status,
+        workstreams=terminal_streams,
         updated_at=utc_now(),
     )
     with event_state_lock:
@@ -3906,43 +6110,105 @@ def run_hierarchy(
             call_outcomes=model_call_outcomes,
             director_agent_id=director_id,
             called_agent_ids=called_agent_ids,
+            started_agent_ids=started_agent_ids,
             agent_dispositions=agent_dispositions,
+            agent_no_call_reasons=agent_no_call_reasons,
             agent_call_purposes=agent_call_purposes,
+            expected_manager_ids=expected_manager_ids,
+            manager_terminal_reports=manager_terminal_reports.values(),
+            director_final_review_count=director_final_review_count,
         )
-    if not reconciliation["balanced"]:
+    if not reconciliation["covered"] and not cancelled_run:
         all_approved = False
         final_plan = replace(final_plan, status=PlanStatus.FAILED)
         director_verdict = "revise"
-        director_summary = "Completion reconciliation failed: " + "; ".join(
+        director_summary = "Completion coverage failed: " + "; ".join(
             reconciliation["errors"]
         )
+
+    approved_file_paths = sorted(
+        {
+            path
+            for stream in final_plan.workstreams
+            for item in stream.work_items
+            if item.status == WorkStatus.APPROVED
+            for path in (
+                completed_package_files.get(item.id)
+                or set(item.write_scopes)
+            )
+        }
+    )
+    if final_plan.status == PlanStatus.COMPLETED and on_file_approved is not None:
+        for approved_path in approved_file_paths:
+            on_file_approved(approved_path)
     repo.save_plan(final_plan, expected_previous_revision=running_revision)
+    _complete_execution_epoch(
+        repo,
+        task_id=task_id,
+        execution_epoch=execution_epoch,
+        disposition=final_plan.status.value,
+        terminal_log_refs=(
+            ref
+            for report in manager_terminal_reports.values()
+            for ref in report.get("log_refs", ())
+        ),
+    )
 
     contextual_event(
         {
             "type": "completion_reconciliation",
             "role": "director",
             "agent_instance_id": director_id,
-            "status": "balanced" if reconciliation["balanced"] else "failed",
+            "execution_epoch": execution_epoch,
+            "status": "covered" if reconciliation["covered"] else "failed",
             **reconciliation,
         }
     )
-    contextual_event(
-        {
-            "type": (
-                "hierarchy_completed"
-                if all_approved
-                else "hierarchy_cancelled"
-                if cancelled_run
-                else "hierarchy_failed"
-            ),
-            "role": "director",
-            "agent_instance_id": director_id,
-            "status": ("completed" if all_approved else "cancelled" if cancelled_run else "failed"),
-            "verdict": director_verdict,
-            "summary": director_summary,
-        }
-    )
+    if final_plan.status == PlanStatus.PARTIAL:
+        contextual_event(
+            {
+                "type": "hierarchy_partial",
+                "role": "director",
+                "agent_instance_id": director_id,
+                "execution_epoch": execution_epoch,
+                "status": "partial",
+                "verdict": director_verdict,
+                "summary": director_summary,
+                "completed_workstream_ids": sorted(
+                    stream.id
+                    for stream in final_plan.workstreams
+                    if stream.status == WorkStatus.APPROVED
+                ),
+                "abandoned_workstream_ids": sorted(
+                    stream.id
+                    for stream in final_plan.workstreams
+                    if stream.status == WorkStatus.ABANDONED
+                ),
+                "skipped_workstream_ids": sorted(
+                    stream.id
+                    for stream in final_plan.workstreams
+                    if stream.status == WorkStatus.SKIPPED
+                ),
+            }
+        )
+    else:
+        contextual_event(
+            {
+                "type": (
+                    "hierarchy_completed"
+                    if final_plan.status == PlanStatus.COMPLETED
+                    else "hierarchy_cancelled"
+                    if final_plan.status == PlanStatus.CANCELLED
+                    else "hierarchy_failed"
+                ),
+                "role": "director",
+                "agent_instance_id": director_id,
+                "execution_epoch": execution_epoch,
+                "status": final_plan.status.value,
+                "verdict": director_verdict,
+                "summary": director_summary,
+            }
+        )
     for stream in final_plan.workstreams:
         for item in stream.work_items:
             if item.id not in item_evidence:
@@ -3953,16 +6219,25 @@ def run_hierarchy(
                     tool_name="hierarchy_work_item",
                     accepted=bool(evidence.get("accepted")),
                     detail=str(
-                        evidence.get("reviewer_feedback") or evidence.get("error") or item.title
+                        evidence.get("reviewer_feedback")
+                        or evidence.get("error")
+                        or item.title
                     )[:1000],
                     stop_loop=False,
                 )
             )
     result.stopped_reason = (
-        "task_completed" if all_approved else "cancelled" if cancelled_run else "hierarchy_failed"
+        "task_completed"
+        if final_plan.status == PlanStatus.COMPLETED
+        else "task_partial"
+        if final_plan.status == PlanStatus.PARTIAL
+        else "cancelled"
+        if final_plan.status == PlanStatus.CANCELLED
+        else "hierarchy_failed"
     )
     result.final_state = {
         "session_id": session_id,
+        "execution_epoch": execution_epoch,
         "plan_revision": final_plan.revision,
         "plan_status": final_plan.status.value,
         "turn_count": len(result.turns),
@@ -3981,8 +6256,256 @@ def run_hierarchy(
         ),
         "last_review_verdict": director_verdict,
         "last_reviewer_feedback": director_summary,
+        "approved_file_paths": approved_file_paths,
+        "manager_terminal_reports": list(manager_terminal_reports.values()),
+        "manager_report_barrier": barrier,
+        "director_final_review_count": director_final_review_count,
         "reconciliation": reconciliation,
     }
     llm_client.thread_local.event_sink = None
     llm_client.thread_local.agent_instance_id = None
+    release_known_agent_accounts()
     return result
+
+
+def run_hierarchy(
+    *,
+    root: Path,
+    task_description: str,
+    task_id: str,
+    source_files: list[str] | None = None,
+    test_cmd: list[str] | None = None,
+    allow_new_files: bool = False,
+    limits: SchedulerLimits | None = None,
+    director_model: str = "claude-sonnet-5",
+    director_effort: str = "max",
+    manager_model: str = "claude-sonnet-5",
+    manager_effort: str = "max",
+    worker_model: str = "claude-sonnet-5",
+    worker_effort: str = "max",
+    reviewer_model: str = "claude-sonnet-5",
+    reviewer_effort: str = "high",
+    llm_call: LLMCallFn = _default_llm_call,
+    on_event: EventSink | None = None,
+    on_file_approved: ApprovedFileSink | None = None,
+    repository: StateRepository | None = None,
+    project_lease: Any | None = None,
+    resume_session: bool = False,
+    agent_config_resolver: AgentConfigResolver | None = None,
+    approval_callback: ApprovalCallback | None = None,
+    cancelled: CancellationCallback | None = None,
+    crisis_strategy: Any | None = None,
+) -> SessionResult:
+    """Run the hierarchy and preserve account-pool exhaustion as a fatal exception."""
+    repo = repository or StateRepository()
+    observed_reports: dict[str, dict[str, Any]] = {}
+    observed_agents: set[str] = set()
+    epoch_event: dict[str, Any] | None = None
+    barrier_observed = False
+
+    def observed_event(event: dict[str, Any]) -> None:
+        nonlocal epoch_event, barrier_observed
+        event_type = str(event.get("type") or "")
+        agent_id = str(event.get("agent_instance_id") or "")
+        if agent_id:
+            observed_agents.add(agent_id)
+        if event_type == "execution_epoch_started":
+            epoch_event = dict(event)
+        elif event_type == "manager_terminal_report":
+            manager_id = str(event.get("manager_id") or agent_id)
+            if manager_id:
+                observed_reports.setdefault(manager_id, dict(event))
+        elif event_type == "manager_report_barrier":
+            barrier_observed = True
+        _emit(on_event, event)
+
+    try:
+        return _run_hierarchy_impl(
+            root=root,
+            task_description=task_description,
+            task_id=task_id,
+            source_files=source_files,
+            test_cmd=test_cmd,
+            allow_new_files=allow_new_files,
+            limits=limits,
+            director_model=director_model,
+            director_effort=director_effort,
+            manager_model=manager_model,
+            manager_effort=manager_effort,
+            worker_model=worker_model,
+            worker_effort=worker_effort,
+            reviewer_model=reviewer_model,
+            reviewer_effort=reviewer_effort,
+            llm_call=llm_call,
+            on_event=observed_event,
+            on_file_approved=on_file_approved,
+            repository=repo,
+            project_lease=project_lease,
+            resume_session=resume_session,
+            agent_config_resolver=agent_config_resolver,
+            approval_callback=approval_callback,
+            cancelled=cancelled,
+            crisis_strategy=crisis_strategy,
+        )
+    except llm_client.AccountPoolExhaustedError as exc:
+        plan = repo.get_plan(task_id)
+        if plan is not None:
+            attempted_ids = {
+                attempt.work_item_id
+                for attempt in repo.list_attempts(task_id)
+            }
+            fatal_streams: list[Workstream] = []
+            fatal_evidence: dict[str, dict[str, Any]] = {}
+            for stream in plan.workstreams:
+                fatal_items: list[WorkItem] = []
+                for item in stream.work_items:
+                    status = (
+                        WorkStatus.ABANDONED
+                        if item.id in attempted_ids
+                        else WorkStatus.SKIPPED
+                    )
+                    fatal_items.append(replace(item, status=status))
+                    attempts = repo.list_attempts(task_id, item.id)
+                    latest = (
+                        max(attempts, key=lambda value: value.number)
+                        if attempts
+                        else None
+                    )
+                    fatal_evidence[item.id] = {
+                        **dict(latest.evidence if latest is not None else {}),
+                        "accepted": False,
+                        "status": status.value,
+                        "failure_kind": "account_pool_exhausted",
+                        "retryable": False,
+                        "error": str(exc),
+                    }
+                manager_id = str(
+                    stream.manager_agent_id
+                    or _resolve_repository_agent_id(
+                        repo,
+                        task_id=task_id,
+                        role="manager",
+                        assignment_id=stream.id,
+                    )
+                )
+                fatal_streams.append(
+                    replace(
+                        stream,
+                        manager_agent_id=manager_id,
+                        status=(
+                            WorkStatus.ABANDONED
+                            if manager_id in observed_agents
+                            else WorkStatus.SKIPPED
+                        ),
+                        work_items=tuple(fatal_items),
+                    )
+                )
+            fatal_plan = replace(
+                plan,
+                revision=plan.revision + 1,
+                status=PlanStatus.FAILED,
+                workstreams=tuple(fatal_streams),
+                metadata={
+                    **dict(plan.metadata),
+                    "failure_kind": "account_pool_exhausted",
+                },
+                updated_at=utc_now(),
+            )
+            repo.save_plan(fatal_plan, expected_previous_revision=plan.revision)
+            expected_manager_ids = tuple(
+                str(stream.manager_agent_id) for stream in fatal_plan.workstreams
+            )
+            execution_epoch = str((epoch_event or {}).get("execution_epoch") or "")
+            if not execution_epoch:
+                epoch_seed = "\0".join(
+                    (task_id, fatal_plan.session_id, str(plan.revision))
+                )
+                execution_epoch = (
+                    "epoch_"
+                    + hashlib.sha256(epoch_seed.encode("utf-8")).hexdigest()[:24]
+                )
+            for stream in fatal_plan.workstreams:
+                manager_id = str(stream.manager_agent_id)
+                if manager_id in observed_reports:
+                    continue
+                report = _build_manager_terminal_report(
+                    repository=repo,
+                    task_id=task_id,
+                    session_id=fatal_plan.session_id,
+                    execution_epoch=execution_epoch,
+                    stream=stream,
+                    manager_id=manager_id,
+                    item_statuses={
+                        item.id: item.status for item in stream.work_items
+                    },
+                    item_evidence=fatal_evidence,
+                    synthesized=True,
+                    reasons=("account_pool_exhausted", str(exc)),
+                )
+                _persist_manager_terminal_report(repo, report)
+                observed_event(report)
+            if expected_manager_ids and not barrier_observed:
+                barrier = {
+                    "type": "manager_report_barrier",
+                    "task_id": task_id,
+                    "session_id": fatal_plan.session_id,
+                    "execution_epoch": execution_epoch,
+                    "role": "director",
+                    "expected_manager_ids": sorted(expected_manager_ids),
+                    "reported_manager_ids": sorted(observed_reports),
+                    "expected_count": len(expected_manager_ids),
+                    "reported_count": len(observed_reports),
+                    "satisfied": set(expected_manager_ids) == set(observed_reports),
+                    "status": "satisfied",
+                }
+                _persist_manager_report_barrier(repo, barrier)
+                observed_event(barrier)
+            _complete_execution_epoch(
+                repo,
+                task_id=task_id,
+                execution_epoch=execution_epoch,
+                disposition="account_pool_exhausted",
+                terminal_log_refs=(
+                    ref
+                    for report in observed_reports.values()
+                    for ref in report.get("log_refs", ())
+                ),
+            )
+            reconciliation = reconcile_completion(
+                fatal_plan,
+                item_evidence=fatal_evidence,
+                expected_manager_ids=expected_manager_ids,
+                manager_terminal_reports=observed_reports.values(),
+                director_final_review_count=0,
+            )
+            observed_event(
+                {
+                    "type": "completion_reconciliation",
+                    "task_id": task_id,
+                    "session_id": fatal_plan.session_id,
+                    "execution_epoch": execution_epoch,
+                    "role": "director",
+                    "status": "covered" if reconciliation["covered"] else "failed",
+                    **reconciliation,
+                }
+            )
+            observed_event(
+                {
+                    "type": "hierarchy_failed",
+                    "task_id": task_id,
+                    "session_id": fatal_plan.session_id,
+                    "execution_epoch": execution_epoch,
+                    "role": "director",
+                    "status": "failed",
+                    "failure_kind": "account_pool_exhausted",
+                    "verdict": "revise",
+                    "summary": str(exc),
+                }
+            )
+        for agent_id in observed_agents:
+            llm_client.release_agent_account(agent_id)
+        llm_client.thread_local.event_sink = None
+        llm_client.thread_local.agent_instance_id = None
+        raise
+    finally:
+        llm_client.release_task_account_cohort(task_id)

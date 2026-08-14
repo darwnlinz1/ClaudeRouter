@@ -88,20 +88,11 @@ def _validate_decision_entry(entry: Any) -> str | None:
 
 
 def _validate_worker_feedback(feedback: str) -> str:
-    feedback = str(feedback).strip()
-    if len(feedback) > config.WORKER_FEEDBACK_MAX_CHARS:
-        logger.warning(
-            "worker_feedback exceeds %d chars (%d) -- truncating for storage",
-            config.WORKER_FEEDBACK_MAX_CHARS,
-            len(feedback),
-        )
-        return feedback[: config.WORKER_FEEDBACK_MAX_CHARS]
-    return feedback
+    return str(feedback).strip()
 
 
 def _validate_reviewer_text(value: str) -> str:
-    value = str(value).strip()
-    return value[: config.REVIEWER_FEEDBACK_MAX_CHARS]
+    return str(value).strip()
 
 
 def _emit(on_event: EventSink | None, event: dict[str, Any]) -> None:
@@ -157,7 +148,7 @@ def _record_completed_ticket(
             "file_path": file_path,
             "summary": summary[:1000],
             "verification": verification[:1000],
-            "reviewer_feedback": reviewer_feedback[:1000],
+            "reviewer_feedback": reviewer_feedback,
             "status": "approved",
         }
     )

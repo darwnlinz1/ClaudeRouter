@@ -113,8 +113,21 @@ export function useWorkspace(task?: TaskSummary) {
       ]);
       if (cancelled) return;
       let events: Record<string, unknown>[];
+      let timeline:
+        | {
+            latestSequence: number;
+            retainedFromSequence: number;
+            historyIncomplete: boolean;
+          }
+        | undefined;
       try {
-        events = await api.getTimeline(task.id, 0, controller.signal);
+        const result = await api.getTimeline(task.id, 0, controller.signal);
+        events = result.events;
+        timeline = {
+          latestSequence: result.latestSequence,
+          retainedFromSequence: result.retainedFromSequence,
+          historyIncomplete: result.historyIncomplete,
+        };
         if (cancelled) return;
       } catch {
         if (controller.signal.aborted) return;
@@ -125,9 +138,11 @@ export function useWorkspace(task?: TaskSummary) {
       // Durable timeline is the source of truth. Replaying detail.events
       // first would jump sequence to the end and discard older token/thinking
       // frames as duplicates.
+      const hierarchy = { ...(detail.hierarchy ?? {}) };
+      delete hierarchy.execution;
       dispatch({
         type: 'load-task',
-        task: { ...detail, events: [] },
+        task: { ...detail, events: [], hierarchy },
       });
       const ordered = [...events].sort(
         (left, right) => Number(left.sequence ?? 0) - Number(right.sequence ?? 0),
@@ -139,6 +154,10 @@ export function useWorkspace(task?: TaskSummary) {
           ...ordered.map((event) => Number(event.sequence ?? 0)).filter(Number.isFinite),
         );
       }
+      if (timeline) {
+        sequenceRef.current = Math.max(sequenceRef.current, timeline.latestSequence);
+      }
+      dispatch({ type: 'apply-snapshot', task: detail, timeline });
       setApprovals(approvalItems);
       setHydratedTaskId(task.id);
     })().catch(() => {
@@ -168,7 +187,7 @@ export function useWorkspace(task?: TaskSummary) {
     let retryTimer: number | undefined;
     let stopped = false;
     let retries = 0;
-    let queuedEvents: Record<string, unknown>[] = [];
+    const queuedEvents: Record<string, unknown>[] = [];
     let frameHandle: number | undefined;
     let frameUsesTimeout = false;
     let approvalController: AbortController | undefined;
@@ -221,13 +240,13 @@ export function useWorkspace(task?: TaskSummary) {
     };
 
     const teardown = () => {
+      cancelScheduledFrame();
+      flushQueuedEvents(true);
       stopped = true;
       source?.close();
       source = undefined;
       if (retryTimer) window.clearTimeout(retryTimer);
-      cancelScheduledFrame();
       approvalController?.abort();
-      queuedEvents = [];
     };
 
     const connect = () => {

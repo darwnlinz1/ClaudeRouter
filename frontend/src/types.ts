@@ -8,7 +8,17 @@ export type AgentRole =
   'director' | 'manager' | 'worker' | 'tester' | 'reviewer' | 'supervisor' | 'agent';
 
 export type AgentStatus =
-  'idle' | 'queued' | 'running' | 'waiting' | 'passed' | 'failed' | 'stopped';
+  | 'idle'
+  | 'queued'
+  | 'running'
+  | 'waiting'
+  | 'blocked'
+  | 'passed'
+  | 'partial'
+  | 'abandoned'
+  | 'skipped'
+  | 'failed'
+  | 'stopped';
 
 export type ExecutionState =
   | 'planned'
@@ -21,9 +31,112 @@ export type ExecutionState =
   | 'skipped'
   | 'preflight_failed'
   | 'completed'
+  | 'partial'
+  | 'abandoned'
   | 'failed'
   | 'aborted'
   | 'idle';
+
+export type TerminalOutcome = 'completed' | 'partial' | 'abandoned' | 'skipped' | 'failed';
+
+export interface TerminalOutcomeCounts {
+  completed: number;
+  partial: number;
+  abandoned: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface ManagerWorkItemCounts extends TerminalOutcomeCounts {
+  planned: number;
+  terminal: number;
+}
+
+export interface ManagerTerminalReport {
+  managerId: string;
+  workstreamId?: string;
+  outcome: TerminalOutcome;
+  summary?: string;
+  counts: ManagerWorkItemCounts;
+  workItemIds: Partial<Record<TerminalOutcome, string[]>>;
+  artifacts: string[];
+  reasons: string[];
+  logRefs: string[];
+  synthesized: boolean;
+  executionEpoch?: string;
+  reportedAt?: string;
+  sequence?: number;
+}
+
+export interface ManagerReportRosterEntry {
+  managerId: string;
+  workstreamId?: string;
+  reported: boolean;
+  outcome?: TerminalOutcome;
+  reportedAt?: string;
+}
+
+export interface ManagerReportRoster {
+  entries: ManagerReportRosterEntry[];
+  expectedManagerIds: string[];
+  reportedManagerIds: string[];
+  pendingManagerIds: string[];
+}
+
+export interface ManagerReportCounts extends TerminalOutcomeCounts {
+  expected: number;
+  reported: number;
+  pending: number;
+}
+
+export interface ManagerReportState {
+  reports: Record<string, ManagerTerminalReport>;
+  roster: ManagerReportRoster;
+  counts: ManagerReportCounts;
+  barrierSatisfied: boolean;
+  updatedAt?: string;
+}
+
+export interface HierarchyCrisis {
+  crisisId?: string;
+  status: string;
+  scope?: string;
+  failureKind?: string;
+  reason?: string;
+  retryable?: boolean;
+  managerId?: string;
+  workstreamId?: string;
+  affectedManagerIds: string[];
+  affectedWorkItemIds: string[];
+  at?: string;
+}
+
+export interface HierarchyRemediation {
+  crisisId?: string;
+  status: string;
+  action?: string;
+  strategy?: string;
+  reason?: string;
+  instructions?: string;
+  summary?: string;
+  managerId?: string;
+  workstreamId?: string;
+  affectedManagerIds: string[];
+  affectedWorkItemIds: string[];
+  at?: string;
+}
+
+export interface DirectorFinalReview {
+  outcome: TerminalOutcome;
+  verdict?: string;
+  summary?: string;
+  remainingRisks: string[];
+  integrationStatus?: string;
+  managerReportsExpected?: number;
+  managerReportsReported?: number;
+  finalReviewNumber?: number;
+  at?: string;
+}
 
 export interface ChangedFile {
   additions?: number;
@@ -51,23 +164,44 @@ export interface WorkContract {
 export interface ReconciliationPartition {
   planned: number;
   completed: number;
+  partial: number;
+  abandoned: number;
   skipped: number;
   blocked: number;
   failed: number;
   preflightFailed: number;
   terminal: number;
   balanced: boolean;
+  covered?: boolean;
+  successful?: boolean;
   ids: Record<string, string[]>;
   invalidIds: string[];
 }
 
 export interface CompletionReconciliation {
   balanced: boolean;
+  covered?: boolean;
+  successful?: boolean;
   errors: string[];
   workstreams: ReconciliationPartition;
   workItems: ReconciliationPartition;
   agents: ReconciliationPartition;
+  agentCalls?: ReconciliationPartition;
+  agentCallPurposes?: Record<string, string[]>;
   calls: ReconciliationPartition;
+  managerReports?: ReconciliationPartition;
+  reportBarrier?: {
+    expectedCount: number;
+    reportedCount: number;
+    satisfied: boolean;
+    duplicates: string[];
+    unexpectedManagerIds: string[];
+  };
+  directorFinalReview?: {
+    count: number;
+    exactlyOnce: boolean;
+    enforced: boolean;
+  };
   updatedAt?: string;
 }
 
@@ -168,6 +302,9 @@ export interface EventEnvelope {
   agentInstanceId?: string;
   callId?: string;
   attemptId?: string;
+  executionAttemptId?: string;
+  providerAttemptId?: string;
+  callPurpose?: string;
   attempt?: number;
   requestRevision?: number;
   provider?: string;
@@ -203,6 +340,8 @@ export interface TestResult {
 export interface CallAttempt {
   id: string;
   logicalRequestId?: string;
+  executionAttemptId?: string;
+  callPurpose?: string;
   attempt: number;
   requestRevision?: number;
   provider?: string;
@@ -224,10 +363,19 @@ export interface AgentFailure {
   provider?: string;
 }
 
+export interface ProvisionalThinkingChunk {
+  id: string;
+  text: string;
+  attemptId?: string;
+  chunkIndex?: number;
+}
+
 export interface AgentInstance {
   id: string;
   role: AgentRole;
   title: string;
+  /** Operator-facing ordinal from the backend, e.g. "Worker 2.3". */
+  label?: string;
   managerId?: string;
   workstreamId?: string;
   workItemId?: string;
@@ -246,6 +394,8 @@ export interface AgentInstance {
   action: string;
   output: string;
   thinking: string;
+  provisionalThinking: string;
+  provisionalThinkingChunks: ProvisionalThinkingChunk[];
   contextFiles: string[];
   diff: string;
   tests: TestResult[];
@@ -305,6 +455,7 @@ export interface ManagerNode {
   agentId?: string;
   workstreamId?: string;
   contract?: WorkContract;
+  terminalReport?: ManagerTerminalReport;
   items: WorkItemNode[];
 }
 
@@ -355,10 +506,20 @@ export interface WorkspaceState {
   signals: AgentSignal[];
   usedAccounts: string[];
   fanout: FanoutStats;
+  managerReports: ManagerReportState;
+  hierarchyOutcome?: TerminalOutcome;
+  directorFinalReview?: DirectorFinalReview;
+  crisis?: HierarchyCrisis;
+  remediation?: HierarchyRemediation;
   reconciliation?: CompletionReconciliation;
   projectLease?: ProjectLease;
   effects: EffectReceipt[];
   sandbox?: SandboxTrust;
+  timeline?: {
+    latestSequence: number;
+    retainedFromSequence: number;
+    historyIncomplete: boolean;
+  };
   updatedAt?: string;
 }
 
@@ -368,9 +529,6 @@ export interface WorkspaceSettings {
   maxWorkersPerManager: number;
   maxParallelWorkersPerManager?: number;
   maxParallelWorkers: number;
-  maxModelCalls: number;
-  maxWallClockSeconds: number;
-  maxEstimatedInputTokens: number;
   mockWhenUnavailable: boolean;
   roleProfiles: Record<ConfigurableRole, AgentProfile>;
 }

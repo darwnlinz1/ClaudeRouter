@@ -10,11 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "LicenseRef-Proprietary"
 dependencies = [
-  "fastapi",
-  "httpx",
-  "pydantic",
-  "requests>=2.31",
-  "uvicorn[standard]",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.4",
+  "requests==2.34.2",
+  "starlette==1.6.0",
+  "uvicorn[standard]==0.52.1",
 ]
 
 [project.optional-dependencies]
@@ -25,7 +26,7 @@ dev = [
   "mypy",
   "pip-audit",
   "pip-tools",
-  "pytest>=7",
+  "pytest==9.1.1",
   "ruff",
   "types-requests",
 ]

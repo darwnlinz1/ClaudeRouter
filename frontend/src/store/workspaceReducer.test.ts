@@ -67,6 +67,40 @@ describe('workspaceReducer', () => {
     });
   });
 
+  it('keeps planned agents separate from actual starts', () => {
+    const planned = reduceEvent(initialWorkspaceState, {
+      sequence: 1,
+      type: 'agent_planned',
+      agent_instance_id: 'worker-planned',
+      manager_id: 'manager-a',
+      role: 'worker',
+      payload: { status: 'planned', title: 'Worker 1.1' },
+    });
+
+    expect(planned.agents['worker-planned']).toMatchObject({
+      status: 'queued',
+      phase: 'planned',
+      executionState: 'planned',
+    });
+    expect(planned.agents['worker-planned'].startedAt).toBeUndefined();
+
+    const started = reduceEvent(planned, {
+      sequence: 2,
+      timestamp: '2026-08-13T04:00:00Z',
+      type: 'agent_started',
+      agent_instance_id: 'worker-planned',
+      manager_id: 'manager-a',
+      role: 'worker',
+      payload: { status: 'running' },
+    });
+
+    expect(started.agents['worker-planned']).toMatchObject({
+      status: 'running',
+      executionState: 'in_flight',
+      startedAt: '2026-08-13T04:00:00Z',
+    });
+  });
+
   it('groups multiple workers beneath one manager and work item', () => {
     let state = reduceEvent(initialWorkspaceState, {
       sequence: 1,
@@ -331,6 +365,77 @@ describe('workspaceReducer', () => {
     expect(state.agents['worker-a'].thinking).toContain('Inspecting the target file.');
     expect(state.agents['worker-a'].status).toBe('failed');
     expect(state.agents['worker-a'].error).toContain('requirements.txt');
+  });
+
+  it('shows dependency-gated agents as blocked instead of failed', () => {
+    const state = workspaceReducer(initialWorkspaceState, {
+      type: 'events',
+      taskId: 'task-blocked',
+      events: [
+        {
+          sequence: 1,
+          type: 'agent_started',
+          agent_instance_id: 'worker-blocked',
+          manager_id: 'manager-upstream',
+          role: 'worker',
+          payload: { status: 'queued' },
+        },
+        {
+          sequence: 2,
+          type: 'agent_blocked',
+          agent_instance_id: 'worker-blocked',
+          manager_id: 'manager-upstream',
+          role: 'worker',
+          payload: {
+            status: 'blocked',
+            failure_kind: 'dependency',
+            blocked_by: ['foundation'],
+          },
+        },
+      ],
+    });
+
+    expect(state.agents['worker-blocked']).toMatchObject({
+      status: 'blocked',
+      executionState: 'blocked',
+    });
+    expect(state.agents['worker-blocked'].failures).toEqual([]);
+    expect(state.managers[0]).toMatchObject({
+      status: 'blocked',
+      items: [expect.objectContaining({ status: 'blocked' })],
+    });
+  });
+
+  it('shows provisional thinking live and replaces it with committed thinking once', () => {
+    let state = reduceEvent(initialWorkspaceState, {
+      sequence: 1,
+      type: 'thinking',
+      agent_instance_id: 'worker-live',
+      role: 'worker',
+      attempt_id: 'worker-live:a1',
+      chunk_index: 0,
+      provisional: true,
+      committed: false,
+      payload: { text: 'Inspecting live.' },
+    });
+
+    expect(state.agents['worker-live'].provisionalThinking).toBe('Inspecting live.');
+    expect(state.agents['worker-live'].thinking).toBe('');
+
+    state = reduceEvent(state, {
+      sequence: 2,
+      type: 'thinking',
+      agent_instance_id: 'worker-live',
+      role: 'worker',
+      attempt_id: 'worker-live:a1',
+      chunk_index: 0,
+      provisional: false,
+      committed: true,
+      payload: { text: 'Inspecting live.' },
+    });
+
+    expect(state.agents['worker-live'].thinking).toBe('Inspecting live.');
+    expect(state.agents['worker-live'].provisionalThinking).toBe('');
   });
 
   it('records source-target agent signals for the animated graph', () => {
@@ -830,6 +935,64 @@ describe('workspaceReducer', () => {
     expect(state.usedAccounts).toEqual(['account-a', 'account-b']);
   });
 
+  it('does not count redaction placeholders as provider accounts', () => {
+    const state = workspaceReducer(initialWorkspaceState, {
+      type: 'events',
+      taskId: 'task-redacted',
+      events: [
+        {
+          sequence: 1,
+          type: 'model_request_started',
+          agent_instance_id: 'worker-redacted',
+          role: 'worker',
+          account: '[REDACTED]',
+          account_ref: 'acct-1234-abcd-5678',
+          payload: { stage: 'calling_model' },
+        },
+      ],
+    });
+
+    expect(state.usedAccounts).toEqual(['acct-1234-abcd-5678']);
+  });
+
+  it('counts called logical agents by role without counting retries twice', () => {
+    const roles = [
+      ['director-main', 'director'],
+      ['manager-api', 'manager'],
+      ['worker-api', 'worker'],
+      ['tester-api', 'tester'],
+      ['worker-api', 'worker'],
+    ] as const;
+    const state = workspaceReducer(initialWorkspaceState, {
+      type: 'events',
+      taskId: 'task-accounting',
+      events: roles.map(([agentId, role], index) => ({
+        sequence: index + 1,
+        type: 'model_request_started',
+        agent_instance_id: agentId,
+        role,
+        attempt_id: `${agentId}:a${index + 1}`,
+        logical_request_id: `${agentId}:request`,
+        replayed: index === roles.length - 1,
+        payload: { stage: 'calling_model' },
+      })),
+    });
+
+    expect(state.fanout.requestAttempts).toBe(5);
+    expect(state.fanout.calledAgentIds).toEqual([
+      'director-main',
+      'manager-api',
+      'worker-api',
+      'tester-api',
+    ]);
+    expect(state.fanout.calledByRole).toEqual({
+      director: 1,
+      manager: 1,
+      worker: 1,
+      tester: 1,
+    });
+  });
+
   it('hydrates planning capacity from legacy hierarchy snapshots', () => {
     const state = workspaceReducer(initialWorkspaceState, {
       type: 'load-task',
@@ -844,6 +1007,34 @@ describe('workspaceReducer', () => {
         },
         hierarchy: {
           requested_manager_count: 2,
+          agents: {
+            'director-stable': {
+              id: 'director-stable',
+              role: 'director',
+              status: 'completed',
+            },
+            'manager-api': {
+              id: 'manager-api',
+              role: 'manager',
+              workstream_id: 'api',
+              status: 'completed',
+            },
+            'worker-api': {
+              id: 'worker-api',
+              role: 'worker',
+              manager_id: 'manager-api',
+              workstream_id: 'api',
+              work_item_id: 'api-contract',
+              status: 'completed',
+            },
+            'tester-api': {
+              id: 'tester-api',
+              role: 'tester',
+              manager_id: 'manager-api',
+              workstream_id: 'api',
+              status: 'blocked',
+            },
+          },
           workstreams: {
             api: {
               title: 'API stream',
@@ -880,14 +1071,351 @@ describe('workspaceReducer', () => {
       maxParallelWorkers: 8,
     });
     expect(state.graphRevision).toBeGreaterThan(0);
+    expect(Object.keys(state.agents)).toEqual([
+      'director-stable',
+      'manager-api',
+      'worker-api',
+      'tester-api',
+    ]);
+    expect(state.directorId).toBe('director-stable');
+    expect(state.agents['tester-api'].workItemId).toBeUndefined();
     expect(state.managers).toEqual([
       expect.objectContaining({
         id: 'api',
         title: 'API stream',
         workstreamId: 'api',
-        items: [expect.objectContaining({ id: 'api-contract', title: 'API contract' })],
+        agentId: 'manager-api',
+        items: [
+          expect.objectContaining({
+            id: 'api-contract',
+            title: 'API contract',
+            agentIds: ['worker-api'],
+          }),
+        ],
       }),
       expect.objectContaining({ id: 'ui', title: 'UI stream', workstreamId: 'ui' }),
     ]);
+  });
+
+  it('records an explicit retained-history gap without creating a ghost agent', () => {
+    const state = workspaceReducer(initialWorkspaceState, {
+      type: 'event',
+      taskId: 'task-gap',
+      event: {
+        type: 'timeline_gap',
+        sequence: 9,
+        retained_from_sequence: 10,
+        latest_sequence: 40,
+        history_incomplete: true,
+      },
+    });
+
+    expect(state.timeline).toEqual({
+      latestSequence: 40,
+      retainedFromSequence: 10,
+      historyIncomplete: true,
+    });
+    expect(state.agents).toEqual({});
+  });
+
+  it('tracks abandoned and skipped work without treating either as success', () => {
+    const state = workspaceReducer(initialWorkspaceState, {
+      type: 'events',
+      taskId: 'task-terminal-outcomes',
+      events: [
+        {
+          sequence: 1,
+          type: 'manager_plan_created',
+          agent_instance_id: 'manager-a',
+          manager_id: 'manager-a',
+          workstream_id: 'stream-a',
+          role: 'manager',
+          work_items: [
+            { id: 'item-abandoned', title: 'Unrecoverable work' },
+            { id: 'item-skipped', title: 'No longer needed' },
+          ],
+        },
+        {
+          sequence: 2,
+          type: 'agent_abandoned',
+          agent_instance_id: 'worker-a',
+          manager_id: 'manager-a',
+          workstream_id: 'stream-a',
+          work_item_id: 'item-abandoned',
+          role: 'worker',
+          reason: 'Retry budget exhausted',
+        },
+        {
+          sequence: 3,
+          type: 'work_item_skipped',
+          manager_id: 'manager-a',
+          workstream_id: 'stream-a',
+          work_item_id: 'item-skipped',
+          reason: 'Dependency removed the need for this item',
+        },
+      ],
+    });
+
+    expect(state.agents['worker-a']).toMatchObject({
+      status: 'abandoned',
+      executionState: 'abandoned',
+      error: 'Retry budget exhausted',
+    });
+    expect(state.managers[0].items).toEqual([
+      expect.objectContaining({ id: 'item-abandoned', status: 'abandoned' }),
+      expect.objectContaining({ id: 'item-skipped', status: 'skipped' }),
+    ]);
+    expect(state.managers[0].status).toBe('partial');
+  });
+
+  it('reconciles Manager terminal reports and preserves partial hierarchy outcomes', () => {
+    const task = {
+      id: 'task-manager-reports',
+      name: 'Manager report barrier',
+      status: 'MANAGING',
+    };
+    const loaded = workspaceReducer(initialWorkspaceState, { type: 'load-task', task });
+    const state = workspaceReducer(loaded, {
+      type: 'events',
+      taskId: task.id,
+      events: [
+        {
+          sequence: 1,
+          type: 'plan_created',
+          workstreams: [
+            { id: 'stream-a', title: 'A' },
+            { id: 'stream-b', title: 'B' },
+          ],
+        },
+        {
+          sequence: 2,
+          type: 'manager_plan_created',
+          agent_instance_id: 'manager-a',
+          manager_id: 'manager-a',
+          workstream_id: 'stream-a',
+          role: 'manager',
+          work_items: [{ id: 'item-a', title: 'A item' }],
+        },
+        {
+          sequence: 3,
+          type: 'manager_plan_created',
+          agent_instance_id: 'manager-b',
+          manager_id: 'manager-b',
+          workstream_id: 'stream-b',
+          role: 'manager',
+          work_items: [{ id: 'item-b', title: 'B item' }],
+        },
+        {
+          sequence: 4,
+          type: 'manager_terminal_report',
+          manager_id: 'manager-a',
+          workstream_id: 'stream-a',
+          status: 'partial',
+          completed_item_ids: ['item-a'],
+          abandoned_item_ids: ['item-a2'],
+          skipped_item_ids: [],
+          reasons: ['One item could not finish.'],
+        },
+        {
+          sequence: 5,
+          type: 'manager_terminal_report',
+          manager_id: 'manager-b',
+          workstream_id: 'stream-b',
+          status: 'abandoned',
+          completed_item_ids: [],
+          abandoned_item_ids: ['item-b'],
+          skipped_item_ids: [],
+          reasons: ['Retry budget exhausted.'],
+        },
+        {
+          sequence: 6,
+          type: 'manager_report_barrier',
+          expected_manager_ids: ['manager-a', 'manager-b'],
+          reported_manager_ids: ['manager-a', 'manager-b'],
+          expected_count: 2,
+          reported_count: 2,
+        },
+        {
+          sequence: 7,
+          type: 'hierarchy_partial',
+          summary: 'Useful output was retained.',
+        },
+        {
+          sequence: 8,
+          type: 'director_final_review',
+          outcome: 'partial',
+          verdict: 'accept_partial',
+          summary: 'Ship the completed subset.',
+        },
+      ],
+    });
+
+    expect(state.managerReports).toMatchObject({
+      barrierSatisfied: true,
+      counts: {
+        expected: 2,
+        reported: 2,
+        completed: 0,
+        partial: 1,
+        abandoned: 1,
+        pending: 0,
+      },
+    });
+    expect(state.managerReports.roster.pendingManagerIds).toEqual([]);
+    expect(state.managerReports.reports['manager-a']).toMatchObject({
+      counts: { planned: 2, completed: 1, abandoned: 1, terminal: 2 },
+      workItemIds: {
+        completed: ['item-a'],
+        abandoned: ['item-a2'],
+        skipped: [],
+      },
+      summary: 'One item could not finish.',
+    });
+    expect(state.managers).toEqual([
+      expect.objectContaining({
+        agentId: 'manager-a',
+        status: 'partial',
+        terminalReport: expect.objectContaining({ outcome: 'partial' }),
+      }),
+      expect.objectContaining({
+        agentId: 'manager-b',
+        status: 'abandoned',
+        terminalReport: expect.objectContaining({ outcome: 'abandoned' }),
+      }),
+    ]);
+    expect(state.hierarchyOutcome).toBe('partial');
+    expect(state.directorFinalReview).toMatchObject({
+      outcome: 'partial',
+      verdict: 'accept_partial',
+    });
+    expect(state.task).toMatchObject({
+      status: 'PARTIAL',
+      phase: 'director_review',
+      finished_at: expect.any(String),
+    });
+    expect(state.agents).toEqual({
+      'manager-a': expect.any(Object),
+      'manager-b': expect.any(Object),
+    });
+  });
+
+  it('records crisis and remediation lifecycle events without ghost agents', () => {
+    const state = workspaceReducer(
+      {
+        ...initialWorkspaceState,
+        task: { id: 'task-crisis', name: 'Crisis recovery', status: 'RUNNING' },
+      },
+      {
+        type: 'events',
+        taskId: 'task-crisis',
+        events: [
+          {
+            sequence: 1,
+            type: 'crisis_detected',
+            crisis_id: 'crisis-1',
+            scope: 'workstream',
+            workstream_id: 'stream-a',
+            failure_kind: 'manager_review',
+            reason: 'Manager stopped responding',
+            retryable: true,
+            affected_manager_ids: ['manager-a'],
+            affected_work_item_ids: ['item-a'],
+          },
+          {
+            sequence: 2,
+            type: 'remediation_started',
+            workstream_id: 'stream-a',
+            crisis_id: 'crisis-1',
+            action: 'retry',
+            strategy: 'abandon_and_continue',
+            instructions: 'Use the retained evidence.',
+            summary: 'Preserving completed work.',
+            affected_manager_ids: ['manager-a'],
+            affected_work_item_ids: ['item-a'],
+          },
+        ],
+      },
+    );
+
+    expect(state.crisis).toMatchObject({
+      crisisId: 'crisis-1',
+      status: 'detected',
+      scope: 'workstream',
+      failureKind: 'manager_review',
+      reason: 'Manager stopped responding',
+      retryable: true,
+      affectedManagerIds: ['manager-a'],
+      affectedWorkItemIds: ['item-a'],
+    });
+    expect(state.remediation).toMatchObject({
+      crisisId: 'crisis-1',
+      status: 'started',
+      action: 'retry',
+      strategy: 'abandon_and_continue',
+      instructions: 'Use the retained evidence.',
+      affectedManagerIds: ['manager-a'],
+      affectedWorkItemIds: ['item-a'],
+    });
+    expect(state.task).toMatchObject({ status: 'RUNNING', phase: 'remediation_started' });
+    expect(state.agents).toEqual({});
+  });
+
+  it('hydrates Manager reports and their barrier from a compacted task snapshot', () => {
+    const state = workspaceReducer(initialWorkspaceState, {
+      type: 'load-task',
+      task: {
+        id: 'task-report-snapshot',
+        name: 'Compacted report snapshot',
+        status: 'PARTIAL',
+        hierarchy: {
+          workstreams: {
+            'stream-a': {
+              id: 'stream-a',
+              title: 'Stream A',
+              agent_instance_id: 'manager-a',
+              status: 'partial',
+            },
+          },
+          manager_terminal_reports: [
+            {
+              manager_id: 'manager-a',
+              agent_instance_id: 'manager-a',
+              workstream_id: 'stream-a',
+              status: 'partial',
+              completed_item_ids: ['item-a'],
+              abandoned_item_ids: ['item-b'],
+              skipped_item_ids: [],
+              reasons: ['item-b exhausted remediation'],
+            },
+          ],
+          manager_report_barrier: {
+            expected_manager_ids: ['manager-a'],
+            reported_manager_ids: ['manager-a'],
+            expected_count: 1,
+            reported_count: 1,
+            satisfied: true,
+          },
+        },
+      },
+    });
+
+    expect(state.managerReports).toMatchObject({
+      barrierSatisfied: true,
+      counts: {
+        expected: 1,
+        reported: 1,
+        partial: 1,
+        pending: 0,
+      },
+    });
+    expect(state.managers[0]).toMatchObject({
+      status: 'partial',
+      terminalReport: {
+        managerId: 'manager-a',
+        outcome: 'partial',
+        counts: { planned: 2, terminal: 2, completed: 1, abandoned: 1 },
+      },
+    });
+    expect(state.hierarchyOutcome).toBe('partial');
   });
 });

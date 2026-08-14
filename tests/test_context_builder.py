@@ -1,4 +1,7 @@
-from orchestrator.context_builder import build_user_message
+import pytest
+
+from orchestrator.context_builder import SourceFile, build_source_blocks, build_user_message
+from orchestrator.worker_targets import UnsupportedPromptSource
 
 
 def test_checkpoint_context_omits_capability_refusal_transcripts():
@@ -61,3 +64,16 @@ def test_checkpoint_context_omits_capability_refusal_transcripts():
     assert "NO_ACCESS_" not in built.user_message
     assert '"instructions"' not in built.user_message
     assert "secret-digest" not in built.user_message
+
+
+def test_binary_or_non_utf8_source_is_never_loaded_into_prompt(tmp_path):
+    binary = tmp_path / "reference.png"
+    binary.write_bytes(b"\x89PNG\r\n\x00not-prompt-text")
+
+    with pytest.raises(UnsupportedPromptSource, match="never prompt bytes"):
+        build_source_blocks([SourceFile("reference.png", binary)])
+
+    invalid_utf8 = tmp_path / "notes.txt"
+    invalid_utf8.write_bytes(b"valid prefix\xff")
+    with pytest.raises(UnsupportedPromptSource, match="not valid UTF-8"):
+        build_source_blocks([SourceFile("notes.txt", invalid_utf8)])

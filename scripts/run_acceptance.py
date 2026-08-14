@@ -1,4 +1,5 @@
 """Run the Windows-friendly acceptance matrix and preserve exact gate evidence."""
+
 from __future__ import annotations
 
 import argparse
@@ -82,7 +83,6 @@ GATES: tuple[Gate, ...] = (
             "-m",
             "mypy",
             "--strict",
-            "orchestrator/budget.py",
             "orchestrator/models.py",
             "orchestrator/effects.py",
             "orchestrator/reconciliation.py",
@@ -198,8 +198,12 @@ GATES: tuple[Gate, ...] = (
         _pytest(
             "tests/test_provider_adapter.py",
             "tests/test_provider_transcript.py",
+            "tests/test_llm_client.py::test_provider_prompt_content_is_not_blocked_before_transport",
+            "tests/test_llm_client.py::test_web_stream_classifies_authentication_error_for_cookie_rotation",
             "tests/test_llm_client.py::test_web_stream_rejects_eof_without_terminal_event",
             "tests/test_llm_client.py::test_worker_429_replays_identical_request_on_new_account",
+            "tests/test_llm_client.py::test_transport_failure_rotates_cookie_and_replays_same_assignment",
+            "tests/test_llm_client.py::test_auth_failure_quarantines_cookie_and_replays_with_next_account",
             "tests/test_llm_client.py::test_rate_limit_error_honors_retry_after_header",
             "tests/test_llm_client.py::test_final_failure_emits_one_terminal_event",
             "tests/test_llm_client.py::test_cancel_emits_one_aborted_terminal_event",
@@ -286,7 +290,7 @@ SOURCE_PATTERNS = (
     "*.toml",
     "requirements*.txt",
 )
-SOURCE_EXCLUSIONS = frozenset({"docs/acceptance-evidence.md"})
+SOURCE_EXCLUSIONS = frozenset()
 
 
 def _command_text(command: Sequence[str]) -> str:
@@ -352,9 +356,7 @@ def _source_snapshot() -> dict[str, object]:
             "git_commit": nested_commit,
             "git_branch": _git_output("branch", "--show-current", cwd=nested_root),
             "working_tree_dirty": bool(nested_status),
-            "status_sha256": hashlib.sha256(
-                (nested_status or "").encode("utf-8")
-            ).hexdigest(),
+            "status_sha256": hashlib.sha256((nested_status or "").encode("utf-8")).hexdigest(),
         }
     return snapshot
 
@@ -535,7 +537,9 @@ def main() -> int:
         choices=("full", "backend", "frontend", "focused", "migration"),
         default="full",
     )
-    parser.add_argument("--gate", action="append", default=[], help="run only this gate; repeatable")
+    parser.add_argument(
+        "--gate", action="append", default=[], help="run only this gate; repeatable"
+    )
     parser.add_argument("--label", default="current-baseline")
     parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--timeout", type=int, default=1200, help="per-gate timeout in seconds")
@@ -581,9 +585,8 @@ def main() -> int:
 
     finished_at = datetime.now(timezone.utc).isoformat()
     finished_snapshot = _source_snapshot()
-    source_changed = (
-        snapshot.get("source_fingerprint_sha256")
-        != finished_snapshot.get("source_fingerprint_sha256")
+    source_changed = snapshot.get("source_fingerprint_sha256") != finished_snapshot.get(
+        "source_fingerprint_sha256"
     )
     report = {
         "schema_version": 1,

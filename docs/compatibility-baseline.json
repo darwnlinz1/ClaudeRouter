@@ -1,12 +1,22 @@
 {
-  "event_schema_version": 1,
+  "event_schema_version": 2,
   "events": {
     "account_invalidated": {
       "fields": {
         "agent_instance_id": "string",
+        "attempt": "integer",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "reason": "string",
+        "request_revision": "integer",
+        "reset_provisional": "boolean",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -15,17 +25,27 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "account_rate_limited": {
       "fields": {
         "account": "string",
         "agent_instance_id": "string",
+        "attempt": "integer",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
         "cooldown_seconds": "number",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "provider": "string",
+        "provider_attempt_id": "string",
         "reason": "string",
+        "request_revision": "integer",
+        "reset_provisional": "boolean",
         "retry_after_seconds": "number",
         "sequence": "integer",
         "session_id": "string",
@@ -35,15 +55,20 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "account_switch": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "from_account": "string",
+        "logical_agent_id": "string",
         "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "reason": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -56,14 +81,105 @@
       "required": [
         "reason"
       ],
-      "version": 1
+      "version": 2
+    },
+    "agent_blocked": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "blocked_by": "array",
+        "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "failure_kind": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role",
+        "status"
+      ],
+      "version": 2
+    },
+    "agent_cancelled": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "call_purpose": "string",
+        "error": "string",
+        "execution_attempt_id": "string",
+        "failure_kind": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role",
+        "status"
+      ],
+      "version": 2
+    },
+    "agent_completed": {
+      "fields": {
+        "accepted": "boolean",
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "file_path": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "agent_instance_id",
+        "role"
+      ],
+      "version": 2
     },
     "agent_failed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "error": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -77,13 +193,19 @@
         "error",
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "agent_message": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -100,14 +222,20 @@
         "source_agent_id",
         "target_agent_id"
       ],
-      "version": 1
+      "version": 2
     },
     "agent_progress": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "message": "string",
+        "provider_attempt_id": "string",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -120,13 +248,46 @@
       "required": [
         "role"
       ],
-      "version": 1
+      "version": 2
+    },
+    "agent_skipped": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "reason": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "role",
+        "status"
+      ],
+      "version": 2
     },
     "agent_started": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -136,9 +297,10 @@
         "workstream_id": "string"
       },
       "required": [
+        "agent_instance_id",
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "approval_decided": {
       "fields": {
@@ -146,7 +308,13 @@
         "approval_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "decision": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "reason": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -159,7 +327,7 @@
         "approval_id",
         "decision"
       ],
-      "version": 1
+      "version": 2
     },
     "approval_requested": {
       "fields": {
@@ -167,7 +335,13 @@
         "approval_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "kind": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "reason": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -185,59 +359,25 @@
         "status",
         "target"
       ],
-      "version": 1
-    },
-    "budget_exceeded": {
-      "fields": {
-        "agent_instance_id": "string",
-        "attempt_id": "string",
-        "budget": "object",
-        "call_id": "string",
-        "logical_request_id": "string",
-        "reason": "string",
-        "role": "string",
-        "sequence": "integer",
-        "session_id": "string",
-        "task_id": "string",
-        "timestamp": "string",
-        "work_item_id": "string",
-        "workstream_id": "string"
-      },
-      "required": [
-        "budget",
-        "reason"
-      ],
-      "version": 1
-    },
-    "budget_updated": {
-      "fields": {
-        "agent_instance_id": "string",
-        "attempt_id": "string",
-        "budget": "object",
-        "call_id": "string",
-        "logical_request_id": "string",
-        "role": "string",
-        "sequence": "integer",
-        "session_id": "string",
-        "task_id": "string",
-        "timestamp": "string",
-        "work_item_id": "string",
-        "workstream_id": "string"
-      },
-      "required": [
-        "budget"
-      ],
-      "version": 1
+      "version": 2
     },
     "completion_reconciliation": {
       "fields": {
+        "agent_call_purposes": "object",
+        "agent_calls": "object",
         "agent_instance_id": "string",
         "agents": "object",
         "attempt_id": "string",
         "balanced": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
         "calls": "object",
         "errors": "array",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -250,13 +390,19 @@
       "required": [
         "balanced"
       ],
-      "version": 1
+      "version": 2
     },
     "director_replan_created": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "reason": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -266,7 +412,7 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "effect_applied": {
       "fields": {
@@ -275,10 +421,16 @@
         "attempt_id": "string",
         "before_sha256": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "effect_id": "string",
         "effect_kind": "string",
+        "execution_attempt_id": "string",
         "file_path": "string",
         "idempotency_key": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -289,14 +441,20 @@
       "required": [
         "effect_id"
       ],
-      "version": 1
+      "version": 2
     },
     "error": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "data": "any",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -305,7 +463,7 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "execution_result": {
       "fields": {
@@ -314,9 +472,15 @@
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "deletions": "integer",
+        "execution_attempt_id": "string",
         "execution_result": "any",
         "file_path": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -328,16 +492,23 @@
       "required": [
         "accepted"
       ],
-      "version": 1
+      "version": 2
     },
     "fanout_selected": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "level": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "maximum": "integer",
+        "provider_attempt_id": "string",
         "reason": "string",
+        "role": "string",
         "selected": "integer",
         "sequence": "integer",
         "session_id": "string",
@@ -351,13 +522,19 @@
         "level",
         "selected"
       ],
-      "version": 1
+      "version": 2
     },
     "finish_chat_turn": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -366,13 +543,42 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
+    },
+    "hierarchy_cancelled": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "verdict": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [],
+      "version": 2
     },
     "hierarchy_completed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "summary": "string",
@@ -383,13 +589,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "hierarchy_failed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "summary": "string",
@@ -400,26 +612,56 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "hierarchy_fanout_planned": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "child_agent_count": "integer",
         "coder_count": "integer",
+        "dependency_aware": "boolean",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_agent_ids": "array",
         "manager_count": "integer",
+        "manager_id": "string",
+        "max_coders_per_manager": "integer",
+        "max_manager_count": "integer",
+        "max_parallel_managers": "integer",
+        "max_parallel_workers": "integer",
+        "max_parallel_workers_per_manager": "integer",
+        "primary_agent_count": "integer",
+        "primary_agent_ids": "array",
+        "primary_child_request_count": "integer",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
+        "status": "string",
+        "summary": "string",
         "task_id": "string",
+        "tester_agent_ids": "array",
         "tester_count": "integer",
         "timestamp": "string",
+        "unused_manager_capacity": "integer",
         "work_item_id": "string",
+        "worker_agent_ids": "array",
         "workstream_id": "string"
       },
-      "required": [],
-      "version": 1
+      "required": [
+        "coder_count",
+        "manager_agent_ids",
+        "manager_count",
+        "primary_agent_count",
+        "primary_agent_ids",
+        "tester_agent_ids",
+        "tester_count",
+        "worker_agent_ids"
+      ],
+      "version": 2
     },
     "integration_result": {
       "fields": {
@@ -427,6 +669,12 @@
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "summary": "string",
@@ -436,13 +684,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "manager_plan_created": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "requested_worker_count": "integer",
         "sequence": "integer",
         "session_id": "string",
@@ -453,15 +707,24 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "model_request_aborted": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
         "error": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
         "logical_request_id": "string",
+        "manager_id": "string",
+        "provider": "string",
+        "provider_attempt_id": "string",
+        "request_revision": "integer",
+        "reset_provisional": "boolean",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -473,15 +736,25 @@
       "required": [
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "model_request_completed": {
       "fields": {
         "agent_instance_id": "string",
+        "attempt": "integer",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "latency_ms": "number",
+        "logical_agent_id": "string",
         "logical_request_id": "string",
+        "manager_id": "string",
+        "provider": "string",
+        "provider_attempt_id": "string",
+        "request_revision": "integer",
+        "reset_provisional": "boolean",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -493,15 +766,24 @@
       "required": [
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "model_request_failed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
         "error": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
         "logical_request_id": "string",
+        "manager_id": "string",
+        "provider": "string",
+        "provider_attempt_id": "string",
+        "request_revision": "integer",
+        "reset_provisional": "boolean",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -514,14 +796,19 @@
         "error",
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "model_request_replayed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
         "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "replayed": "boolean",
         "request_revision": "integer",
         "role": "string",
@@ -536,15 +823,26 @@
         "logical_request_id",
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "model_request_started": {
       "fields": {
+        "account": "string",
+        "account_ref": "string",
         "agent_instance_id": "string",
+        "attempt": "integer",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
         "logical_request_id": "string",
+        "manager_id": "string",
+        "provider": "string",
+        "provider_attempt_id": "string",
         "replayed": "boolean",
+        "request_revision": "integer",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -556,13 +854,19 @@
       "required": [
         "role"
       ],
-      "version": 1
+      "version": 2
     },
     "plan.created": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "revision": "integer",
         "sequence": "integer",
         "session_id": "string",
@@ -574,13 +878,19 @@
       "required": [
         "revision"
       ],
-      "version": 1
+      "version": 2
     },
     "plan_created": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "requested_manager_count": "integer",
         "sequence": "integer",
         "session_id": "string",
@@ -591,14 +901,20 @@
         "workstreams": "array"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "plan_preflight_failed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "issues": "array",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -610,15 +926,21 @@
       "required": [
         "issues"
       ],
-      "version": 1
+      "version": 2
     },
     "planner_count_rejected": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "level": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "maximum": "integer",
+        "provider_attempt_id": "string",
         "requested": "integer",
         "sequence": "integer",
         "session_id": "string",
@@ -628,16 +950,51 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
+    },
+    "preflight_failed": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "call_id": "string",
+        "call_purpose": "string",
+        "error": "string",
+        "execution_attempt_id": "string",
+        "failure_kind": "string",
+        "issues": "array",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "role": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "error",
+        "status"
+      ],
+      "version": 2
     },
     "project_lease_acquired": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
         "fencing_token": "integer",
         "isolation_level": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "project_key": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -649,15 +1006,21 @@
         "fencing_token",
         "project_key"
       ],
-      "version": 1
+      "version": 2
     },
     "project_lease_lost": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "error": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "project_key": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "status": "string",
@@ -669,14 +1032,23 @@
       "required": [
         "error"
       ],
-      "version": 1
+      "version": 2
     },
     "protocol_retry": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
         "error": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "request_revision": "integer",
+        "reset_provisional": "boolean",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -686,13 +1058,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "resume": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -702,14 +1080,20 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "resume_checkpoint_loaded": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "checkpoint": "object",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -718,13 +1102,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "review_result": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "reviewer_feedback": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -737,14 +1127,22 @@
       "required": [
         "verdict"
       ],
-      "version": 1
+      "version": 2
     },
     "status": {
       "fields": {
+        "account": "string",
+        "account_ref": "string",
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "data": "any",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "role": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -754,13 +1152,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "task.started": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -769,7 +1173,7 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "test_result": {
       "fields": {
@@ -778,11 +1182,17 @@
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
         "command": "string",
         "detail": "string",
+        "execution_attempt_id": "string",
         "isolation_details": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "output_truncated": "boolean",
         "passed": "boolean",
+        "provider_attempt_id": "string",
         "requested_isolation": "string",
         "sequence": "integer",
         "session_id": "string",
@@ -793,29 +1203,87 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "thinking": {
       "fields": {
         "agent_instance_id": "string",
+        "attempt": "integer",
         "attempt_id": "string",
+        "attempt_terminal": "boolean",
         "call_id": "string",
+        "call_purpose": "string",
+        "chunk_index": "integer",
+        "committed": "boolean",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider": "string",
+        "provider_attempt_id": "string",
+        "provisional": "boolean",
+        "reason": "string",
+        "request_revision": "integer",
+        "reset": "boolean",
+        "role": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
+        "terminal": "boolean",
         "text": "string",
         "timestamp": "string",
         "work_item_id": "string",
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
-    "token": {
+    "timeline_gap": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "history_incomplete": "boolean",
+        "latest_sequence": "integer",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "retained_from_sequence": "integer",
+        "sequence": "integer",
+        "session_id": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "history_incomplete",
+        "latest_sequence",
+        "retained_from_sequence"
+      ],
+      "version": 2
+    },
+    "token": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt": "integer",
+        "attempt_id": "string",
+        "call_id": "string",
+        "call_purpose": "string",
+        "chunk_index": "integer",
+        "committed": "boolean",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider": "string",
+        "provider_attempt_id": "string",
+        "provisional": "boolean",
+        "request_revision": "integer",
+        "role": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -825,14 +1293,20 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "turn_phase": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "phase": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -843,14 +1317,20 @@
       "required": [
         "phase"
       ],
-      "version": 1
+      "version": 2
     },
     "turn_start": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
         "phase": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "task_id": "string",
@@ -860,13 +1340,45 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
+    },
+    "workstream_blocked": {
+      "fields": {
+        "agent_instance_id": "string",
+        "attempt_id": "string",
+        "blocked_by": "array",
+        "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
+        "sequence": "integer",
+        "session_id": "string",
+        "status": "string",
+        "summary": "string",
+        "task_id": "string",
+        "timestamp": "string",
+        "work_item_id": "string",
+        "workstream_id": "string"
+      },
+      "required": [
+        "status"
+      ],
+      "version": 2
     },
     "workstream_completed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "status": "string",
@@ -877,13 +1389,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "workstream_failed": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "status": "string",
@@ -894,13 +1412,19 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     },
     "workstream_started": {
       "fields": {
         "agent_instance_id": "string",
         "attempt_id": "string",
         "call_id": "string",
+        "call_purpose": "string",
+        "execution_attempt_id": "string",
+        "logical_agent_id": "string",
+        "logical_request_id": "string",
+        "manager_id": "string",
+        "provider_attempt_id": "string",
         "sequence": "integer",
         "session_id": "string",
         "status": "string",
@@ -910,7 +1434,7 @@
         "workstream_id": "string"
       },
       "required": [],
-      "version": 1
+      "version": 2
     }
   },
   "routes": {
@@ -975,6 +1499,9 @@
     ],
     "/api/accounts": [
       "get"
+    ],
+    "/api/accounts/credentials/{source}": [
+      "delete"
     ],
     "/api/tasks/{task_id}/agents/{agent_id}/config": [
       "put"

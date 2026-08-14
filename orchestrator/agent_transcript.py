@@ -152,6 +152,11 @@ def _redact_transcript_text(value: str, *, max_chars: int) -> str:
     return _COOKIE_HEADER.sub(r"\1[REDACTED]", safe)
 
 
+def _safe_account_reference(value: str | None) -> str:
+    account = str(value or "").strip()
+    return account if account.startswith("acct-") else "[REDACTED]"
+
+
 def record_message(
     *,
     task_id: str | None,
@@ -374,9 +379,7 @@ def record_response(
     raw_response = _redact_transcript_text(
         raw_response, max_chars=200000
     )
-    safe_account = _redact_transcript_text(
-        account or "-", max_chars=500
-    )
+    safe_account = _safe_account_reference(account)
     safe_error = _redact_transcript_text(error or "-", max_chars=2000)
     status = "ok" if parsed_ok else "parse_error"
     filename = f"{stamp}_attempt{attempt}_{status}.md"

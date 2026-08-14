@@ -1,14 +1,16 @@
 // @vitest-environment jsdom
 
-import { render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { mockTask } from '../data/mockWorkspace';
 import { initialWorkspaceState } from '../store/workspaceReducer';
 import { EventConsole } from './EventConsole';
 import { InterventionBanner } from './InterventionBanner';
 import { TaskDashboard } from './TaskDashboard';
 import { ToastStack } from './ToastStack';
+
+afterEach(cleanup);
 
 describe('operator interventions', () => {
   test('hidden intervention banner does not announce stale work', () => {
@@ -63,6 +65,75 @@ describe('operator interventions', () => {
     expect(document.activeElement).toBe(plan);
     expect(plan.getAttribute('aria-selected')).toBe('true');
     expect(screen.getByRole('tabpanel').getAttribute('aria-label')).toBe('Plan');
+  });
+
+  test('dashboard separates Manager report coverage from successful outcomes', async () => {
+    const user = userEvent.setup();
+    const partition = {
+      planned: 2,
+      completed: 1,
+      partial: 0,
+      abandoned: 0,
+      skipped: 0,
+      blocked: 0,
+      failed: 1,
+      preflightFailed: 0,
+      terminal: 2,
+      balanced: true,
+      ids: {},
+      invalidIds: [],
+    };
+    render(
+      <TaskDashboard
+        state={{
+          ...initialWorkspaceState,
+          managerReports: {
+            reports: {},
+            roster: {
+              entries: [],
+              expectedManagerIds: ['manager-a', 'manager-b'],
+              reportedManagerIds: ['manager-a', 'manager-b'],
+              pendingManagerIds: [],
+            },
+            counts: {
+              expected: 2,
+              reported: 2,
+              pending: 0,
+              completed: 1,
+              partial: 1,
+              abandoned: 0,
+              skipped: 0,
+              failed: 0,
+            },
+            barrierSatisfied: true,
+          },
+          reconciliation: {
+            balanced: true,
+            covered: true,
+            successful: false,
+            errors: [],
+            workstreams: partition,
+            workItems: partition,
+            agents: partition,
+            calls: partition,
+          },
+        }}
+        task={{ ...mockTask, status: 'PARTIAL' }}
+        onOpenAgent={() => undefined}
+        graphExpanded={false}
+        onToggleGraph={() => undefined}
+      />,
+    );
+
+    expect(screen.getByLabelText('2 of 2 Manager terminal reports received')).toBeTruthy();
+    expect(screen.getByText('Coverage complete')).toBeTruthy();
+    expect(screen.getByText(/outcomes are not all successful/)).toBeTruthy();
+    expect(screen.queryByText('Balanced')).toBeNull();
+
+    await user.click(screen.getByRole('tab', { name: 'Plan' }));
+    expect(screen.getByText('Manager reports')).toBeTruthy();
+    expect(screen.getByText('Partial')).toBeTruthy();
+    expect(screen.getByText('Abandoned')).toBeTruthy();
   });
 
   test('console controls expose expanded and pressed states', async () => {

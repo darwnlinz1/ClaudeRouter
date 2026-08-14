@@ -111,6 +111,6 @@ If compromise is suspected:
 See [ADR 0004](docs/adr/0004-local-security-boundary.md) and the
 [migration/rollback runbook](docs/runbooks/migration-rollback.md).
 
-The latest schema-14 acceptance result is recorded in
-`docs/acceptance-evidence.md`. This policy is not evidence by itself; rerun the
-full matrix after any source or dependency change.
+This policy is not evidence by itself. Rerun the
+[acceptance matrix](docs/acceptance-matrix.md) after any source or dependency
+change.

@@ -23,9 +23,7 @@ charset-normalizer==3.5.0
 click==8.4.2
     # via uvicorn
 colorama==0.4.6
-    # via
-    #   click
-    #   pytest
+    # via click
 fastapi==0.141.1
     # via -r requirements.txt
 h11==0.16.0
@@ -43,22 +41,12 @@ idna==3.18
     #   anyio
     #   httpx
     #   requests
-iniconfig==2.3.0
-    # via pytest
-packaging==26.3
-    # via pytest
-pluggy==1.6.0
-    # via pytest
 pydantic==2.13.4
     # via
     #   -r requirements.txt
     #   fastapi
 pydantic-core==2.46.4
     # via pydantic
-pygments==2.20.0
-    # via pytest
-pytest==9.1.1
-    # via -r requirements.txt
 python-dotenv==1.2.2
     # via uvicorn
 pyyaml==6.0.3
@@ -66,7 +54,9 @@ pyyaml==6.0.3
 requests==2.34.2
     # via -r requirements.txt
 starlette==1.6.0
-    # via fastapi
+    # via
+    #   -r requirements.txt
+    #   fastapi
 typing-extensions==4.16.0
     # via
     #   anyio

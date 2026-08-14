@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   loadPrefs,
+  normalizeWorkspaceSettings,
   PREFS_KEY,
   savePrefs,
   WORKSPACE_SPLIT_DEFAULT,
   WORKSPACE_SPLIT_MAX,
   WORKSPACE_SPLIT_MIN,
 } from './preferences';
+import type { WorkspaceSettings } from '../types';
 
 const values = new Map<string, string>();
 const storage: Storage = {
@@ -46,5 +48,62 @@ describe('UI preferences', () => {
     expect(prefs.workspaceSplitPercent).toBe(52.5);
     expect(loadPrefs().workspaceSplitPercent).toBe(52.5);
     expect(JSON.parse(storage.getItem(PREFS_KEY) ?? '{}').workspaceSplitPercent).toBe(52.5);
+  });
+});
+
+describe('workspace settings', () => {
+  const defaults: WorkspaceSettings = {
+    maxManagers: 4,
+    maxParallelManagers: 4,
+    maxWorkersPerManager: 5,
+    maxParallelWorkersPerManager: undefined,
+    maxParallelWorkers: 8,
+    mockWhenUnavailable: false,
+    roleProfiles: {
+      director: { model: 'claude-sonnet-5', effort: 'max' },
+      manager: { model: 'claude-sonnet-5', effort: 'max' },
+      worker: { model: 'claude-sonnet-5', effort: 'max' },
+      tester: { model: 'claude-sonnet-5', effort: 'high' },
+    },
+  };
+
+  it('clamps stale local settings to the backend request contract', () => {
+    expect(
+      normalizeWorkspaceSettings(
+        {
+          maxManagers: 99,
+          maxParallelManagers: -3,
+          maxWorkersPerManager: 50,
+          maxParallelWorkersPerManager: 99,
+          maxParallelWorkers: 0,
+        },
+        defaults,
+      ),
+    ).toMatchObject({
+      maxManagers: 32,
+      maxParallelManagers: 1,
+      maxWorkersPerManager: 32,
+      maxParallelWorkersPerManager: 31,
+      maxParallelWorkers: 1,
+    });
+  });
+
+  it('falls back from non-numeric persisted limits and preserves all role profiles', () => {
+    const malformed = {
+      maxManagers: 'many',
+      maxParallelWorkers: Number.NaN,
+      roleProfiles: {
+        worker: { model: 'claude-sonnet-4-6', effort: 'medium' },
+      },
+    } as unknown as Partial<WorkspaceSettings>;
+    const normalized = normalizeWorkspaceSettings(malformed, defaults);
+
+    expect(normalized.maxManagers).toBe(4);
+    expect(normalized.maxParallelWorkers).toBe(8);
+    expect(normalized.roleProfiles.worker).toEqual({
+      model: 'claude-sonnet-4-6',
+      effort: 'medium',
+    });
+    expect(normalized.roleProfiles.director).toEqual(defaults.roleProfiles.director);
   });
 });

@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+from . import config
+
 REQUEST_CONTEXT_SCHEMA = {
     "name": "request_context",
     "description": "Yêu cầu backend nạp file (AST skeleton, line-range, hoặc full). Action này không thay đổi code.",
@@ -16,7 +18,7 @@ REQUEST_CONTEXT_SCHEMA = {
                     "strategy_reset_needs_human",
                     "other",
                 ],
-                "description": "Lý do gửi action."
+                "description": "Lý do gửi action.",
             },
             "files_needed": {
                 "type": "array",
@@ -24,18 +26,18 @@ REQUEST_CONTEXT_SCHEMA = {
                 "minItems": 1,
                 "maxItems": 20,
                 "uniqueItems": True,
-                "description": "Cú pháp: 'file.py:skeleton', 'file.py:10-50', hoặc 'file.py'."
+                "description": "Cú pháp: 'file.py:skeleton', 'file.py:10-50', hoặc 'file.py'.",
             },
             "context_note": {
                 "type": "string",
                 "maxLength": 500,
-                "description": "Ghi chú giải thích những gì cần làm rõ."
+                "description": "Ghi chú giải thích những gì cần làm rõ.",
             },
             "decisions_md_entry": {
                 "type": ["string", "null"],
                 "maxLength": 2000,
-                "description": "Đề xuất ghi chú kiến trúc. Đặt null nếu không cần thiết."
-            }
+                "description": "Đề xuất ghi chú kiến trúc. Đặt null nếu không cần thiết.",
+            },
         },
         "required": ["reason", "files_needed", "context_note", "decisions_md_entry"],
     },
@@ -52,31 +54,31 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 500,
-                "description": "File giao cho Worker xử lý."
+                "description": "File giao cho Worker xử lý.",
             },
             "instructions": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 12000,
-                "description": "Lệnh cực kỳ chi tiết (Sửa hàm nào, dòng nào)."
+                "description": "Lệnh cực kỳ chi tiết (Sửa hàm nào, dòng nào).",
             },
             "is_final_ticket": {
                 "type": "boolean",
                 "description": (
                     "Chỉ true khi đây là file/ticket cuối cùng của toàn bộ task. "
                     "Dùng false nếu còn file khác phải xử lý."
-                )
+                ),
             },
             "context_note": {
                 "type": "string",
                 "maxLength": 500,
-                "description": "Tóm tắt task đang giao."
+                "description": "Tóm tắt task đang giao.",
             },
             "decisions_md_entry": {
                 "type": ["string", "null"],
                 "maxLength": 2000,
-                "description": "Đề xuất ghi vào DECISIONS.md (đặt null nếu không có)."
-            }
+                "description": "Đề xuất ghi vào DECISIONS.md (đặt null nếu không có).",
+            },
         },
         "required": [
             "file_path",
@@ -98,15 +100,14 @@ SUBMIT_PATCH_SCHEMA = {
             "task_status": {
                 "type": "string",
                 "enum": ["in_progress", "completed", "failed"],
-                "description": "Trạng thái nộp code."
+                "description": "Trạng thái nộp code.",
             },
             "worker_feedback": {
                 "type": "string",
-                "maxLength": 1000,
                 "description": (
                     "Báo cáo ngắn gọn những gì Worker vừa sửa, các giả định đã dùng "
                     "và mọi rủi ro hoặc việc cần Supervisor lưu ý."
-                )
+                ),
             },
         },
         "required": ["task_status", "worker_feedback"],
@@ -126,19 +127,17 @@ REVIEW_PATCH_SCHEMA = {
             "verdict": {
                 "type": "string",
                 "enum": ["approved", "revise"],
-                "description": "approved nếu patch đúng và đủ; revise nếu cần làm lại."
+                "description": "approved nếu patch đúng và đủ; revise nếu cần làm lại.",
             },
             "reviewer_feedback": {
                 "type": "string",
-                "maxLength": 1200,
-                "description": "Nhận xét ngắn gọn, có bằng chứng và nêu rủi ro còn lại."
+                "description": "Nhận xét ngắn gọn, có bằng chứng và nêu rủi ro còn lại.",
             },
             "next_instructions": {
                 "type": "string",
-                "maxLength": 1200,
                 "description": (
                     "Chỉ thị cụ thể cho Supervisor/Worker ở lượt sau; để trống khi approved."
-                )
+                ),
             },
         },
         "required": ["verdict", "reviewer_feedback", "next_instructions"],
@@ -173,7 +172,11 @@ _CONTRACT_PROPERTIES = {
         "minItems": 1,
         "maxItems": 32,
         "uniqueItems": True,
-        "description": "Concrete artifacts or observable deliverables this contract produces.",
+        "description": (
+            "Concrete artifacts or observable deliverables this contract produces. "
+            "Runtime binary outputs such as background.jpg may be listed here only "
+            "when the Worker's source code creates them at runtime."
+        ),
     },
     "read_scopes": {
         "type": "array",
@@ -188,7 +191,11 @@ _CONTRACT_PROPERTIES = {
         "minItems": 1,
         "maxItems": 32,
         "uniqueItems": True,
-        "description": "Project-relative paths exclusively owned for writes by this package.",
+        "description": (
+            "Project-relative UTF-8 source/text/config/doc/script/.gitkeep files "
+            "exclusively owned for Worker writes. Never include images, media, fonts, "
+            "archives, databases, SVG, or binary runtime outputs."
+        ),
     },
     "acceptance_criteria": {
         "type": "array",
@@ -358,7 +365,11 @@ _WORK_ITEM_SCHEMA = {
             "type": "string",
             "minLength": 1,
             "maxLength": 500,
-            "description": "File neo / file chính của gói nhu cầu (bắt buộc).",
+            "description": (
+                "Required primary Worker target. It must be UTF-8 source, text, config, "
+                "documentation, script, or .gitkeep; never background.jpg or another "
+                "image/media/font/archive/database/SVG/binary artifact."
+            ),
         },
         "instructions": {"type": "string", "minLength": 1, "maxLength": 12000},
         "dependencies": {
@@ -368,6 +379,10 @@ _WORK_ITEM_SCHEMA = {
             "uniqueItems": True,
         },
         **_CONTRACT_PROPERTIES,
+        "write_scopes": {
+            **_CONTRACT_PROPERTIES["write_scopes"],
+            "maxItems": config.MAX_FILES_PER_WORK_PACKAGE,
+        },
         "test_focus": {"type": "string", "maxLength": 3000},
     },
     "required": [

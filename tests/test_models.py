@@ -6,10 +6,13 @@ from orchestrator.models import (
     AgentInstance,
     AgentRole,
     Attempt,
+    AttemptStatus,
     EventEnvelope,
+    PlanStatus,
     TaskPlan,
     WorkerAssignment,
     WorkItem,
+    WorkStatus,
     Workstream,
     agent_instance_from_dict,
     event_from_dict,
@@ -50,9 +53,23 @@ def test_task_plan_round_trip_is_lossless():
     restored = task_plan_from_dict(to_dict(plan))
 
     assert restored == plan
-    assert restored.workstreams[0].work_items[0].write_scopes == (
-        "orchestrator/models.py",
-    )
+    assert restored.workstreams[0].work_items[0].write_scopes == ("orchestrator/models.py",)
+
+
+@pytest.mark.parametrize("status", [WorkStatus.ABANDONED, WorkStatus.SKIPPED])
+def test_terminal_work_statuses_round_trip_without_changing_attempt_semantics(status):
+    plan = make_plan()
+    item = replace(plan.workstreams[0].work_items[0], status=status)
+    stream = replace(plan.workstreams[0], status=status, work_items=(item,))
+    partial = replace(plan, status=PlanStatus.PARTIAL, workstreams=(stream,))
+
+    restored = task_plan_from_dict(to_dict(partial))
+
+    assert restored.status == PlanStatus.PARTIAL
+    assert restored.workstreams[0].status == status
+    assert restored.workstreams[0].work_items[0].status == status
+    assert "abandoned" not in {value.value for value in AttemptStatus}
+    assert "skipped" not in {value.value for value in AttemptStatus}
 
 
 def test_model_validation_rejects_unsafe_scope_and_self_dependency():
@@ -77,6 +94,21 @@ def test_agent_role_invariants_are_enforced():
             session_id="session-1",
             role=AgentRole.MANAGER,
         )
+    with pytest.raises(ValueError, match="tester requires workstream_id"):
+        AgentInstance(
+            id="tester-1",
+            task_id="task-1",
+            session_id="session-1",
+            role=AgentRole.TESTER,
+        )
+    tester = AgentInstance(
+        id="tester-1",
+        task_id="task-1",
+        session_id="session-1",
+        role=AgentRole.TESTER,
+        workstream_id="stream-1",
+    )
+    assert tester.work_item_id is None
 
 
 def test_event_envelope_round_trip_preserves_version_and_timestamp():

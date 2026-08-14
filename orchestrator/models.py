@@ -4,6 +4,7 @@ The models deliberately contain no persistence or execution logic.  They are
 safe to construct from untrusted planner output because every public model
 validates its identifiers, dependencies, scopes, and state invariants.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -29,6 +30,7 @@ class PlanStatus(str, Enum):
     READY = "ready"
     RUNNING = "running"
     COMPLETED = "completed"
+    PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -39,6 +41,8 @@ class WorkStatus(str, Enum):
     RUNNING = "running"
     TESTING = "testing"
     APPROVED = "approved"
+    ABANDONED = "abandoned"
+    SKIPPED = "skipped"
     FAILED = "failed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
@@ -77,6 +81,7 @@ class AgentStatus(str, Enum):
     STARTING = "starting"
     IDLE = "idle"
     BUSY = "busy"
+    BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
     STOPPED = "stopped"
@@ -101,11 +106,7 @@ def _clean_tuple(values: Sequence[str] | str, name: str) -> tuple[str, ...]:
 def _validate_scope(scope: str, name: str = "scope") -> None:
     _require_text(name, scope)
     normalized = scope.strip().replace("\\", "/")
-    has_drive_prefix = (
-        len(normalized) >= 2
-        and normalized[0].isalpha()
-        and normalized[1] == ":"
-    )
+    has_drive_prefix = len(normalized) >= 2 and normalized[0].isalpha() and normalized[1] == ":"
     if (
         normalized.startswith("/")
         or has_drive_prefix
@@ -169,11 +170,7 @@ class WorkContract:
 
     def __post_init__(self) -> None:
         _require_text("id", self.id)
-        if (
-            not isinstance(self.version, int)
-            or isinstance(self.version, bool)
-            or self.version < 1
-        ):
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 1:
             raise ValueError("version must be an integer of at least 1")
 
         for name in (
@@ -212,9 +209,7 @@ class WorkContract:
             approval_policy = ApprovalPolicy(self.approval_policy)
         except (TypeError, ValueError) as exc:
             allowed = ", ".join(policy.value for policy in ApprovalPolicy)
-            raise ValueError(
-                f"approval_policy must be one of: {allowed}"
-            ) from exc
+            raise ValueError(f"approval_policy must be one of: {allowed}") from exc
         object.__setattr__(self, "approval_policy", approval_policy)
 
         if (
@@ -244,7 +239,9 @@ class WorkItem:
             _require_text(name, getattr(self, name))
         object.__setattr__(self, "status", WorkStatus(self.status))
         object.__setattr__(
-            self, "acceptance_criteria", _clean_tuple(self.acceptance_criteria, "acceptance_criteria")
+            self,
+            "acceptance_criteria",
+            _clean_tuple(self.acceptance_criteria, "acceptance_criteria"),
         )
         if not self.acceptance_criteria:
             raise ValueError("acceptance_criteria must not be empty")
@@ -269,7 +266,7 @@ class WorkItem:
                 expected_outputs=self.write_scopes or (self.goal,),
                 write_scopes=self.write_scopes,
                 acceptance_criteria=self.acceptance_criteria,
-                    test_requirements=self.acceptance_criteria,
+                test_requirements=self.acceptance_criteria,
                 evidence_requirements=self.acceptance_criteria,
                 consumers=(self.workstream_id,),
                 priority=self.priority,
@@ -282,9 +279,7 @@ class WorkItem:
         elif not isinstance(contract, WorkContract):
             raise ValueError("contract must be a WorkContract")
         if contract.acceptance_criteria != self.acceptance_criteria:
-            raise ValueError(
-                "contract.acceptance_criteria must match the work item"
-            )
+            raise ValueError("contract.acceptance_criteria must match the work item")
         if contract.write_scopes != self.write_scopes:
             raise ValueError("contract.write_scopes must match the work item")
         if contract.priority != self.priority:
@@ -311,7 +306,9 @@ class Workstream:
             _require_text(name, getattr(self, name))
         object.__setattr__(self, "status", WorkStatus(self.status))
         object.__setattr__(
-            self, "acceptance_criteria", _clean_tuple(self.acceptance_criteria, "acceptance_criteria")
+            self,
+            "acceptance_criteria",
+            _clean_tuple(self.acceptance_criteria, "acceptance_criteria"),
         )
         if not self.acceptance_criteria:
             raise ValueError("acceptance_criteria must not be empty")
@@ -350,9 +347,7 @@ class Workstream:
         elif not isinstance(contract, WorkContract):
             raise ValueError("contract must be a WorkContract")
         if contract.acceptance_criteria != self.acceptance_criteria:
-            raise ValueError(
-                "contract.acceptance_criteria must match the workstream"
-            )
+            raise ValueError("contract.acceptance_criteria must match the workstream")
         if contract.write_scopes != self.write_scopes:
             raise ValueError("contract.write_scopes must match the workstream")
 
@@ -469,14 +464,16 @@ class WorkerAssignment:
 
     def __post_init__(self) -> None:
         for name in (
-            "id", "task_id", "workstream_id", "work_item_id",
-            "worker_agent_id", "attempt_id",
+            "id",
+            "task_id",
+            "workstream_id",
+            "work_item_id",
+            "worker_agent_id",
+            "attempt_id",
         ):
             _require_text(name, getattr(self, name))
         if self.worker_agent_id == self.attempt_id:
-            raise ValueError(
-                "attempt_id must be distinct from the logical worker_agent_id"
-            )
+            raise ValueError("attempt_id must be distinct from the logical worker_agent_id")
         object.__setattr__(self, "write_scopes", _clean_tuple(self.write_scopes, "write_scopes"))
         for scope in self.write_scopes:
             _validate_scope(scope, "write_scope")
@@ -513,9 +510,7 @@ class Attempt:
         for name in ("id", "task_id", "workstream_id", "work_item_id", "worker_agent_id"):
             _require_text(name, getattr(self, name))
         if self.id == self.worker_agent_id:
-            raise ValueError(
-                "attempt id must be distinct from the logical worker_agent_id"
-            )
+            raise ValueError("attempt id must be distinct from the logical worker_agent_id")
         object.__setattr__(self, "status", AttemptStatus(self.status))
         if self.number < 1:
             raise ValueError("number must be at least 1")
@@ -561,8 +556,10 @@ class AgentInstance:
             raise ValueError("director cannot have a parent agent")
         if self.role == AgentRole.MANAGER and not self.workstream_id:
             raise ValueError("manager requires workstream_id")
-        if self.role in (AgentRole.WORKER, AgentRole.TESTER) and not self.work_item_id:
-            raise ValueError(f"{self.role.value} requires work_item_id")
+        if self.role == AgentRole.WORKER and not self.work_item_id:
+            raise ValueError("worker requires work_item_id")
+        if self.role == AgentRole.TESTER and not self.workstream_id:
+            raise ValueError("tester requires workstream_id")
         _aware("started_at", self.started_at)
         if self.stopped_at is not None:
             _aware("stopped_at", self.stopped_at)
@@ -695,11 +692,7 @@ def workstream_from_dict(data: Mapping[str, Any]) -> Workstream:
     raw_contract = values.get("contract")
     if not isinstance(raw_contract, Mapping):
         metadata = values.get("metadata")
-        raw_contract = (
-            metadata.get("work_contract")
-            if isinstance(metadata, Mapping)
-            else None
-        )
+        raw_contract = metadata.get("work_contract") if isinstance(metadata, Mapping) else None
     if isinstance(raw_contract, Mapping):
         values["contract"] = work_contract_from_dict(raw_contract)
     return Workstream(**values)

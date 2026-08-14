@@ -12,10 +12,11 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, TypeVar
+from typing import Any, Callable, Iterator, Mapping, Sequence, TypeVar
 
 from .effects import EffectReceipt, EffectState
 from .event_schema import validate_event_payload
+from .llm_request_log import sanitize as sanitize_llm_request_attempt
 from .models import (
     Attempt,
     EventEnvelope,
@@ -41,7 +42,8 @@ DEFAULT_DB_PATH = Path(
         Path.home() / ".ai_orchestrator" / "orchestrator.sqlite3",
     )
 )
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 17
+EXECUTION_RECOVERY_API_VERSION = 1
 TERMINAL_EVENT_TYPES = frozenset(
     {
         "completion_reconciliation",
@@ -66,6 +68,7 @@ class RetentionPolicy:
     log_days: int = 14
     artifact_days: int = 90
     observability_days: int = 30
+    llm_request_days: int = 30
     max_events_per_task: int = 50_000
 
     def __post_init__(self) -> None:
@@ -74,6 +77,7 @@ class RetentionPolicy:
             "log_days",
             "artifact_days",
             "observability_days",
+            "llm_request_days",
             "max_events_per_task",
         ):
             value = getattr(self, name)
@@ -90,6 +94,9 @@ class RetentionPolicy:
             ),
             observability_days=int(
                 os.environ.get("ORCH_OBSERVABILITY_RETENTION_DAYS", "30")
+            ),
+            llm_request_days=int(
+                os.environ.get("ORCH_LLM_REQUEST_RETENTION_DAYS", "30")
             ),
             max_events_per_task=int(
                 os.environ.get("ORCH_MAX_EVENTS_PER_TASK", "50000")
@@ -123,6 +130,13 @@ def _coerce_datetime(value: datetime | None) -> datetime:
     )
 
 
+def _stable_record_id(prefix: str, *parts: str) -> str:
+    digest = hashlib.sha256(
+        "\0".join(str(part) for part in parts).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"{prefix}_{digest}"
+
+
 def _validate_sha256(value: str | None, field_name: str) -> None:
     if value is None:
         return
@@ -136,6 +150,8 @@ class StateRepository:
     One repository owns one SQLite connection. Calls are serialized with an
     ``RLock`` while SQLite WAL mode still permits readers in other processes.
     """
+
+    execution_recovery_api_version = EXECUTION_RECOVERY_API_VERSION
 
     def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
         self.db_path = str(db_path or DEFAULT_DB_PATH)
@@ -187,6 +203,9 @@ class StateRepository:
             12: ("durable_effect_fencing", self._migration_12_durable_effects),
             13: ("durable_coordination", self._migration_13_durable_coordination),
             14: ("managed_retention_claims", self._migration_14_managed_retention),
+            15: ("llm_request_attempts", self._migration_15_llm_request_attempts),
+            16: ("llm_request_attempt_agent_role", self._migration_16_llm_request_agent_role),
+            17: ("execution_recovery_records", self._migration_17_execution_recovery),
         }
         with self._lock:
             version = int(
@@ -834,6 +853,215 @@ class StateRepository:
                 """CREATE INDEX IF NOT EXISTS ix_artifact_managed_retention
                     ON artifact_records(
                         retention_state, terminal_evidence, updated_at, record_id
+                    )""",
+            ),
+        )
+
+    def _migration_15_llm_request_attempts(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add a sanitized, per-provider-attempt diagnostic ledger."""
+
+        self._execute_all(
+            connection,
+            (
+                """CREATE TABLE IF NOT EXISTS llm_request_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    task_id TEXT,
+                    session_id TEXT,
+                    agent_instance_id TEXT,
+                    agent_role TEXT,
+                    manager_id TEXT,
+                    workstream_id TEXT,
+                    work_item_id TEXT,
+                    execution_attempt_id TEXT,
+                    call_purpose TEXT,
+                    logical_request_id TEXT NOT NULL,
+                    request_revision INTEGER NOT NULL CHECK(request_revision >= 1),
+                    provider_attempt INTEGER NOT NULL CHECK(provider_attempt >= 1),
+                    provider TEXT NOT NULL,
+                    account_ref TEXT,
+                    org_ref TEXT,
+                    route TEXT,
+                    model TEXT,
+                    effort TEXT,
+                    max_tokens INTEGER,
+                    request_fingerprint TEXT,
+                    wire_fingerprint TEXT,
+                    logical_request_json TEXT NOT NULL DEFAULT '{}',
+                    tool_schema_json TEXT NOT NULL DEFAULT '[]',
+                    wire_body_json TEXT NOT NULL DEFAULT '{}',
+                    response_status INTEGER,
+                    response_headers_json TEXT NOT NULL DEFAULT '{}',
+                    response_body_json TEXT NOT NULL DEFAULT 'null',
+                    parser_result_json TEXT NOT NULL DEFAULT 'null',
+                    status TEXT NOT NULL CHECK(status IN (
+                        'started','completed','failed','aborted'
+                    )),
+                    error_stage TEXT,
+                    error_classification TEXT,
+                    error_type TEXT,
+                    error_message TEXT,
+                    retryable INTEGER,
+                    probe_of_attempt_id TEXT,
+                    created_at TEXT NOT NULL,
+                    transport_started_at TEXT,
+                    response_received_at TEXT,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    duration_ms REAL,
+                    transport_duration_ms REAL,
+                    redaction_version INTEGER NOT NULL DEFAULT 1)""",
+                """CREATE INDEX IF NOT EXISTS ix_llm_attempts_task_created
+                    ON llm_request_attempts(task_id, created_at DESC, attempt_id)""",
+                """CREATE INDEX IF NOT EXISTS ix_llm_attempts_logical
+                    ON llm_request_attempts(
+                        logical_request_id, request_revision, provider_attempt
+                    )""",
+                """CREATE INDEX IF NOT EXISTS ix_llm_attempts_schema_errors
+                    ON llm_request_attempts(
+                        error_stage, error_classification, created_at DESC
+                    )""",
+            ),
+        )
+
+    def _migration_16_llm_request_agent_role(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Repair early migration-15 databases created before agent_role landed."""
+
+        columns = self._columns(connection, "llm_request_attempts")
+        if "agent_role" not in columns:
+            connection.execute(
+                "ALTER TABLE llm_request_attempts ADD COLUMN agent_role TEXT"
+            )
+
+    def _migration_17_execution_recovery(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add immutable execution rosters and exactly-once recovery records."""
+
+        self._execute_all(
+            connection,
+            (
+                """CREATE TABLE IF NOT EXISTS execution_epochs (
+                    execution_epoch_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    epoch_number INTEGER NOT NULL CHECK(epoch_number >= 1),
+                    plan_revision INTEGER,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    expected_manager_count INTEGER NOT NULL DEFAULT 0
+                        CHECK(expected_manager_count >= 0),
+                    terminal_disposition TEXT,
+                    terminal_log_refs_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    roster_frozen_at TEXT,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(task_id, epoch_number))""",
+                """CREATE INDEX IF NOT EXISTS ix_execution_epochs_task
+                    ON execution_epochs(task_id, epoch_number DESC)""",
+                """CREATE TABLE IF NOT EXISTS execution_roster (
+                    execution_epoch_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    manager_agent_id TEXT NOT NULL,
+                    workstream_id TEXT NOT NULL,
+                    contract_id TEXT,
+                    contract_version INTEGER,
+                    roster_position INTEGER NOT NULL CHECK(roster_position >= 0),
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(execution_epoch_id, manager_agent_id),
+                    UNIQUE(execution_epoch_id, workstream_id),
+                    FOREIGN KEY(execution_epoch_id)
+                    REFERENCES execution_epochs(execution_epoch_id)
+                    ON DELETE CASCADE)""",
+                """CREATE INDEX IF NOT EXISTS ix_execution_roster_task
+                    ON execution_roster(task_id, execution_epoch_id,
+                        roster_position)""",
+                """CREATE TABLE IF NOT EXISTS remediation_attempts (
+                    remediation_attempt_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    execution_epoch_id TEXT,
+                    logical_agent_id TEXT NOT NULL,
+                    failure_signature TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    category TEXT,
+                    status TEXT NOT NULL DEFAULT 'reserved',
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    terminal_disposition TEXT,
+                    terminal_log_refs_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(task_id, logical_agent_id,
+                        failure_signature, strategy))""",
+                """CREATE INDEX IF NOT EXISTS ix_remediation_attempts_lookup
+                    ON remediation_attempts(task_id, logical_agent_id,
+                        failure_signature, created_at)""",
+                """CREATE TABLE IF NOT EXISTS manager_terminal_reports (
+                    report_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    execution_epoch_id TEXT NOT NULL,
+                    manager_agent_id TEXT NOT NULL,
+                    workstream_id TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    synthesized INTEGER NOT NULL DEFAULT 0
+                        CHECK(synthesized IN (0, 1)),
+                    report_json TEXT NOT NULL DEFAULT '{}',
+                    terminal_log_refs_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_id, execution_epoch_id, manager_agent_id),
+                    UNIQUE(task_id, execution_epoch_id, workstream_id),
+                    FOREIGN KEY(execution_epoch_id, manager_agent_id)
+                    REFERENCES execution_roster(
+                        execution_epoch_id, manager_agent_id
+                    ) ON DELETE CASCADE)""",
+                """CREATE INDEX IF NOT EXISTS ix_manager_reports_barrier
+                    ON manager_terminal_reports(
+                        task_id, execution_epoch_id, disposition
+                    )""",
+                """CREATE TABLE IF NOT EXISTS director_final_reviews (
+                    review_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    execution_epoch_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'reserved',
+                    verdict TEXT,
+                    logical_request_id TEXT,
+                    review_json TEXT NOT NULL DEFAULT '{}',
+                    terminal_disposition TEXT,
+                    terminal_log_refs_json TEXT NOT NULL DEFAULT '[]',
+                    reserved_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(task_id, execution_epoch_id),
+                    FOREIGN KEY(execution_epoch_id)
+                    REFERENCES execution_epochs(execution_epoch_id)
+                    ON DELETE CASCADE)""",
+                """CREATE INDEX IF NOT EXISTS ix_director_reviews_task
+                    ON director_final_reviews(task_id, execution_epoch_id)""",
+                """CREATE TABLE IF NOT EXISTS terminal_dispositions (
+                    disposition_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    execution_epoch_id TEXT NOT NULL,
+                    entity_kind TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    logical_agent_id TEXT,
+                    disposition TEXT NOT NULL,
+                    reason_code TEXT,
+                    summary TEXT NOT NULL DEFAULT '',
+                    terminal_log_refs_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(task_id, execution_epoch_id,
+                        entity_kind, entity_id))""",
+                """CREATE INDEX IF NOT EXISTS ix_terminal_dispositions_task
+                    ON terminal_dispositions(
+                        task_id, execution_epoch_id, entity_kind, disposition
                     )""",
             ),
         )
@@ -1719,6 +1947,1553 @@ class StateRepository:
                 raise RuntimeError("persisted handoff failed integrity check")
         return handoffs
 
+    @staticmethod
+    def _required_text(value: Any, field_name: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError(f"{field_name} must be a non-empty string")
+        return text
+
+    @staticmethod
+    def _execution_epoch_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["terminal_log_refs"] = _json_load(
+            result.pop("terminal_log_refs_json")
+        )
+        result["metadata"] = _json_load(result.pop("metadata_json"))
+        return result
+
+    @staticmethod
+    def _execution_roster_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["metadata"] = _json_load(result.pop("metadata_json"))
+        return result
+
+    def create_execution_epoch(
+        self,
+        task_id: str,
+        execution_epoch_id: str | None = None,
+        *,
+        epoch_number: int | None = None,
+        plan_revision: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Create one durable execution generation idempotently."""
+
+        task = self._required_text(task_id, "task_id")
+        if epoch_number is not None and (
+            not isinstance(epoch_number, int)
+            or isinstance(epoch_number, bool)
+            or epoch_number < 1
+        ):
+            raise ValueError("epoch_number must be a positive integer")
+        if plan_revision is not None and (
+            not isinstance(plan_revision, int)
+            or isinstance(plan_revision, bool)
+            or plan_revision < 1
+        ):
+            raise ValueError("plan_revision must be a positive integer")
+        timestamp = _coerce_datetime(now).isoformat()
+        metadata_json = _json_dump(dict(metadata or {}))
+        proposed_id = (
+            self._required_text(execution_epoch_id, "execution_epoch_id")
+            if execution_epoch_id is not None
+            else None
+        )
+        with self.transaction() as connection:
+            if proposed_id is not None:
+                existing = connection.execute(
+                    """
+                    SELECT * FROM execution_epochs
+                    WHERE execution_epoch_id = ?
+                    """,
+                    (proposed_id,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["task_id"]) != task:
+                        raise RuntimeError(
+                            "execution epoch conflict: task identity differs"
+                        )
+                    if (
+                        epoch_number is not None
+                        and int(existing["epoch_number"]) != epoch_number
+                    ):
+                        raise RuntimeError(
+                            "execution epoch conflict: epoch number differs"
+                        )
+                    if (
+                        plan_revision is not None
+                        and existing["plan_revision"] != plan_revision
+                    ):
+                        raise RuntimeError(
+                            "execution epoch conflict: plan revision differs"
+                        )
+                    if metadata is not None and str(
+                        existing["metadata_json"]
+                    ) != metadata_json:
+                        raise RuntimeError(
+                            "execution epoch conflict: metadata differs"
+                        )
+                    return self._execution_epoch_from_row(existing)
+
+            if epoch_number is None:
+                number_row = connection.execute(
+                    """
+                    SELECT MAX(epoch_number) AS epoch_number
+                    FROM execution_epochs WHERE task_id = ?
+                    """,
+                    (task,),
+                ).fetchone()
+                epoch_number = int(number_row["epoch_number"] or 0) + 1
+            by_number = connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE task_id = ? AND epoch_number = ?
+                """,
+                (task, epoch_number),
+            ).fetchone()
+            if by_number is not None:
+                if proposed_id not in (None, str(by_number["execution_epoch_id"])):
+                    raise RuntimeError(
+                        "execution epoch conflict: epoch number already exists"
+                    )
+                if (
+                    plan_revision is not None
+                    and by_number["plan_revision"] != plan_revision
+                ):
+                    raise RuntimeError(
+                        "execution epoch conflict: plan revision differs"
+                    )
+                if metadata is not None and str(
+                    by_number["metadata_json"]
+                ) != metadata_json:
+                    raise RuntimeError(
+                        "execution epoch conflict: metadata differs"
+                    )
+                return self._execution_epoch_from_row(by_number)
+
+            epoch_id = proposed_id or _stable_record_id(
+                "epoch",
+                task,
+                str(epoch_number),
+            )
+            connection.execute(
+                """
+                INSERT INTO execution_epochs(
+                    execution_epoch_id, task_id, epoch_number, plan_revision,
+                    status, expected_manager_count, terminal_log_refs_json,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'open', 0, '[]', ?, ?, ?)
+                """,
+                (
+                    epoch_id,
+                    task,
+                    epoch_number,
+                    plan_revision,
+                    metadata_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE execution_epoch_id = ?
+                """,
+                (epoch_id,),
+            ).fetchone()
+            assert row is not None
+            return self._execution_epoch_from_row(row)
+
+    # Rollout callers use both names; they intentionally share semantics.
+    begin_execution_epoch = create_execution_epoch
+    start_execution_epoch = create_execution_epoch
+
+    def get_execution_epoch(
+        self,
+        task_id: str,
+        execution_epoch_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        query = "SELECT * FROM execution_epochs WHERE task_id = ?"
+        parameters: tuple[Any, ...] = (task_id,)
+        if execution_epoch_id is not None:
+            query += " AND execution_epoch_id = ?"
+            parameters += (execution_epoch_id,)
+        query += " ORDER BY epoch_number DESC LIMIT 1"
+        with self._lock:
+            row = self._connection.execute(query, parameters).fetchone()
+        return self._execution_epoch_from_row(row) if row is not None else None
+
+    def list_execution_epochs(self, task_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE task_id = ? ORDER BY epoch_number
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._execution_epoch_from_row(row) for row in rows]
+
+    @staticmethod
+    def _normalize_execution_roster(
+        roster: Any,
+    ) -> list[dict[str, Any]]:
+        if isinstance(roster, Mapping):
+            if (
+                "manager_agent_id" in roster or "manager_id" in roster
+            ) and "workstream_id" in roster:
+                values: Sequence[Any] = (roster,)
+            else:
+                values = tuple(
+                    {
+                        "manager_agent_id": manager_id,
+                        "workstream_id": workstream_id,
+                    }
+                    for manager_id, workstream_id in roster.items()
+                )
+        else:
+            values = tuple(roster or ())
+        normalized: list[dict[str, Any]] = []
+        for index, value in enumerate(values):
+            if isinstance(value, Mapping):
+                manager_id = str(
+                    value.get("manager_agent_id")
+                    or value.get("manager_id")
+                    or value.get("logical_agent_id")
+                    or ""
+                ).strip()
+                workstream_id = str(value.get("workstream_id") or "").strip()
+                contract_id = value.get("contract_id")
+                contract_version = value.get("contract_version")
+                position = value.get("roster_position", index)
+                metadata = dict(value.get("metadata") or {})
+            else:
+                parts = tuple(value)
+                if len(parts) < 2:
+                    raise ValueError(
+                        "roster tuples require manager and workstream IDs"
+                    )
+                manager_id = str(parts[0]).strip()
+                workstream_id = str(parts[1]).strip()
+                contract_id = parts[2] if len(parts) > 2 else None
+                contract_version = parts[3] if len(parts) > 3 else None
+                position = index
+                metadata = {}
+            if not manager_id or not workstream_id:
+                raise ValueError(
+                    "roster manager_agent_id and workstream_id are required"
+                )
+            if (
+                not isinstance(position, int)
+                or isinstance(position, bool)
+                or position < 0
+            ):
+                raise ValueError(
+                    "roster_position must be a non-negative integer"
+                )
+            if contract_version is not None and (
+                not isinstance(contract_version, int)
+                or isinstance(contract_version, bool)
+                or contract_version < 1
+            ):
+                raise ValueError(
+                    "contract_version must be a positive integer"
+                )
+            normalized.append(
+                {
+                    "manager_agent_id": manager_id,
+                    "workstream_id": workstream_id,
+                    "contract_id": (
+                        str(contract_id) if contract_id is not None else None
+                    ),
+                    "contract_version": contract_version,
+                    "roster_position": position,
+                    "metadata": metadata,
+                }
+            )
+        manager_ids = [row["manager_agent_id"] for row in normalized]
+        workstream_ids = [row["workstream_id"] for row in normalized]
+        positions = [row["roster_position"] for row in normalized]
+        if len(manager_ids) != len(set(manager_ids)):
+            raise ValueError("execution roster contains duplicate Managers")
+        if len(workstream_ids) != len(set(workstream_ids)):
+            raise ValueError("execution roster contains duplicate workstreams")
+        if len(positions) != len(set(positions)):
+            raise ValueError("execution roster contains duplicate positions")
+        return sorted(normalized, key=lambda row: row["roster_position"])
+
+    def freeze_execution_roster(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+        roster: Any = None,
+        *,
+        managers: Any = None,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Persist the expected Manager roster once, with immutable retries."""
+
+        if (
+            roster is not None
+            and managers is not None
+            and roster != managers
+        ):
+            raise ValueError("roster and managers values disagree")
+        normalized = self._normalize_execution_roster(
+            roster if roster is not None else managers
+        )
+        task = self._required_text(task_id, "task_id")
+        epoch_id = self._required_text(
+            execution_epoch_id,
+            "execution_epoch_id",
+        )
+        timestamp = _coerce_datetime(now).isoformat()
+        with self.transaction() as connection:
+            epoch = connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE execution_epoch_id = ? AND task_id = ?
+                """,
+                (epoch_id, task),
+            ).fetchone()
+            if epoch is None:
+                raise RuntimeError("execution epoch has not been created")
+            existing_rows = connection.execute(
+                """
+                SELECT * FROM execution_roster
+                WHERE execution_epoch_id = ? ORDER BY roster_position
+                """,
+                (epoch_id,),
+            ).fetchall()
+            if epoch["roster_frozen_at"] is not None:
+                restored = [
+                    self._execution_roster_from_row(row)
+                    for row in existing_rows
+                ]
+                comparable = [
+                    {
+                        key: row[key]
+                        for key in (
+                            "manager_agent_id",
+                            "workstream_id",
+                            "contract_id",
+                            "contract_version",
+                            "roster_position",
+                            "metadata",
+                        )
+                    }
+                    for row in restored
+                ]
+                if comparable != normalized:
+                    raise RuntimeError(
+                        "execution roster conflict: frozen roster differs"
+                    )
+                return restored
+
+            for row in normalized:
+                connection.execute(
+                    """
+                    INSERT INTO execution_roster(
+                        execution_epoch_id, task_id, manager_agent_id,
+                        workstream_id, contract_id, contract_version,
+                        roster_position, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        epoch_id,
+                        task,
+                        row["manager_agent_id"],
+                        row["workstream_id"],
+                        row["contract_id"],
+                        row["contract_version"],
+                        row["roster_position"],
+                        _json_dump(row["metadata"]),
+                        timestamp,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE execution_epochs
+                SET status = 'roster_frozen', expected_manager_count = ?,
+                    roster_frozen_at = ?, updated_at = ?
+                WHERE execution_epoch_id = ?
+                """,
+                (len(normalized), timestamp, timestamp, epoch_id),
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM execution_roster
+                WHERE execution_epoch_id = ? ORDER BY roster_position
+                """,
+                (epoch_id,),
+            ).fetchall()
+            return [self._execution_roster_from_row(row) for row in rows]
+
+    save_execution_roster = freeze_execution_roster
+    freeze_manager_roster = freeze_execution_roster
+
+    def list_execution_roster(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM execution_roster
+                WHERE task_id = ? AND execution_epoch_id = ?
+                ORDER BY roster_position
+                """,
+                (task_id, execution_epoch_id),
+            ).fetchall()
+        return [self._execution_roster_from_row(row) for row in rows]
+
+    get_execution_roster = list_execution_roster
+
+    @staticmethod
+    def _remediation_attempt_from_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        result = dict(row)
+        result["details"] = _json_load(result.pop("details_json"))
+        result["terminal_log_refs"] = _json_load(
+            result.pop("terminal_log_refs_json")
+        )
+        return result
+
+    def reserve_remediation_attempt(
+        self,
+        task_id: str,
+        logical_agent_id: str,
+        failure_signature: str,
+        strategy: str,
+        *,
+        execution_epoch_id: str | None = None,
+        category: str | None = None,
+        details: Mapping[str, Any] | None = None,
+        terminal_log_refs: Sequence[Any] = (),
+        remediation_attempt_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Claim one strategy for a failure signature, or report it was used."""
+
+        task = self._required_text(task_id, "task_id")
+        agent_id = self._required_text(
+            logical_agent_id,
+            "logical_agent_id",
+        )
+        signature = self._required_text(
+            failure_signature,
+            "failure_signature",
+        )
+        strategy_name = self._required_text(strategy, "strategy")
+        epoch_id = (
+            self._required_text(execution_epoch_id, "execution_epoch_id")
+            if execution_epoch_id is not None
+            else None
+        )
+        timestamp = _coerce_datetime(now).isoformat()
+        attempt_id = remediation_attempt_id or _stable_record_id(
+            "remediation",
+            task,
+            agent_id,
+            signature,
+            strategy_name,
+        )
+        with self.transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM remediation_attempts
+                WHERE task_id = ? AND logical_agent_id = ?
+                  AND failure_signature = ? AND strategy = ?
+                """,
+                (task, agent_id, signature, strategy_name),
+            ).fetchone()
+            if existing is not None:
+                return None
+            if epoch_id is not None:
+                epoch = connection.execute(
+                    """
+                    SELECT 1 FROM execution_epochs
+                    WHERE task_id = ? AND execution_epoch_id = ?
+                    """,
+                    (task, epoch_id),
+                ).fetchone()
+                if epoch is None:
+                    raise RuntimeError("execution epoch has not been created")
+            connection.execute(
+                """
+                INSERT INTO remediation_attempts(
+                    remediation_attempt_id, task_id, execution_epoch_id,
+                    logical_agent_id, failure_signature, strategy, category,
+                    status, details_json, terminal_log_refs_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    task,
+                    epoch_id,
+                    agent_id,
+                    signature,
+                    strategy_name,
+                    category,
+                    _json_dump(dict(details or {})),
+                    _json_dump(list(terminal_log_refs)),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM remediation_attempts
+                WHERE remediation_attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            assert row is not None
+            return self._remediation_attempt_from_row(row)
+
+    begin_remediation_attempt = reserve_remediation_attempt
+    claim_remediation_strategy = reserve_remediation_attempt
+
+    def record_remediation_attempt(
+        self,
+        task_id: str,
+        logical_agent_id: str,
+        failure_signature: str,
+        strategy: str,
+        *,
+        execution_epoch_id: str | None = None,
+        category: str | None = None,
+        details: Mapping[str, Any] | None = None,
+        terminal_log_refs: Sequence[Any] = (),
+        remediation_attempt_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently return the unique durable strategy attempt."""
+
+        created = self.reserve_remediation_attempt(
+            task_id,
+            logical_agent_id,
+            failure_signature,
+            strategy,
+            execution_epoch_id=execution_epoch_id,
+            category=category,
+            details=details,
+            terminal_log_refs=terminal_log_refs,
+            remediation_attempt_id=remediation_attempt_id,
+            now=now,
+        )
+        if created is not None:
+            return created
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM remediation_attempts
+                WHERE task_id = ? AND logical_agent_id = ?
+                  AND failure_signature = ? AND strategy = ?
+                """,
+                (
+                    task_id,
+                    logical_agent_id,
+                    failure_signature,
+                    strategy,
+                ),
+            ).fetchone()
+        assert row is not None
+        restored = self._remediation_attempt_from_row(row)
+        if (
+            execution_epoch_id is not None
+            and restored["execution_epoch_id"] != execution_epoch_id
+        ) or (
+            category is not None and restored["category"] != category
+        ):
+            raise RuntimeError(
+                "remediation attempt conflict: immutable identity differs"
+            )
+        return restored
+
+    def complete_remediation_attempt(
+        self,
+        remediation_attempt_id: str,
+        *,
+        status: str,
+        details: Mapping[str, Any] | None = None,
+        terminal_disposition: str | None = None,
+        terminal_log_refs: Sequence[Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        attempt_id = self._required_text(
+            remediation_attempt_id,
+            "remediation_attempt_id",
+        )
+        final_status = self._required_text(status, "status")
+        timestamp = _coerce_datetime(now).isoformat()
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM remediation_attempts
+                WHERE remediation_attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(attempt_id)
+            restored = self._remediation_attempt_from_row(row)
+            next_details = (
+                dict(details) if details is not None else restored["details"]
+            )
+            next_refs = (
+                list(terminal_log_refs)
+                if terminal_log_refs is not None
+                else restored["terminal_log_refs"]
+            )
+            if row["completed_at"] is not None:
+                if (
+                    restored["status"] == final_status
+                    and restored["details"] == next_details
+                    and restored["terminal_disposition"]
+                    == terminal_disposition
+                    and restored["terminal_log_refs"] == next_refs
+                ):
+                    return restored
+                raise RuntimeError(
+                    "remediation attempt conflict: terminal result differs"
+                )
+            connection.execute(
+                """
+                UPDATE remediation_attempts
+                SET status = ?, details_json = ?,
+                    terminal_disposition = ?,
+                    terminal_log_refs_json = ?, completed_at = ?,
+                    updated_at = ?
+                WHERE remediation_attempt_id = ?
+                """,
+                (
+                    final_status,
+                    _json_dump(next_details),
+                    terminal_disposition,
+                    _json_dump(next_refs),
+                    timestamp,
+                    timestamp,
+                    attempt_id,
+                ),
+            )
+            completed = connection.execute(
+                """
+                SELECT * FROM remediation_attempts
+                WHERE remediation_attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            assert completed is not None
+            return self._remediation_attempt_from_row(completed)
+
+    def list_remediation_attempts(
+        self,
+        task_id: str,
+        *,
+        logical_agent_id: str | None = None,
+        failure_signature: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["task_id = ?"]
+        parameters: list[Any] = [task_id]
+        if logical_agent_id is not None:
+            clauses.append("logical_agent_id = ?")
+            parameters.append(logical_agent_id)
+        if failure_signature is not None:
+            clauses.append("failure_signature = ?")
+            parameters.append(failure_signature)
+        query = (
+            "SELECT * FROM remediation_attempts WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at, remediation_attempt_id"
+        )
+        with self._lock:
+            rows = self._connection.execute(query, tuple(parameters)).fetchall()
+        return [self._remediation_attempt_from_row(row) for row in rows]
+
+    @staticmethod
+    def _manager_terminal_report_from_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        result = dict(row)
+        result["synthesized"] = bool(result["synthesized"])
+        result["report"] = _json_load(result.pop("report_json"))
+        result["terminal_log_refs"] = _json_load(
+            result.pop("terminal_log_refs_json")
+        )
+        return result
+
+    def record_manager_terminal_report(
+        self,
+        task_id: str | Mapping[str, Any],
+        execution_epoch_id: str | None = None,
+        manager_agent_id: str | None = None,
+        workstream_id: str | None = None,
+        disposition: str | None = None,
+        *,
+        report: Mapping[str, Any] | None = None,
+        terminal_log_refs: Sequence[Any] | None = None,
+        synthesized: bool | None = None,
+        report_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Persist one immutable terminal report per rostered Manager."""
+
+        if isinstance(task_id, Mapping):
+            payload = dict(task_id)
+            task_id = str(payload.get("task_id") or "")
+            execution_epoch_id = str(
+                payload.get("execution_epoch_id")
+                or payload.get("epoch_id")
+                or execution_epoch_id
+                or ""
+            )
+            manager_agent_id = str(
+                payload.get("manager_agent_id")
+                or payload.get("manager_id")
+                or manager_agent_id
+                or ""
+            )
+            workstream_id = str(
+                payload.get("workstream_id")
+                or workstream_id
+                or ""
+            )
+            disposition = str(
+                payload.get("disposition")
+                or payload.get("status")
+                or disposition
+                or ""
+            )
+            if report is None:
+                report = payload
+            if terminal_log_refs is None:
+                terminal_log_refs = list(
+                    payload.get("terminal_log_refs")
+                    or payload.get("log_refs")
+                    or ()
+                )
+            if synthesized is None:
+                synthesized = bool(payload.get("synthesized", False))
+            if report_id is None:
+                report_id = payload.get("report_id")
+        task = self._required_text(task_id, "task_id")
+        epoch_id = self._required_text(
+            execution_epoch_id,
+            "execution_epoch_id",
+        )
+        manager_id = self._required_text(
+            manager_agent_id,
+            "manager_agent_id",
+        )
+        stream_id = self._required_text(
+            workstream_id,
+            "workstream_id",
+        )
+        terminal = self._required_text(
+            disposition,
+            "disposition",
+        ).lower()
+        if terminal not in {"completed", "partial", "abandoned"}:
+            raise ValueError(
+                "Manager disposition must be completed, partial, or abandoned"
+            )
+        report_payload = dict(report or {})
+        refs = list(terminal_log_refs or ())
+        is_synthesized = bool(synthesized)
+        identity = report_id or _stable_record_id(
+            "manager_report",
+            task,
+            epoch_id,
+            manager_id,
+        )
+        timestamp = _coerce_datetime(now).isoformat()
+        report_json = _json_dump(report_payload)
+        refs_json = _json_dump(refs)
+
+        with self.transaction() as connection:
+            roster = connection.execute(
+                """
+                SELECT workstream_id FROM execution_roster
+                WHERE task_id = ? AND execution_epoch_id = ?
+                  AND manager_agent_id = ?
+                """,
+                (task, epoch_id, manager_id),
+            ).fetchone()
+            if roster is None:
+                raise RuntimeError(
+                    "Manager terminal report is not in the frozen roster"
+                )
+            if str(roster["workstream_id"]) != stream_id:
+                raise RuntimeError(
+                    "Manager terminal report workstream differs from roster"
+                )
+            existing = connection.execute(
+                """
+                SELECT * FROM manager_terminal_reports
+                WHERE task_id = ? AND execution_epoch_id = ?
+                  AND manager_agent_id = ?
+                """,
+                (task, epoch_id, manager_id),
+            ).fetchone()
+            if existing is not None:
+                restored = self._manager_terminal_report_from_row(existing)
+                if (
+                    restored["workstream_id"] == stream_id
+                    and restored["disposition"] == terminal
+                    and restored["synthesized"] == is_synthesized
+                    and restored["report"] == report_payload
+                    and restored["terminal_log_refs"] == refs
+                ):
+                    return restored
+                raise RuntimeError(
+                    "Manager terminal report conflict: exactly-once record differs"
+                )
+            report_collision = connection.execute(
+                """
+                SELECT task_id, execution_epoch_id, manager_agent_id
+                FROM manager_terminal_reports WHERE report_id = ?
+                """,
+                (identity,),
+            ).fetchone()
+            if report_collision is not None:
+                raise RuntimeError(
+                    "Manager terminal report conflict: report ID is in use"
+                )
+            stream_collision = connection.execute(
+                """
+                SELECT manager_agent_id FROM manager_terminal_reports
+                WHERE task_id = ? AND execution_epoch_id = ?
+                  AND workstream_id = ?
+                """,
+                (task, epoch_id, stream_id),
+            ).fetchone()
+            if stream_collision is not None:
+                raise RuntimeError(
+                    "Manager terminal report conflict: workstream already reported"
+                )
+            connection.execute(
+                """
+                INSERT INTO manager_terminal_reports(
+                    report_id, task_id, execution_epoch_id,
+                    manager_agent_id, workstream_id, disposition,
+                    synthesized, report_json, terminal_log_refs_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity,
+                    task,
+                    epoch_id,
+                    manager_id,
+                    stream_id,
+                    terminal,
+                    int(is_synthesized),
+                    report_json,
+                    refs_json,
+                    timestamp,
+                ),
+            )
+            counts = connection.execute(
+                """
+                SELECT
+                    (SELECT expected_manager_count FROM execution_epochs
+                     WHERE execution_epoch_id = ?) AS expected,
+                    COUNT(*) AS received
+                FROM manager_terminal_reports
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (epoch_id, task, epoch_id),
+            ).fetchone()
+            if int(counts["received"]) == int(counts["expected"]):
+                connection.execute(
+                    """
+                    UPDATE execution_epochs
+                    SET status = 'reports_complete', updated_at = ?
+                    WHERE execution_epoch_id = ?
+                    """,
+                    (timestamp, epoch_id),
+                )
+            stored = connection.execute(
+                """
+                SELECT * FROM manager_terminal_reports
+                WHERE report_id = ?
+                """,
+                (identity,),
+            ).fetchone()
+            assert stored is not None
+            return self._manager_terminal_report_from_row(stored)
+
+    save_manager_terminal_report = record_manager_terminal_report
+    record_manager_report = record_manager_terminal_report
+
+    def list_manager_terminal_reports(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT reports.*
+                FROM manager_terminal_reports AS reports
+                JOIN execution_roster AS roster
+                  ON roster.execution_epoch_id = reports.execution_epoch_id
+                 AND roster.manager_agent_id = reports.manager_agent_id
+                WHERE reports.task_id = ?
+                  AND reports.execution_epoch_id = ?
+                ORDER BY roster.roster_position
+                """,
+                (task_id, execution_epoch_id),
+            ).fetchall()
+        return [self._manager_terminal_report_from_row(row) for row in rows]
+
+    def manager_report_barrier(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            epoch = self._connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (task_id, execution_epoch_id),
+            ).fetchone()
+            if epoch is None:
+                raise KeyError(execution_epoch_id)
+            rows = self._connection.execute(
+                """
+                SELECT roster.manager_agent_id, roster.workstream_id,
+                       reports.disposition
+                FROM execution_roster AS roster
+                LEFT JOIN manager_terminal_reports AS reports
+                  ON reports.execution_epoch_id = roster.execution_epoch_id
+                 AND reports.manager_agent_id = roster.manager_agent_id
+                WHERE roster.task_id = ?
+                  AND roster.execution_epoch_id = ?
+                ORDER BY roster.roster_position
+                """,
+                (task_id, execution_epoch_id),
+            ).fetchall()
+        missing = [
+            str(row["manager_agent_id"])
+            for row in rows
+            if row["disposition"] is None
+        ]
+        counts = {"completed": 0, "partial": 0, "abandoned": 0}
+        for row in rows:
+            if row["disposition"] in counts:
+                counts[str(row["disposition"])] += 1
+        expected = int(epoch["expected_manager_count"])
+        received = len(rows) - len(missing)
+        satisfied = (
+            epoch["roster_frozen_at"] is not None
+            and received == expected
+            and not missing
+        )
+        return {
+            "task_id": task_id,
+            "execution_epoch_id": execution_epoch_id,
+            "expected": expected,
+            "received": received,
+            "missing_manager_ids": missing,
+            "disposition_counts": counts,
+            "satisfied": satisfied,
+            "all_completed": satisfied and counts["completed"] == expected,
+        }
+
+    get_manager_report_barrier = manager_report_barrier
+    manager_reports_barrier = manager_report_barrier
+
+    @staticmethod
+    def _director_final_review_from_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        result = dict(row)
+        result["review"] = _json_load(result.pop("review_json"))
+        result["terminal_log_refs"] = _json_load(
+            result.pop("terminal_log_refs_json")
+        )
+        return result
+
+    def reserve_director_final_review(
+        self,
+        task_id: str | Mapping[str, Any],
+        execution_epoch_id: str | None = None,
+        *,
+        review_id: str | None = None,
+        logical_request_id: str | None = None,
+        review_context: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Reserve the epoch's sole Director invocation before calling it."""
+
+        if isinstance(task_id, Mapping):
+            payload = dict(task_id)
+            task_id = str(payload.get("task_id") or "")
+            execution_epoch_id = str(
+                payload.get("execution_epoch_id")
+                or payload.get("epoch_id")
+                or execution_epoch_id
+                or ""
+            )
+            review_id = review_id or payload.get("review_id")
+            logical_request_id = (
+                logical_request_id or payload.get("logical_request_id")
+            )
+            if review_context is None:
+                review_context = dict(
+                    payload.get("review_context")
+                    or payload.get("context")
+                    or {}
+                )
+        task = self._required_text(task_id, "task_id")
+        epoch_id = self._required_text(
+            execution_epoch_id,
+            "execution_epoch_id",
+        )
+        identity = review_id or _stable_record_id(
+            "director_review",
+            task,
+            epoch_id,
+        )
+        timestamp = _coerce_datetime(now).isoformat()
+        with self.transaction() as connection:
+            epoch = connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (task, epoch_id),
+            ).fetchone()
+            if epoch is None:
+                raise RuntimeError("execution epoch has not been created")
+            expected = int(epoch["expected_manager_count"])
+            received = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM manager_terminal_reports
+                    WHERE task_id = ? AND execution_epoch_id = ?
+                    """,
+                    (task, epoch_id),
+                ).fetchone()[0]
+            )
+            if epoch["roster_frozen_at"] is None or received != expected:
+                raise RuntimeError(
+                    "Director final review requires the N/N Manager report barrier"
+                )
+            existing = connection.execute(
+                """
+                SELECT * FROM director_final_reviews
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (task, epoch_id),
+            ).fetchone()
+            if existing is not None:
+                return None
+            collision = connection.execute(
+                "SELECT 1 FROM director_final_reviews WHERE review_id = ?",
+                (identity,),
+            ).fetchone()
+            if collision is not None:
+                raise RuntimeError(
+                    "Director final review conflict: review ID is in use"
+                )
+            connection.execute(
+                """
+                INSERT INTO director_final_reviews(
+                    review_id, task_id, execution_epoch_id, status,
+                    logical_request_id, review_json,
+                    terminal_log_refs_json, reserved_at, updated_at
+                ) VALUES (?, ?, ?, 'reserved', ?, ?, '[]', ?, ?)
+                """,
+                (
+                    identity,
+                    task,
+                    epoch_id,
+                    logical_request_id,
+                    _json_dump(dict(review_context or {})),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE execution_epochs
+                SET status = 'review_reserved', updated_at = ?
+                WHERE execution_epoch_id = ?
+                """,
+                (timestamp, epoch_id),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM director_final_reviews WHERE review_id = ?
+                """,
+                (identity,),
+            ).fetchone()
+            assert row is not None
+            return self._director_final_review_from_row(row)
+
+    begin_director_final_review = reserve_director_final_review
+    reserve_final_review = reserve_director_final_review
+
+    def get_director_final_review(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM director_final_reviews
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (task_id, execution_epoch_id),
+            ).fetchone()
+        return (
+            self._director_final_review_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def complete_director_final_review(
+        self,
+        review_id: str,
+        *,
+        verdict: str,
+        review: Mapping[str, Any] | None = None,
+        status: str = "completed",
+        terminal_disposition: str | None = None,
+        terminal_log_refs: Sequence[Any] = (),
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        identity = self._required_text(review_id, "review_id")
+        verdict_value = self._required_text(verdict, "verdict")
+        status_value = self._required_text(status, "status")
+        review_payload = dict(review or {})
+        refs = list(terminal_log_refs)
+        timestamp = _coerce_datetime(now).isoformat()
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM director_final_reviews WHERE review_id = ?
+                """,
+                (identity,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(identity)
+            restored = self._director_final_review_from_row(row)
+            if row["completed_at"] is not None:
+                if (
+                    restored["status"] == status_value
+                    and restored["verdict"] == verdict_value
+                    and restored["review"] == review_payload
+                    and restored["terminal_disposition"]
+                    == terminal_disposition
+                    and restored["terminal_log_refs"] == refs
+                ):
+                    return restored
+                raise RuntimeError(
+                    "Director final review conflict: terminal record differs"
+                )
+            connection.execute(
+                """
+                UPDATE director_final_reviews
+                SET status = ?, verdict = ?, review_json = ?,
+                    terminal_disposition = ?,
+                    terminal_log_refs_json = ?, completed_at = ?,
+                    updated_at = ?
+                WHERE review_id = ?
+                """,
+                (
+                    status_value,
+                    verdict_value,
+                    _json_dump(review_payload),
+                    terminal_disposition,
+                    _json_dump(refs),
+                    timestamp,
+                    timestamp,
+                    identity,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE execution_epochs
+                SET status = 'final_review_complete', updated_at = ?
+                WHERE execution_epoch_id = ?
+                """,
+                (timestamp, restored["execution_epoch_id"]),
+            )
+            completed = connection.execute(
+                """
+                SELECT * FROM director_final_reviews WHERE review_id = ?
+                """,
+                (identity,),
+            ).fetchone()
+            assert completed is not None
+            return self._director_final_review_from_row(completed)
+
+    def record_director_final_review(
+        self,
+        task_id: str | Mapping[str, Any],
+        execution_epoch_id: str | None = None,
+        *,
+        verdict: str | None = None,
+        review: Mapping[str, Any] | None = None,
+        status: str = "completed",
+        terminal_disposition: str | None = None,
+        terminal_log_refs: Sequence[Any] | None = None,
+        review_id: str | None = None,
+        logical_request_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Reserve and complete the unique final review in one convenience API."""
+
+        if isinstance(task_id, Mapping):
+            payload = dict(task_id)
+            raw_task_id = str(payload.get("task_id") or "")
+            raw_epoch_id = str(
+                payload.get("execution_epoch_id")
+                or payload.get("epoch_id")
+                or execution_epoch_id
+                or ""
+            )
+            verdict = str(
+                payload.get("verdict") or verdict or ""
+            )
+            status = str(payload.get("status") or status)
+            terminal_disposition = (
+                payload.get("terminal_disposition")
+                or terminal_disposition
+            )
+            if review is None:
+                review = dict(payload.get("review") or payload)
+            if terminal_log_refs is None:
+                terminal_log_refs = list(
+                    payload.get("terminal_log_refs")
+                    or payload.get("log_refs")
+                    or ()
+                )
+            review_id = review_id or payload.get("review_id")
+            logical_request_id = (
+                logical_request_id or payload.get("logical_request_id")
+            )
+            task_id = raw_task_id
+            execution_epoch_id = raw_epoch_id
+        if not str(task_id or "").strip() and str(
+            execution_epoch_id or ""
+        ).strip():
+            with self._lock:
+                owner = self._connection.execute(
+                    """
+                    SELECT task_id FROM director_final_reviews
+                    WHERE execution_epoch_id = ?
+                    """,
+                    (execution_epoch_id,),
+                ).fetchone()
+            if owner is not None:
+                task_id = str(owner["task_id"])
+        task = self._required_text(task_id, "task_id")
+        epoch_id = self._required_text(
+            execution_epoch_id,
+            "execution_epoch_id",
+        )
+        verdict_value = self._required_text(verdict, "verdict")
+        reserved = self.reserve_director_final_review(
+            task,
+            epoch_id,
+            review_id=review_id,
+            logical_request_id=logical_request_id,
+            now=now,
+        )
+        existing = reserved or self.get_director_final_review(task, epoch_id)
+        assert existing is not None
+        return self.complete_director_final_review(
+            str(existing["review_id"]),
+            verdict=verdict_value,
+            review=review,
+            status=status,
+            terminal_disposition=terminal_disposition,
+            terminal_log_refs=terminal_log_refs or (),
+            now=now,
+        )
+
+    record_final_review = record_director_final_review
+
+    @staticmethod
+    def _terminal_disposition_from_row(
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        result = dict(row)
+        result["terminal_log_refs"] = _json_load(
+            result.pop("terminal_log_refs_json")
+        )
+        result["metadata"] = _json_load(result.pop("metadata_json"))
+        return result
+
+    def record_terminal_disposition(
+        self,
+        task_id: str | Mapping[str, Any],
+        execution_epoch_id: str | None = None,
+        entity_kind: str | None = None,
+        entity_id: str | None = None,
+        disposition: str | None = None,
+        *,
+        logical_agent_id: str | None = None,
+        reason_code: str | None = None,
+        summary: str = "",
+        terminal_log_refs: Sequence[Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        disposition_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Persist immutable terminal outcome and pinned log references."""
+
+        if isinstance(task_id, Mapping):
+            payload = dict(task_id)
+            task_id = str(payload.get("task_id") or "")
+            execution_epoch_id = str(
+                payload.get("execution_epoch_id")
+                or payload.get("epoch_id")
+                or execution_epoch_id
+                or ""
+            )
+            entity_kind = str(
+                payload.get("entity_kind")
+                or payload.get("kind")
+                or entity_kind
+                or ""
+            )
+            entity_id = str(payload.get("entity_id") or entity_id or "")
+            disposition = str(
+                payload.get("disposition")
+                or payload.get("status")
+                or disposition
+                or ""
+            )
+            logical_agent_id = (
+                payload.get("logical_agent_id") or logical_agent_id
+            )
+            reason_code = payload.get("reason_code") or reason_code
+            summary = str(payload.get("summary") or summary)
+            if terminal_log_refs is None:
+                terminal_log_refs = list(
+                    payload.get("terminal_log_refs")
+                    or payload.get("log_refs")
+                    or ()
+                )
+            if metadata is None:
+                metadata = dict(payload.get("metadata") or {})
+            disposition_id = disposition_id or payload.get("disposition_id")
+        task = self._required_text(task_id, "task_id")
+        epoch_id = self._required_text(
+            execution_epoch_id,
+            "execution_epoch_id",
+        )
+        kind = self._required_text(entity_kind, "entity_kind")
+        target_id = self._required_text(entity_id, "entity_id")
+        terminal = self._required_text(disposition, "disposition").lower()
+        refs = list(terminal_log_refs or ())
+        metadata_value = dict(metadata or {})
+        identity = disposition_id or _stable_record_id(
+            "terminal",
+            task,
+            epoch_id,
+            kind,
+            target_id,
+        )
+        timestamp = _coerce_datetime(now).isoformat()
+        with self.transaction() as connection:
+            epoch = connection.execute(
+                """
+                SELECT 1 FROM execution_epochs
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (task, epoch_id),
+            ).fetchone()
+            if epoch is None:
+                raise RuntimeError("execution epoch has not been created")
+            existing = connection.execute(
+                """
+                SELECT * FROM terminal_dispositions
+                WHERE task_id = ? AND execution_epoch_id = ?
+                  AND entity_kind = ? AND entity_id = ?
+                """,
+                (task, epoch_id, kind, target_id),
+            ).fetchone()
+            if existing is not None:
+                restored = self._terminal_disposition_from_row(existing)
+                if (
+                    restored["logical_agent_id"] == logical_agent_id
+                    and restored["disposition"] == terminal
+                    and restored["reason_code"] == reason_code
+                    and restored["summary"] == summary
+                    and restored["terminal_log_refs"] == refs
+                    and restored["metadata"] == metadata_value
+                ):
+                    return restored
+                raise RuntimeError(
+                    "terminal disposition conflict: immutable record differs"
+                )
+            connection.execute(
+                """
+                INSERT INTO terminal_dispositions(
+                    disposition_id, task_id, execution_epoch_id,
+                    entity_kind, entity_id, logical_agent_id, disposition,
+                    reason_code, summary, terminal_log_refs_json,
+                    metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity,
+                    task,
+                    epoch_id,
+                    kind,
+                    target_id,
+                    logical_agent_id,
+                    terminal,
+                    reason_code,
+                    summary,
+                    _json_dump(refs),
+                    _json_dump(metadata_value),
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM terminal_dispositions
+                WHERE disposition_id = ?
+                """,
+                (identity,),
+            ).fetchone()
+            assert row is not None
+            return self._terminal_disposition_from_row(row)
+
+    save_terminal_disposition = record_terminal_disposition
+    record_agent_terminal_disposition = record_terminal_disposition
+
+    def list_terminal_dispositions(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+        *,
+        entity_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT * FROM terminal_dispositions
+            WHERE task_id = ? AND execution_epoch_id = ?
+        """
+        parameters: list[Any] = [task_id, execution_epoch_id]
+        if entity_kind is not None:
+            query += " AND entity_kind = ?"
+            parameters.append(entity_kind)
+        query += " ORDER BY created_at, disposition_id"
+        with self._lock:
+            rows = self._connection.execute(query, tuple(parameters)).fetchall()
+        return [self._terminal_disposition_from_row(row) for row in rows]
+
+    def pin_log_references(
+        self,
+        task_id: str,
+        log_refs: Sequence[str] = (),
+        *,
+        references: Sequence[str] = (),
+        reason: str = "terminal_evidence",
+    ) -> int:
+        """Protect referenced durable logs from non-terminal retention."""
+
+        del reason
+        paths = sorted(
+            {
+                str(value)
+                for value in (*tuple(log_refs), *tuple(references))
+                if str(value).strip()
+            }
+        )
+        if not paths:
+            return 0
+        placeholders = ",".join("?" for _ in paths)
+        with self.transaction() as connection:
+            return connection.execute(
+                f"""
+                UPDATE log_records SET terminal_evidence = 1
+                WHERE task_id = ? AND path IN ({placeholders})
+                """,
+                (task_id, *paths),
+            ).rowcount
+
+    pin_terminal_logs = pin_log_references
+
+    def complete_execution_epoch(
+        self,
+        task_id: str,
+        execution_epoch_id: str,
+        *,
+        disposition: str,
+        terminal_log_refs: Sequence[Any] = (),
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        task = self._required_text(task_id, "task_id")
+        epoch_id = self._required_text(
+            execution_epoch_id,
+            "execution_epoch_id",
+        )
+        terminal = self._required_text(disposition, "disposition").lower()
+        refs = list(terminal_log_refs)
+        timestamp = _coerce_datetime(now).isoformat()
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE task_id = ? AND execution_epoch_id = ?
+                """,
+                (task, epoch_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(epoch_id)
+            restored = self._execution_epoch_from_row(row)
+            if row["completed_at"] is not None:
+                if (
+                    restored["terminal_disposition"] == terminal
+                    and restored["terminal_log_refs"] == refs
+                ):
+                    return restored
+                raise RuntimeError(
+                    "execution epoch conflict: terminal outcome differs"
+                )
+            connection.execute(
+                """
+                UPDATE execution_epochs
+                SET status = 'terminal', terminal_disposition = ?,
+                    terminal_log_refs_json = ?, completed_at = ?,
+                    updated_at = ?
+                WHERE execution_epoch_id = ?
+                """,
+                (
+                    terminal,
+                    _json_dump(refs),
+                    timestamp,
+                    timestamp,
+                    epoch_id,
+                ),
+            )
+            completed = connection.execute(
+                """
+                SELECT * FROM execution_epochs
+                WHERE execution_epoch_id = ?
+                """,
+                (epoch_id,),
+            ).fetchone()
+            assert completed is not None
+            return self._execution_epoch_from_row(completed)
+
     def save_plan(
         self, plan: TaskPlan, *, expected_previous_revision: int | None = None
     ) -> None:
@@ -2244,6 +4019,294 @@ class StateRepository:
             item["attributes"] = _json_load(item.pop("attributes_json"))
             result.append(item)
         return result
+
+    @staticmethod
+    def _llm_request_attempt_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        for column, field_name in (
+            ("logical_request_json", "logical_request"),
+            ("tool_schema_json", "tool_schema"),
+            ("wire_body_json", "wire_body"),
+            ("response_headers_json", "response_headers"),
+            ("response_body_json", "response_body"),
+            ("parser_result_json", "parser_result"),
+        ):
+            item[field_name] = _json_load(item.pop(column))
+        if item["retryable"] is not None:
+            item["retryable"] = bool(item["retryable"])
+        return item
+
+    def create_llm_request_attempt(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Create one immutable attempt identity with mutable lifecycle fields."""
+
+        value = dict(sanitize_llm_request_attempt(dict(record)))
+        required = (
+            "attempt_id",
+            "logical_request_id",
+            "provider",
+        )
+        if any(not str(value.get(field) or "").strip() for field in required):
+            raise ValueError("attempt_id, logical_request_id, and provider are required")
+        request_revision = int(value.get("request_revision") or 1)
+        provider_attempt = int(value.get("provider_attempt") or 1)
+        if request_revision < 1 or provider_attempt < 1:
+            raise ValueError("request_revision and provider_attempt must be positive")
+        status = str(value.get("status") or "started")
+        if status not in {"started", "completed", "failed", "aborted"}:
+            raise ValueError("invalid LLM request attempt status")
+        created_at = value.get("created_at") or _utc_now()
+        if isinstance(created_at, datetime):
+            created_at = _coerce_datetime(created_at).isoformat()
+        updated_at = value.get("updated_at") or created_at
+        if isinstance(updated_at, datetime):
+            updated_at = _coerce_datetime(updated_at).isoformat()
+        attempt_id = str(value["attempt_id"])
+        with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM llm_request_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["logical_request_id"] != str(value["logical_request_id"])
+                    or int(existing["request_revision"]) != request_revision
+                    or int(existing["provider_attempt"]) != provider_attempt
+                    or existing["provider"] != str(value["provider"])
+                ):
+                    raise RuntimeError("LLM attempt identity conflict")
+                return self._llm_request_attempt_from_row(existing)
+            connection.execute(
+                """INSERT INTO llm_request_attempts(
+                    attempt_id, task_id, session_id, agent_instance_id,
+                    agent_role, manager_id, workstream_id, work_item_id,
+                    execution_attempt_id, call_purpose, logical_request_id,
+                    request_revision, provider_attempt, provider, account_ref,
+                    org_ref, route, model, effort, max_tokens,
+                    request_fingerprint, wire_fingerprint,
+                    logical_request_json, tool_schema_json, wire_body_json,
+                    response_status, response_headers_json, response_body_json,
+                    parser_result_json, status, error_stage,
+                    error_classification, error_type, error_message, retryable,
+                    probe_of_attempt_id, created_at, transport_started_at,
+                    response_received_at, completed_at, updated_at, duration_ms,
+                    transport_duration_ms, redaction_version
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )""",
+                (
+                    attempt_id,
+                    value.get("task_id"),
+                    value.get("session_id"),
+                    value.get("agent_instance_id"),
+                    value.get("agent_role"),
+                    value.get("manager_id"),
+                    value.get("workstream_id"),
+                    value.get("work_item_id"),
+                    value.get("execution_attempt_id"),
+                    value.get("call_purpose"),
+                    str(value["logical_request_id"]),
+                    request_revision,
+                    provider_attempt,
+                    str(value["provider"]),
+                    value.get("account_ref"),
+                    value.get("org_ref"),
+                    value.get("route"),
+                    value.get("model"),
+                    value.get("effort"),
+                    value.get("max_tokens"),
+                    value.get("request_fingerprint"),
+                    value.get("wire_fingerprint"),
+                    _json_dump(value.get("logical_request") or {}),
+                    _json_dump(value.get("tool_schema") or []),
+                    _json_dump(value.get("wire_body") or {}),
+                    value.get("response_status"),
+                    _json_dump(value.get("response_headers") or {}),
+                    _json_dump(value.get("response_body")),
+                    _json_dump(value.get("parser_result")),
+                    status,
+                    value.get("error_stage"),
+                    value.get("error_classification"),
+                    value.get("error_type"),
+                    value.get("error_message"),
+                    (
+                        None
+                        if value.get("retryable") is None
+                        else int(bool(value.get("retryable")))
+                    ),
+                    value.get("probe_of_attempt_id"),
+                    str(created_at),
+                    value.get("transport_started_at"),
+                    value.get("response_received_at"),
+                    value.get("completed_at"),
+                    str(updated_at),
+                    value.get("duration_ms"),
+                    value.get("transport_duration_ms"),
+                    int(value.get("redaction_version") or 1),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM llm_request_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._llm_request_attempt_from_row(row)
+
+    def update_llm_request_attempt(
+        self,
+        attempt_id: str,
+        updates: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Update transport, parser, diagnosis, or terminal attempt evidence."""
+
+        if not attempt_id.strip():
+            raise ValueError("attempt_id is required")
+        value = dict(sanitize_llm_request_attempt(dict(updates)))
+        immutable = {
+            "attempt_id",
+            "logical_request_id",
+            "request_revision",
+            "provider_attempt",
+            "provider",
+            "created_at",
+        }
+        if immutable.intersection(value):
+            raise ValueError("attempt identity fields cannot be updated")
+        json_fields = {
+            "logical_request": "logical_request_json",
+            "tool_schema": "tool_schema_json",
+            "wire_body": "wire_body_json",
+            "response_headers": "response_headers_json",
+            "response_body": "response_body_json",
+            "parser_result": "parser_result_json",
+        }
+        allowed = {
+            "task_id",
+            "session_id",
+            "agent_instance_id",
+            "agent_role",
+            "manager_id",
+            "workstream_id",
+            "work_item_id",
+            "execution_attempt_id",
+            "call_purpose",
+            "account_ref",
+            "org_ref",
+            "route",
+            "model",
+            "effort",
+            "max_tokens",
+            "request_fingerprint",
+            "wire_fingerprint",
+            "response_status",
+            "status",
+            "error_stage",
+            "error_classification",
+            "error_type",
+            "error_message",
+            "retryable",
+            "probe_of_attempt_id",
+            "transport_started_at",
+            "response_received_at",
+            "completed_at",
+            "duration_ms",
+            "transport_duration_ms",
+            "redaction_version",
+            *json_fields,
+        }
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"unsupported LLM attempt update fields: {sorted(unknown)}")
+        if "status" in value and value["status"] not in {
+            "started",
+            "completed",
+            "failed",
+            "aborted",
+        }:
+            raise ValueError("invalid LLM request attempt status")
+        assignments: list[str] = []
+        params: list[Any] = []
+        for field, field_value in value.items():
+            column = json_fields.get(field, field)
+            if field in json_fields:
+                field_value = _json_dump(field_value)
+            elif field == "retryable" and field_value is not None:
+                field_value = int(bool(field_value))
+            elif isinstance(field_value, datetime):
+                field_value = _coerce_datetime(field_value).isoformat()
+            assignments.append(f"{column} = ?")
+            params.append(field_value)
+        assignments.append("updated_at = ?")
+        params.append(_coerce_datetime(now).isoformat())
+        params.append(attempt_id)
+        with self.transaction() as connection:
+            updated = connection.execute(
+                f"UPDATE llm_request_attempts SET {', '.join(assignments)} "
+                "WHERE attempt_id = ?",
+                tuple(params),
+            ).rowcount
+            if updated != 1:
+                raise KeyError(attempt_id)
+            row = connection.execute(
+                "SELECT * FROM llm_request_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._llm_request_attempt_from_row(row)
+
+    def list_llm_request_attempts(
+        self,
+        task_id: str | None = None,
+        *,
+        logical_request_id: str | None = None,
+        schema_errors_only: bool = False,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 10000:
+            raise ValueError("limit must be between 1 and 10000")
+        query = "SELECT * FROM llm_request_attempts WHERE 1"
+        params: list[Any] = []
+        if task_id is not None:
+            query += " AND task_id = ?"
+            params.append(task_id)
+        if logical_request_id is not None:
+            query += " AND logical_request_id = ?"
+            params.append(logical_request_id)
+        if schema_errors_only:
+            query += (
+                " AND (error_stage = 'parser' OR error_classification IN "
+                "('malformed_input','schema_error','protocol_error',"
+                "'provider_conversation_input'))"
+            )
+        query += " ORDER BY created_at DESC, attempt_id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._connection.execute(query, tuple(params)).fetchall()
+        return [self._llm_request_attempt_from_row(row) for row in rows]
+
+    def compact_llm_request_attempts(
+        self,
+        policy: RetentionPolicy | None = None,
+        *,
+        task_id: str | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        retention = policy or RetentionPolicy.from_environment()
+        cutoff = (
+            _coerce_datetime(now) - timedelta(days=retention.llm_request_days)
+        ).isoformat()
+        query = "DELETE FROM llm_request_attempts WHERE updated_at < ?"
+        params: list[Any] = [cutoff]
+        if task_id is not None:
+            query += " AND task_id = ?"
+            params.append(task_id)
+        with self.transaction() as connection:
+            cursor = connection.execute(query, tuple(params))
+        return cursor.rowcount
 
     def record_log_metadata(
         self,
@@ -2813,6 +4876,10 @@ class StateRepository:
             "logs": self.compact_log_records(retention, now=current),
             "artifacts": self.compact_artifact_records(retention, now=current),
             "observability": observability_deleted,
+            "llm_request_attempts": self.compact_llm_request_attempts(
+                retention,
+                now=current,
+            ),
         }
 
     def delete_task(self, task_id: str) -> dict[str, int]:
@@ -2822,6 +4889,34 @@ class StateRepository:
         """
         with self.transaction() as connection:
             counts = {
+                "terminal_dispositions": connection.execute(
+                    "DELETE FROM terminal_dispositions WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
+                "director_final_reviews": connection.execute(
+                    "DELETE FROM director_final_reviews WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
+                "manager_terminal_reports": connection.execute(
+                    "DELETE FROM manager_terminal_reports WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
+                "remediation_attempts": connection.execute(
+                    "DELETE FROM remediation_attempts WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
+                "execution_roster": connection.execute(
+                    "DELETE FROM execution_roster WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
+                "execution_epochs": connection.execute(
+                    "DELETE FROM execution_epochs WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
+                "llm_request_attempts": connection.execute(
+                    "DELETE FROM llm_request_attempts WHERE task_id = ?",
+                    (task_id,),
+                ).rowcount,
                 "handoffs": connection.execute(
                     "DELETE FROM handoffs WHERE task_id = ?", (task_id,)
                 ).rowcount,

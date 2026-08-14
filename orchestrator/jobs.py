@@ -450,7 +450,7 @@ class DurableJobQueue:
         fencing_token: int,
         error: str,
         *,
-        retryable: bool = True,
+        retryable: bool = False,
         retry_delay_seconds: float = 0,
         now: datetime | None = None,
     ) -> DurableJob:

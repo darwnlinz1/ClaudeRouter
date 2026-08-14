@@ -152,8 +152,5 @@ terminal evidence while applying configured age/count limits. Artifact records
 and content hashes support missing/tampered-file reconciliation.
 
 See the [event catalog](event-catalog.md), [acceptance matrix](acceptance-matrix.md),
-and [migration/rollback runbook](runbooks/migration-rollback.md).
-
-The latest schema-14 result is recorded in
-[acceptance evidence](acceptance-evidence.md). Architecture descriptions are
-not test results; rerun acceptance after source changes.
+and [migration/rollback runbook](runbooks/migration-rollback.md). Architecture
+descriptions are not test results; rerun acceptance after source changes.

@@ -50,9 +50,7 @@ def test_event_replay_is_deterministic_and_checkpointed(tmp_path):
     with StateRepository(tmp_path / "events.sqlite3") as repository:
         core = TaskEventCore(repository)
         started = core.append(_event("task-replay", "task.started"))
-        planned = core.append(
-            _event("task-replay", "plan.created", revision=1)
-        )
+        planned = core.append(_event("task-replay", "plan.created", revision=1))
         finished = core.append(
             _event(
                 "task-replay",
@@ -62,12 +60,8 @@ def test_event_replay_is_deterministic_and_checkpointed(tmp_path):
             )
         )
 
-        first = core.rebuild(
-            "task-replay", session_id="session-task-replay"
-        )
-        second = project_events(
-            repository.replay_events("task-replay")
-        )
+        first = core.rebuild("task-replay", session_id="session-task-replay")
+        second = project_events(repository.replay_events("task-replay"))
 
         assert (started.sequence, planned.sequence, finished.sequence) == (1, 2, 3)
         assert first == second
@@ -76,9 +70,7 @@ def test_event_replay_is_deterministic_and_checkpointed(tmp_path):
         assert core.verify_checkpoint("task-replay")
 
         assert core.append(finished) == finished
-        assert core.rebuild(
-            "task-replay", session_id="session-task-replay"
-        ) == first
+        assert core.rebuild("task-replay", session_id="session-task-replay") == first
 
 
 def test_durable_job_idempotency_retry_and_cancel(tmp_path):
@@ -117,16 +109,13 @@ def test_durable_job_idempotency_retry_and_cancel(tmp_path):
             "worker-a",
             claimed.fencing_token,
             "temporary",
+            retryable=True,
             retry_delay_seconds=5,
             now=now,
         )
         assert retried.status is JobStatus.RETRY
-        assert queue.claim(
-            "worker-a", now=now + timedelta(seconds=4)
-        ) is None
-        claimed_again = queue.claim(
-            "worker-a", now=now + timedelta(seconds=5)
-        )
+        assert queue.claim("worker-a", now=now + timedelta(seconds=4)) is None
+        claimed_again = queue.claim("worker-a", now=now + timedelta(seconds=5))
         assert claimed_again is not None
         assert claimed_again.attempts == 2
         assert claimed_again.fencing_token > claimed.fencing_token
@@ -154,9 +143,7 @@ def test_expired_job_is_reclaimed_with_fencing_after_restart(tmp_path):
             max_attempts=3,
             now=now,
         )
-        first_claim = first_queue.claim(
-            "worker-old", lease_ttl_seconds=5, now=now
-        )
+        first_claim = first_queue.claim("worker-old", lease_ttl_seconds=5, now=now)
         assert first_claim is not None
 
         with StateRepository(database) as restarted_repository:
@@ -234,8 +221,19 @@ def test_local_executor_uses_durable_claim_and_result(tmp_path):
                 resource=PRODUCTION_PROVIDER,
                 content="authorization=Bearer abcdefghijklmnopqrstuvwxyz",
             ),
-            PolicyEffect.DENY,
-            "raw_secret_detected",
+            PolicyEffect.ALLOW,
+            "provider_content_passthrough",
+        ),
+        (
+            PolicyRequest(
+                action=PolicyAction.EFFECT_APPLY,
+                resource="src/generated.py",
+                scopes=("src/**",),
+                content="AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'",
+                approval_status="approved",
+            ),
+            PolicyEffect.ALLOW,
+            "secret_scan_audit_only",
         ),
         (
             PolicyRequest(
@@ -269,6 +267,7 @@ def test_declarative_policy_decisions(policy_request, effect, reason):
 
 def test_policy_approval_and_audit_chain(tmp_path):
     with StateRepository(tmp_path / "audit.sqlite3") as repository:
+
         def audit(request, decision):
             repository.append_audit_record(
                 namespace=request.subject.namespace,
@@ -358,9 +357,7 @@ def test_provider_plugin_registry_locks_production_to_cookie_web():
         )
     )
     registry.register(plugin)
-    adapter = registry.create_adapter(
-        {"org_id": "org", "cookie_string": "sessionKey=redacted"}
-    )
+    adapter = registry.create_adapter({"org_id": "org", "cookie_string": "sessionKey=redacted"})
     assert adapter.name == PRODUCTION_PROVIDER
 
     with pytest.raises(ProviderPluginError, match="cannot be replaced"):

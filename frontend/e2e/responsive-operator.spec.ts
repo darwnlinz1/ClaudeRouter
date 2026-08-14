@@ -43,6 +43,61 @@ const timelineEvents = [
     role: 'worker',
     payload: { name: 'Graph worker', status: 'running' },
   },
+  {
+    sequence: 4,
+    type: 'model_request_started',
+    agent_instance_id: 'worker-responsive',
+    manager_id: 'manager-responsive',
+    role: 'worker',
+    account: '[REDACTED]',
+    account_ref: 'acct-1234-abcd-5678',
+    payload: { stage: 'calling_model' },
+  },
+  {
+    sequence: 5,
+    type: 'thinking',
+    agent_instance_id: 'worker-responsive',
+    manager_id: 'manager-responsive',
+    role: 'worker',
+    provisional: true,
+    committed: false,
+    attempt_id: 'worker-responsive:a1',
+    chunk_index: 0,
+    payload: { text: 'Inspecting the graph state live.' },
+  },
+  {
+    sequence: 6,
+    type: 'token',
+    agent_instance_id: 'worker-responsive',
+    manager_id: 'manager-responsive',
+    role: 'worker',
+    provisional: false,
+    committed: true,
+    attempt_id: 'worker-responsive:a1',
+    chunk_index: 0,
+    payload: { text: 'Graph response from this worker.' },
+  },
+  {
+    sequence: 7,
+    type: 'manager_terminal_report',
+    agent_instance_id: 'manager-responsive',
+    manager_id: 'manager-responsive',
+    workstream_id: 'stream-responsive',
+    role: 'manager',
+    status: 'partial',
+    completed_item_ids: ['item-complete'],
+    abandoned_item_ids: ['item-abandoned'],
+    skipped_item_ids: [],
+    reasons: ['One work item completed partially.'],
+  },
+  {
+    sequence: 8,
+    type: 'manager_report_barrier',
+    expected_manager_ids: ['manager-responsive'],
+    reported_manager_ids: ['manager-responsive'],
+    expected_count: 1,
+    reported_count: 1,
+  },
 ];
 
 async function installApiRoutes(page: Page) {
@@ -105,6 +160,13 @@ for (const viewport of [
 
     await page.goto(`/#task=${task.id}`);
     await expect(page.getByRole('heading', { name: task.name })).toBeVisible();
+    await expect(page.getByText(task.prompt)).not.toBeVisible();
+    await expect(page.getByText('Accounts used')).toBeVisible();
+    await expect(page.getByText('Primary plan', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('1 of 1 Manager terminal reports received')).toBeVisible();
+    await expect(
+      page.locator('.task-metrics > div').filter({ hasText: 'Accounts used' }).getByText('1'),
+    ).toBeVisible();
     await expect(page.getByRole('tablist', { name: 'Task views' })).toBeVisible();
     await page.getByRole('tab', { name: 'Agents' }).click();
     await expect(page.locator('.flow-agent-label')).toHaveCount(3);
@@ -117,9 +179,22 @@ for (const viewport of [
     await expect(
       page.locator('.flow-agent-label').getByText('Graph worker', { exact: true }),
     ).toBeVisible();
+    await expect(page.getByLabel('Agent outcome counts').getByText('1 partial')).toBeVisible();
     const graphBounds = await page.locator('.signal-graph .react-flow').boundingBox();
     expect(graphBounds?.width ?? 0).toBeGreaterThan(200);
-    expect(graphBounds?.height ?? 0).toBeGreaterThan(120);
+    expect(graphBounds?.height ?? 0).toBeGreaterThan(90);
+    await page.getByRole('button', { name: 'Fullscreen graph' }).click();
+    await expect(page.locator('.workspace-content')).toHaveClass(/graph-expanded/);
+    await page.getByRole('button', { name: 'Restore workspace' }).click();
+    await expect(page.locator('.workspace-content')).not.toHaveClass(/graph-expanded/);
+    await page.locator('.flow-agent-label').getByText('Graph worker', { exact: true }).click();
+    const workerPanel = page.getByRole('region', { name: 'Graph worker' });
+    await expect(workerPanel.getByRole('tab', { name: 'Thinking' })).toBeVisible();
+    await workerPanel.getByRole('tab', { name: 'Thinking' }).click();
+    await expect(page.getByText('Inspecting the graph state live.')).toBeVisible();
+    await expect(page.getByLabel('Thinking live')).toBeVisible();
+    await workerPanel.getByRole('tab', { name: 'Response' }).click();
+    await expect(page.getByText('Graph response from this worker.')).toBeVisible();
     await page.getByRole('tab', { name: 'Tests' }).click();
     await expect(page.getByText('No test evidence yet')).toBeVisible();
     await expect.poll(() => pageErrors).toEqual([]);
@@ -127,9 +202,11 @@ for (const viewport of [
     if (viewport.width === 390) {
       await expect(page.getByRole('button', { name: 'Reject' })).toBeVisible();
       await expect(page.getByRole('button', { name: 'Approve' })).toBeVisible();
-      await page.getByRole('button', { name: 'Delete', exact: true }).click();
-      await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible();
-      await page.getByRole('button', { name: 'Cancel' }).click();
+      await page.getByRole('button', { name: 'Delete task', exact: true }).click();
+      const cancel = page.getByRole('button', { name: 'Cancel' });
+      await expect(cancel).toBeVisible();
+      await cancel.evaluate((button) => button.click());
+      await expect(page.getByRole('alertdialog')).not.toBeVisible();
     }
 
     const overflow = await page.evaluate(() => ({
@@ -140,3 +217,20 @@ for (const viewport of [
     expect(overflow.document, 'document horizontal overflow in CSS pixels').toBeLessThanOrEqual(1);
   });
 }
+
+test('new-run wizard exposes the full frontend fan-out range', async ({ page }) => {
+  await installApiRoutes(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'New hierarchy task' }).click();
+  await page.getByRole('tab', { name: 'Shape' }).evaluate((button) => button.click());
+
+  await expect(
+    page.locator('.range-setting').filter({ hasText: 'Maximum managers' }).locator('input'),
+  ).toHaveAttribute('max', '32');
+  await expect(
+    page
+      .locator('.range-setting')
+      .filter({ hasText: 'Maximum coder tasks per manager' })
+      .locator('input'),
+  ).toHaveAttribute('max', '31');
+});

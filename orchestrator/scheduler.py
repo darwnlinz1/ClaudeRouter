@@ -1,4 +1,5 @@
 """Bounded two-level DAG scheduling and conflict-control primitives."""
+
 from __future__ import annotations
 
 import os
@@ -15,22 +16,42 @@ class SchedulingError(ValueError):
     """Raised when a plan cannot be scheduled safely."""
 
 
+def max_parallelism_enabled() -> bool:
+    """Whether the plan runs at the width it was planned at.
+
+    In this mode every planned Manager and Worker may begin inference
+    immediately. Dependency and write-scope metadata still informs prompts and
+    diagnostics, but does not prevent a model call; filesystem effects remain
+    serialized by the ticket executor's project lock.
+    """
+    return os.environ.get("ORCH_MAX_PARALLELISM", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class SchedulerLimits:
     # Planning caps and execution slots are deliberately separate.  ``None``
     # keeps old settings compatible by using the corresponding parallel cap.
     max_managers: int | None = None
     max_parallel_managers: int = 4
-    max_workers_per_manager: int = 4
+    # Four Coders plus one dedicated Tester, matching the API/UI defaults.
+    max_workers_per_manager: int = 5
     max_parallel_workers_per_manager: int | None = None
-    max_parallel_workers: int = 12
+    max_parallel_workers: int = 8
     max_workstreams: int = 64
     max_work_items_per_stream: int = 128
 
     def __post_init__(self) -> None:
+        if self.max_workers_per_manager < 2:
+            raise ValueError(
+                "max_workers_per_manager must reserve at least one Coder and one Tester"
+            )
         for name in (
             "max_parallel_managers",
-            "max_workers_per_manager",
             "max_parallel_workers",
             "max_workstreams",
             "max_work_items_per_stream",
@@ -44,14 +65,12 @@ class SchedulerLimits:
         if self.max_parallel_managers > self.manager_cap:
             raise ValueError("max_parallel_managers cannot exceed max_managers")
         if self.worker_parallel_cap > self.coders_per_manager:
-            raise ValueError(
-                "max_parallel_workers_per_manager cannot exceed the coder cap"
-            )
+            raise ValueError("max_parallel_workers_per_manager cannot exceed the coder cap")
 
     @property
     def coders_per_manager(self) -> int:
         """One child-agent slot is permanently reserved for the Tester."""
-        return max(1, self.max_workers_per_manager - 1)
+        return self.max_workers_per_manager - 1
 
     @property
     def manager_cap(self) -> int:
@@ -66,7 +85,12 @@ class SchedulerLimits:
 
 class LockRepository(Protocol):
     def acquire_lease(
-        self, resource_type: str, resource_id: str, owner_id: str, ttl_seconds: float, **kwargs: object
+        self,
+        resource_type: str,
+        resource_id: str,
+        owner_id: str,
+        ttl_seconds: float,
+        **kwargs: object,
     ) -> bool: ...
 
     def release_lease(self, resource_type: str, resource_id: str, owner_id: str) -> bool: ...
@@ -124,16 +148,13 @@ def validate_plan(plan: TaskPlan, limits: SchedulerLimits | None = None) -> None
             f"plan selected {len(plan.workstreams)} Managers; cap is {bounds.manager_cap}"
         )
     if plan.requested_manager_count != len(plan.workstreams):
-        raise SchedulingError(
-            "requested_manager_count must equal the number of workstreams"
-        )
-    _validate_dag(plan.workstreams, label="workstream")
+        raise SchedulingError("requested_manager_count must equal the number of workstreams")
+    if not max_parallelism_enabled():
+        _validate_dag(plan.workstreams, label="workstream")
     all_item_ids: set[str] = set()
     for workstream in plan.workstreams:
         if len(workstream.work_items) > bounds.max_work_items_per_stream:
-            raise SchedulingError(
-                f"workstream {workstream.id!r} has too many work items"
-            )
+            raise SchedulingError(f"workstream {workstream.id!r} has too many work items")
         duplicates = all_item_ids.intersection(item.id for item in workstream.work_items)
         if duplicates:
             raise SchedulingError(
@@ -145,7 +166,8 @@ def validate_plan(plan: TaskPlan, limits: SchedulerLimits | None = None) -> None
                 raise SchedulingError(
                     f"work item {item.id!r} must declare at least one write scope"
                 )
-        _validate_dag(workstream.work_items, label=f"work item in {workstream.id}")
+        if not max_parallelism_enabled():
+            _validate_dag(workstream.work_items, label=f"work item in {workstream.id}")
         if workstream.work_items:
             if workstream.requested_worker_count != len(workstream.work_items):
                 raise SchedulingError(
@@ -163,7 +185,27 @@ def validate_plan(plan: TaskPlan, limits: SchedulerLimits | None = None) -> None
 _SUCCESS_STATES = frozenset({WorkStatus.APPROVED})
 _ACTIVE_STATES = frozenset({WorkStatus.RUNNING, WorkStatus.TESTING})
 _UNSCHEDULED_STATES = frozenset({WorkStatus.PENDING, WorkStatus.READY})
+_TERMINAL_STATES = frozenset(
+    {
+        WorkStatus.APPROVED,
+        WorkStatus.ABANDONED,
+        WorkStatus.SKIPPED,
+        WorkStatus.FAILED,
+        WorkStatus.BLOCKED,
+        WorkStatus.CANCELLED,
+    }
+)
 _Schedulable = TypeVar("_Schedulable", Workstream, WorkItem)
+
+
+def is_terminal_work_status(status: WorkStatus | str) -> bool:
+    """Return whether a work status can never be scheduled again."""
+    return WorkStatus(status) in _TERMINAL_STATES
+
+
+def is_successful_work_status(status: WorkStatus | str) -> bool:
+    """Return whether a status satisfies dependency success."""
+    return WorkStatus(status) in _SUCCESS_STATES
 
 
 def _critical_path_depths(
@@ -199,7 +241,12 @@ def ready_workstreams(
         stream
         for stream in plan.workstreams
         if state.get(stream.id, stream.status) in _UNSCHEDULED_STATES
-        and all(state.get(dependency) in _SUCCESS_STATES for dependency in stream.dependencies)
+        and (
+            max_parallelism_enabled()
+            or all(
+                state.get(dependency) in _SUCCESS_STATES for dependency in stream.dependencies
+            )
+        )
     ]
 
 
@@ -216,11 +263,12 @@ def ready_work_items(
         (index, item)
         for index, item in enumerate(workstream.work_items)
         if state.get(item.id, item.status) in _UNSCHEDULED_STATES
-        and all(state.get(dependency) in _SUCCESS_STATES for dependency in item.dependencies)
+        and (
+            max_parallelism_enabled()
+            or all(state.get(dependency) in _SUCCESS_STATES for dependency in item.dependencies)
+        )
     ]
-    return [
-        item for _, item in sorted(indexed, key=lambda pair: (-pair[1].priority, pair[0]))
-    ]
+    return [item for _, item in sorted(indexed, key=lambda pair: (-pair[1].priority, pair[0]))]
 
 
 def canonical_scope(scope: str) -> str:
@@ -268,8 +316,7 @@ class ScopeClaims:
             # Do not let repeated non-blocking callers bypass an older,
             # conflicting waiter.
             if any(
-                waiting_owner != owner_id
-                and scopes_conflict(requested, waiting_scopes)
+                waiting_owner != owner_id and scopes_conflict(requested, waiting_scopes)
                 for _, waiting_owner, waiting_scopes in self._waiters
             ):
                 return False
@@ -283,17 +330,14 @@ class ScopeClaims:
         requested: tuple[str, ...],
     ) -> bool:
         if any(
-            existing_owner != owner_id
-            and scopes_conflict(requested, claimed)
+            existing_owner != owner_id and scopes_conflict(requested, claimed)
             for existing_owner, claimed in self._claims.items()
         ):
             return False
         for waiting_ticket, waiting_owner, waiting_scopes in self._waiters:
             if waiting_ticket == ticket:
                 break
-            if waiting_owner != owner_id and scopes_conflict(
-                requested, waiting_scopes
-            ):
+            if waiting_owner != owner_id and scopes_conflict(requested, waiting_scopes):
                 return False
         return True
 
@@ -376,9 +420,7 @@ class HierarchicalScheduler:
             if node_id not in ready_set:
                 ages.pop(node_id, None)
         for node_id in ready_ids:
-            ages[node_id] = (
-                0 if node_id in selected_ids else ages.get(node_id, 0) + 1
-            )
+            ages[node_id] = 0 if node_id in selected_ids else ages.get(node_id, 0) + 1
 
     def validate(self, plan: TaskPlan) -> None:
         validate_plan(plan, self.limits)
@@ -396,13 +438,19 @@ class HierarchicalScheduler:
         if cancelled is not None and cancelled():
             return []
         self.validate(plan)
-        requested = min(plan.requested_manager_count, self.limits.max_parallel_managers)
+        requested = (
+            plan.requested_manager_count
+            if max_parallelism_enabled()
+            else min(plan.requested_manager_count, self.limits.max_parallel_managers)
+        )
         available = max(0, requested - active_manager_count)
         ready = ready_workstreams(plan, statuses=statuses)
-        depths = _critical_path_depths(plan.workstreams)
-        plan_order = {
-            stream.id: index for index, stream in enumerate(plan.workstreams)
-        }
+        depths = (
+            {stream.id: 0 for stream in plan.workstreams}
+            if max_parallelism_enabled()
+            else _critical_path_depths(plan.workstreams)
+        )
+        plan_order = {stream.id: index for index, stream in enumerate(plan.workstreams)}
         with self._selection_lock:
             ranked = sorted(
                 ready,
@@ -429,6 +477,10 @@ class HierarchicalScheduler:
     ) -> int:
         if active_for_manager < 0 or active_global < 0:
             raise ValueError("active worker counts must be non-negative")
+        if max_parallelism_enabled():
+            # Every planned coder is meant to be in flight; write-scope
+            # conflicts are what still serialise a pair, not a slot count.
+            return max(0, workstream.requested_worker_count - active_for_manager)
         manager_limit = min(
             workstream.requested_worker_count,
             self.limits.worker_parallel_cap,
@@ -461,10 +513,12 @@ class HierarchicalScheduler:
         selected: list[WorkItem] = []
         occupied = [tuple(scopes) for scopes in active_scopes]
         ready = ready_work_items(workstream, statuses=statuses)
-        depths = _critical_path_depths(workstream.work_items)
-        plan_order = {
-            item.id: index for index, item in enumerate(workstream.work_items)
-        }
+        depths = (
+            {item.id: 0 for item in workstream.work_items}
+            if max_parallelism_enabled()
+            else _critical_path_depths(workstream.work_items)
+        )
+        plan_order = {item.id: index for index, item in enumerate(workstream.work_items)}
         with self._selection_lock:
             ranked = sorted(
                 ready,
@@ -481,16 +535,14 @@ class HierarchicalScheduler:
                     break
                 if len(selected) >= slots:
                     break
-                if any(
-                    scopes_conflict(item.write_scopes, scopes)
-                    for scopes in occupied
-                ):
-                    continue
-                if any(
-                    scopes_conflict(item.write_scopes, other.write_scopes)
-                    for other in selected
-                ):
-                    continue
+                if not max_parallelism_enabled():
+                    if any(scopes_conflict(item.write_scopes, scopes) for scopes in occupied):
+                        continue
+                    if any(
+                        scopes_conflict(item.write_scopes, other.write_scopes)
+                        for other in selected
+                    ):
+                        continue
                 selected.append(item)
             self._update_wait_age(
                 self._item_wait_age,
@@ -504,9 +556,7 @@ class HierarchicalScheduler:
     ) -> bool:
         if self.repository is None:
             raise RuntimeError("a state repository is required for durable leases")
-        return self.repository.acquire_lease(
-            "work_item", work_item_id, owner_id, ttl_seconds
-        )
+        return self.repository.acquire_lease("work_item", work_item_id, owner_id, ttl_seconds)
 
     def release_work_lease(self, work_item_id: str, owner_id: str) -> bool:
         if self.repository is None:

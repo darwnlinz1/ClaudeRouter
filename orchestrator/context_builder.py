@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, worker_targets
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,7 @@ def build_source_blocks(
             )
             continue
 
-        raw_content = sf.absolute_path.read_text(encoding="utf-8", errors="replace")
+        raw_content = worker_targets.read_prompt_text(sf.rel_path, sf.absolute_path)
         content = (
             _truncate_content(raw_content, per_file_limit)
             if max_chars_per_file is None

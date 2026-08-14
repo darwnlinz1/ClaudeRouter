@@ -3,8 +3,8 @@ interface HierarchyPreviewProps {
   workersPerManager: number;
 }
 
-const MAX_MANAGERS = 4;
-const MAX_CODERS = 3;
+const MAX_MANAGERS = 6;
+const MAX_CODERS = 5;
 
 export function HierarchyPreview({ managers, workersPerManager }: HierarchyPreviewProps) {
   const managerCount = Math.max(1, managers);

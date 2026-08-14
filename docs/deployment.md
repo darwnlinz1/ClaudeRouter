@@ -69,22 +69,26 @@ See [SECURITY.md](../SECURITY.md) for reporting and handling guidance.
 
 ## Upgrade
 
-The canonical state schema is version `12`. Opening `StateRepository` applies
+The canonical state schema is version `17`. Opening `StateRepository` applies
 pending migrations, including through the administrative `status` command.
 Migration 12 is the additive `durable_effect_fencing` migration: it extends
 effect receipts with expected target hashes, fencing tokens, and one-to-one
 compensation links plus indexes while preserving existing version-11 rows.
 Schema 13 adds immutable contract versions, logical-agent identities, and typed
 handoff records. Schema 14 adds managed-retention claim state and indexes.
+Schemas 15 and 16 add the sanitized LLM-attempt ledger and its agent-role
+repair. Schema 17 adds execution epochs and Manager rosters, unique remediation
+strategies, exactly-once Manager reports and Director final review, and durable
+terminal dispositions/log references.
 Therefore use the explicit
 [migration and rollback runbook](runbooks/migration-rollback.md):
 
 1. stop new task admission, let active effects settle, and stop the service;
-2. run read-only preflight with `--maximum-schema-version 14`;
+2. run read-only preflight with `--maximum-schema-version 17`;
 3. create and verify a backup of state SQLite, account SQLite, artifacts, and
    logs;
 4. install the reviewed source or wheel;
-5. run the migrator with explicit paths and require schema/history `1..14`;
+5. run the migrator with explicit paths and require schema/history `1..17`;
 6. run migration and contract checks, then start on loopback;
 7. verify task projections, approvals, event replay, leases, effects,
    reconciliation, compensation links, and an artifact hash before resuming
@@ -96,8 +100,8 @@ Application rollback and data rollback are separate. Stop the service before
 either operation.
 
 - Reinstalling the prior application while retaining data is allowed only when
-  that exact version is known to read schema `14`, nullable migrated effect
-  fields, and the current event/task contracts.
+  that exact version is known to read schema `17`, including execution-recovery
+  records, nullable migrated effect fields, and current event/task contracts.
 - Otherwise preserve the failed-upgrade state, verify the pre-upgrade archive,
   restore it to empty staging targets, and point the prior application at
   those targets.
@@ -108,6 +112,5 @@ either operation.
 Interrupted tasks and effects require operator review after rollback.
 
 The complete release gate is in the
-[acceptance matrix](acceptance-matrix.md), with the latest source and log hashes
-in [acceptance evidence](acceptance-evidence.md). Rerun the full matrix after
-any source or dependency change.
+[acceptance matrix](acceptance-matrix.md). Rerun the full matrix after any
+source or dependency change.

@@ -17,6 +17,7 @@ import {
   Maximize2,
   MoreHorizontal,
   Minimize2,
+  PanelLeft,
   Pin,
   Play,
   Plus,
@@ -43,8 +44,9 @@ import { ToastStack } from './components/ToastStack';
 import { WorkspaceSplitter } from './components/WorkspaceSplitter';
 import { mockTask } from './data/mockWorkspace';
 import { useWorkspace } from './hooks/useWorkspace';
+import { launchManagerSlots, launchWorkerSlots } from './lib/launchSlots';
 import { isActiveStatus, statusTone } from './lib/phases';
-import { loadPrefs, savePrefs, type UiPrefs } from './lib/preferences';
+import { loadPrefs, normalizeWorkspaceSettings, savePrefs, type UiPrefs } from './lib/preferences';
 import { shortTaskTitle, taskProjectKey } from './lib/taskTitle';
 import type {
   AccountHealth,
@@ -61,10 +63,8 @@ const DEFAULT_SETTINGS: WorkspaceSettings = {
   maxParallelManagers: 4,
   maxWorkersPerManager: 5,
   maxParallelWorkersPerManager: undefined,
-  maxParallelWorkers: 8,
-  maxModelCalls: 200,
-  maxWallClockSeconds: 7_200,
-  maxEstimatedInputTokens: 2_000_000,
+  // Four managers times four coders: wide enough to run the default plan.
+  maxParallelWorkers: 16,
   mockWhenUnavailable: false,
   roleProfiles: {
     director: { model: 'claude-sonnet-5', effort: 'max' },
@@ -156,29 +156,7 @@ const loadSettings = (): WorkspaceSettings => {
     const stored = JSON.parse(
       localStorage.getItem(SETTINGS_KEY) ?? '{}',
     ) as Partial<WorkspaceSettings>;
-    const maxManagers =
-      stored.maxManagers ?? stored.maxParallelManagers ?? DEFAULT_SETTINGS.maxManagers;
-    const maxWorkersPerManager =
-      stored.maxWorkersPerManager ?? DEFAULT_SETTINGS.maxWorkersPerManager;
-    const perManagerSlots = stored.maxParallelWorkersPerManager;
-    return {
-      ...DEFAULT_SETTINGS,
-      ...stored,
-      maxManagers,
-      maxParallelManagers: Math.min(
-        maxManagers,
-        stored.maxParallelManagers ?? DEFAULT_SETTINGS.maxParallelManagers,
-      ),
-      maxWorkersPerManager,
-      maxParallelWorkersPerManager:
-        perManagerSlots == null
-          ? undefined
-          : Math.min(Math.max(1, maxWorkersPerManager - 1), perManagerSlots),
-      roleProfiles: {
-        ...DEFAULT_SETTINGS.roleProfiles,
-        ...(stored.roleProfiles ?? {}),
-      },
-    };
+    return normalizeWorkspaceSettings(stored, DEFAULT_SETTINGS);
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -220,7 +198,9 @@ const matchesRailFilter = (task: TaskSummary, filter: UiPrefs['railFilter']) => 
   if (filter === 'all') return true;
   if (filter === 'active') return isActiveStatus(status);
   if (filter === 'failed') return status === 'FAILED' || status === 'ERROR';
-  return ['COMPLETED', 'DONE', 'STOPPED', 'CANCELLED'].includes(status);
+  return ['COMPLETED', 'DONE', 'PARTIAL', 'ABANDONED', 'SKIPPED', 'STOPPED', 'CANCELLED'].includes(
+    status,
+  );
 };
 
 const routedTaskId = () => {
@@ -246,6 +226,11 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [offline, setOffline] = useState(false);
   const [menuTaskId, setMenuTaskId] = useState<string | null>(null);
+  const [railDrawerOpen, setRailDrawerOpen] = useState(false);
+  const openCreate = useCallback(() => {
+    setRailDrawerOpen(false);
+    setCreateOpen(true);
+  }, []);
   const [busyAction, setBusyAction] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [accountHealth, setAccountHealth] = useState<AccountHealth[]>([]);
@@ -273,6 +258,7 @@ export default function App() {
   }, []);
   const selectTask = useCallback((task: TaskSummary, pushHistory = true) => {
     setSelectedTask(task);
+    setRailDrawerOpen(false);
     const nextHash = `#task=${encodeURIComponent(task.id)}`;
     if (window.location.hash === nextHash) return;
     if (pushHistory) window.history.pushState(null, '', nextHash);
@@ -478,6 +464,24 @@ export default function App() {
     };
   }, [menuTaskId]);
 
+  useEffect(() => {
+    if (!graphExpanded) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setGraphExpanded(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [graphExpanded]);
+
+  useEffect(() => {
+    if (!railDrawerOpen) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRailDrawerOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [railDrawerOpen]);
+
   const openAgent = useCallback((agent: AgentInstance) => {
     setGraphExpanded(false);
     dockRef.current?.openAgent(agent);
@@ -505,19 +509,18 @@ export default function App() {
   const plannedChildren =
     state.fanout.plannedChildren ||
     realAgents.filter((agent) => ['worker', 'tester', 'reviewer'].includes(agent.role)).length;
-  const calledChildren = state.fanout.calledAgentIds.length;
-  const changedFiles = Object.keys(displayedTask?.changed_files ?? {}).length;
+  const plannedManagers =
+    state.fanout.plannedManagers ||
+    realAgents.filter((agent) => agent.role === 'manager' || agent.role === 'supervisor').length;
+  const calledAgents = state.fanout.calledAgentIds.length;
+  const plannedPrimaryAgents =
+    plannedManagers || plannedChildren
+      ? 1 + plannedManagers + plannedChildren
+      : Math.max(1, agentCount);
   const taskIsActive = displayedTask ? isActiveStatus(displayedTask.status) : false;
   const waitingInput = displayedTask?.status?.toUpperCase() === 'WAITING_INPUT';
   const pendingApproval = approvals.find((approval) => approval.status === 'pending');
-  const accountsUsed = useMemo(() => {
-    const accounts = new Set(state.usedAccounts);
-    for (const agent of Object.values(state.agents)) {
-      const account = agent.account?.trim();
-      if (account && account.toLowerCase() !== 'redacted') accounts.add(account);
-    }
-    return accounts.size;
-  }, [state.agents, state.usedAccounts]);
+  const accountsUsed = state.usedAccounts.length;
   const [elapsedNow, setElapsedNow] = useState(() => Date.now());
   useEffect(() => {
     if (!taskIsActive) return;
@@ -674,7 +677,7 @@ export default function App() {
         id: 'new',
         label: 'New run',
         shortcut: 'N',
-        run: () => setCreateOpen(true),
+        run: openCreate,
       },
       {
         id: 'palette-refresh',
@@ -729,6 +732,7 @@ export default function App() {
     focusDirector,
     fullscreen,
     openAgent,
+    openCreate,
     prefs.consoleOpen,
     prefs.density,
     refreshTasks,
@@ -767,7 +771,7 @@ export default function App() {
       if (typing || paletteOpen) return;
       if (event.key.toLowerCase() === 'n') {
         event.preventDefault();
-        setCreateOpen(true);
+        openCreate();
       } else if (event.key.toLowerCase() === 's' && displayedTask && taskIsActive) {
         event.preventDefault();
         void runTaskAction(displayedTask);
@@ -784,6 +788,7 @@ export default function App() {
   }, [
     displayedTask,
     openAgent,
+    openCreate,
     paletteOpen,
     runTaskAction,
     state.agents,
@@ -796,7 +801,7 @@ export default function App() {
   return (
     <div
       ref={appShellRef}
-      className={`app-shell density-${prefs.density} ${railCollapsed ? 'rail-collapsed' : ''} ${prefs.consoleOpen ? 'console-open' : ''} ${prefs.consoleCollapsed ? 'console-collapsed' : ''}`}
+      className={`app-shell density-${prefs.density} ${railCollapsed ? 'rail-collapsed' : ''} ${railDrawerOpen ? 'rail-drawer-open' : ''} ${prefs.consoleOpen ? 'console-open' : ''} ${prefs.consoleCollapsed ? 'console-collapsed' : ''}`}
       style={
         {
           '--console-height': `${prefs.consoleHeight}px`,
@@ -804,6 +809,14 @@ export default function App() {
         } as CSSProperties
       }
     >
+      {railDrawerOpen && (
+        <button
+          type="button"
+          className="rail-scrim"
+          aria-label="Close task list"
+          onClick={() => setRailDrawerOpen(false)}
+        />
+      )}
       <aside className="task-rail" id="task-rail">
         <div className="brand">
           <div className="brand-mark">
@@ -889,7 +902,7 @@ export default function App() {
           <div>
             <button
               type="button"
-              onClick={() => setCreateOpen(true)}
+              onClick={openCreate}
               title="New hierarchy task"
               aria-label="New hierarchy task"
             >
@@ -1020,7 +1033,7 @@ export default function App() {
               <Boxes size={18} />
               <strong>No tasks yet</strong>
               <span>Launch a hierarchy run to populate this rail.</span>
-              <button type="button" className="primary-button" onClick={() => setCreateOpen(true)}>
+              <button type="button" className="primary-button" onClick={openCreate}>
                 <Plus size={14} /> New run
               </button>
             </div>
@@ -1047,180 +1060,195 @@ export default function App() {
         {displayedTask ? (
           <>
             <header className="task-header">
-              <div className="task-breadcrumb">
-                <span title={displayedTask.root}>
-                  <FolderGit2 size={13} /> {taskProjectKey(displayedTask.root)}
+              <div className="task-header-top">
+                <button
+                  type="button"
+                  className="rail-drawer-toggle"
+                  onClick={() => setRailDrawerOpen(true)}
+                  aria-label="Open task list"
+                  aria-controls="task-rail"
+                  aria-expanded={railDrawerOpen}
+                >
+                  <PanelLeft size={16} />
+                </button>
+                <nav className="task-breadcrumb" aria-label="Task location">
+                  <span title={displayedTask.root}>
+                    <FolderGit2 size={13} /> {taskProjectKey(displayedTask.root)}
+                  </span>
+                  {displayedTask.phase && (
+                    <>
+                      <i aria-hidden="true">/</i>
+                      <em title={`Phase: ${displayedTask.phase}`}>{displayedTask.phase}</em>
+                    </>
+                  )}
+                  {displayedTask.current_agent && (
+                    <>
+                      <i aria-hidden="true">/</i>
+                      <em title={`Current agent: ${displayedTask.current_agent}`}>
+                        {displayedTask.current_agent}
+                      </em>
+                    </>
+                  )}
+                  <i aria-hidden="true">/</i>
+                  <span className="task-id" title={`Task ID: ${displayedTask.id}`}>
+                    #{displayedTask.id.slice(0, 8)}
+                  </span>
+                </nav>
+                <span
+                  className={`status-pill tone-${statusTone(displayedTask.status)}`}
+                  title={`${sentenceStatus(displayedTask.status)} · ${
+                    state.connection === 'live' ? 'live stream' : state.connection
+                  } · defaults ${profileSummary}`}
+                >
+                  <span className={`pulse-dot ${state.connection}`} />
+                  {sentenceStatus(displayedTask.status)}
                 </span>
-                <i>/</i>
-                <strong title={displayedTask.name}>{shortTaskTitle(displayedTask)}</strong>
-                {displayedTask.phase && (
-                  <>
-                    <i>/</i>
-                    <em title={displayedTask.phase}>{displayedTask.phase}</em>
-                  </>
-                )}
-                {displayedTask.current_agent && (
-                  <>
-                    <i>/</i>
-                    <em title={displayedTask.current_agent}>{displayedTask.current_agent}</em>
-                  </>
-                )}
-              </div>
-              <div className="task-title-row">
-                <div>
-                  <div className="title-kicker">
-                    <span className={`pulse-dot ${state.connection}`} />
-                    {state.connection === 'live' ? 'Live' : sentenceStatus(displayedTask.status)}
-                    <span
-                      className="live-pill"
-                      title={`${runningAgents} running, ${waitingAgents} waiting, ${calledChildren} of ${plannedChildren || 'unknown'} selected child agents called`}
-                    >
-                      {runningAgents} running · {waitingAgents} waiting · {calledChildren} of{' '}
-                      {plannedChildren || '—'} selected child agents called
-                    </span>
-                    <span className="task-id" title={displayedTask.id}>
-                      #{displayedTask.id.slice(0, 8)}
-                    </span>
-                    <span className="profile-pill" title={profileSummary}>
-                      {profileSummary}
-                    </span>
-                  </div>
-                  <h1 title={displayedTask.name}>{shortTaskTitle(displayedTask)}</h1>
-                  <p>{displayedTask.prompt || displayedTask.name}</p>
-                </div>
-                <div className="task-header-actions">
+                <div className="task-header-actions" role="toolbar" aria-label="Task actions">
                   <button
                     type="button"
-                    className="ghost-button"
+                    className="task-action-icon"
                     onClick={() => void toggleFullscreen()}
                     title="Toggle fullscreen (F11)"
+                    aria-label={fullscreen ? 'Restore window' : 'Fullscreen'}
                     aria-pressed={fullscreen}
                   >
-                    {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                    {fullscreen ? 'Restore' : 'Fullscreen'}
+                    {fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
                   </button>
                   <button
                     type="button"
-                    className="ghost-button"
+                    className="task-action-icon"
                     onClick={() => setPaletteOpen(true)}
-                    title="Open command palette"
+                    title="Open command palette (Ctrl+K)"
+                    aria-label="Commands"
                   >
-                    <Command size={14} /> Commands
+                    <Command size={15} />
                   </button>
                   <button
                     type="button"
-                    className="ghost-button"
+                    className="task-action-icon"
                     onClick={() => updatePrefs({ consoleOpen: !prefs.consoleOpen })}
                     aria-pressed={prefs.consoleOpen}
+                    aria-label={prefs.consoleOpen ? 'Hide console' : 'Show console'}
                     title={prefs.consoleOpen ? 'Hide event console' : 'Show event console'}
                   >
-                    <Terminal size={14} /> Console
+                    <Terminal size={15} />
                   </button>
                   <button
                     type="button"
-                    className="ghost-button"
+                    className="task-action-icon"
                     onClick={() => setSettingsOpen(true)}
-                    title="Open runtime limits"
+                    title="Planning caps, concurrency and role defaults"
+                    aria-label="Runtime settings"
                   >
-                    <SlidersHorizontal size={14} /> Limits
+                    <SlidersHorizontal size={15} />
                   </button>
                   {displayedTask.artifact?.zip_path && (
                     <a
-                      className="ghost-button"
+                      className="task-action-icon"
                       href={`/api/tasks/${encodeURIComponent(displayedTask.id)}/artifacts/download`}
                       download
+                      aria-label="Download artifacts"
+                      title="Download artifacts"
                     >
-                      <FolderOpen size={14} /> Artifacts
+                      <FolderOpen size={15} />
                     </a>
                   )}
                   <button
                     type="button"
-                    className="danger-button"
+                    className="task-action-icon danger"
                     onClick={() => void deleteTask(displayedTask)}
                     disabled={busyAction || taskIsActive || displayedTask.id === mockTask.id}
+                    aria-label="Delete task"
+                    title="Delete task"
                   >
-                    <Trash2 size={14} /> Delete
+                    <Trash2 size={15} />
                   </button>
+                  <span className="action-divider" aria-hidden="true" />
                   <button
                     type="button"
-                    className={taskIsActive ? 'danger-button' : 'primary-button'}
+                    className={`run-action ${taskIsActive ? 'danger-button danger-solid' : 'primary-button'}`}
                     onClick={() => void runTaskAction(displayedTask)}
                     disabled={busyAction || displayedTask.id === mockTask.id}
+                    title={taskIsActive ? 'Stop this task (S)' : 'Resume this task (R)'}
                   >
                     {taskIsActive ? (
                       <>
-                        <CircleStop size={14} /> Stop
+                        <CircleStop size={15} /> Stop
                       </>
                     ) : (
                       <>
-                        <Play size={14} /> Resume
+                        <Play size={15} /> Resume
                       </>
                     )}
                   </button>
                 </div>
               </div>
-              <PhaseStepper status={displayedTask.status} />
+              <div className="task-title-row">
+                <h1 title={displayedTask.name}>{shortTaskTitle(displayedTask)}</h1>
+                <PhaseStepper status={displayedTask.status} />
+              </div>
               <div className="task-metrics">
-                <div>
-                  <Bot size={14} />
-                  <span>Graph nodes</span>
+                <div title={`${agentCount} agent instances have started`}>
+                  <span>
+                    <Bot size={14} />
+                    Agents spawned
+                  </span>
                   <strong>{agentCount}</strong>
                 </div>
-                <div>
-                  <Layers3 size={14} />
-                  <span>Selected child agents</span>
-                  <strong>{plannedChildren || '—'}</strong>
+                <div title="Director, Managers and their planned children">
+                  <span>
+                    <Layers3 size={14} />
+                    Primary plan
+                  </span>
+                  <strong>{plannedPrimaryAgents}</strong>
                 </div>
-                <div>
-                  <Radio size={14} />
-                  <span>Called child agents</span>
-                  <strong>{calledChildren}</strong>
+                <div title={`${calledAgents} agents have issued at least one model call`}>
+                  <span>
+                    <Radio size={14} />
+                    Agents called
+                  </span>
+                  <strong>{calledAgents}</strong>
                 </div>
-                <div>
-                  <Gauge size={14} />
-                  <span>Model requests</span>
+                <div title="Total provider attempts including replays">
+                  <span>
+                    <Gauge size={14} />
+                    Model attempts
+                  </span>
                   <strong>{state.fanout.requestAttempts}</strong>
                 </div>
-                <div>
-                  <RefreshCw size={14} />
-                  <span>Request replays</span>
-                  <strong>{state.fanout.replayedRequests}</strong>
-                </div>
-                <div>
-                  <KeyRound size={14} />
-                  <span>Account switches</span>
-                  <strong>{state.fanout.accountSwitches}</strong>
-                </div>
-                <div>
-                  <Sparkles size={14} />
-                  <span>Running</span>
+                <div title={`${runningAgents} running, ${waitingAgents} waiting`}>
+                  <span>
+                    <Sparkles size={14} />
+                    Running
+                  </span>
                   <strong>{runningAgents}</strong>
                 </div>
-                <div>
-                  <Gauge size={14} />
-                  <span>Events</span>
-                  <strong>{state.eventCount}</strong>
-                </div>
-                <div>
-                  <FolderGit2 size={14} />
-                  <span>Files</span>
-                  <strong>{changedFiles}</strong>
-                </div>
-                <div>
-                  <Timer size={14} />
-                  <span>Time</span>
-                  <strong>{totalElapsed}</strong>
-                </div>
-                <div>
-                  <KeyRound size={14} />
-                  <span>Accounts</span>
+                <div title="Distinct provider accounts actually used">
+                  <span>
+                    <KeyRound size={14} />
+                    Accounts used
+                  </span>
                   <strong>{accountsUsed}</strong>
+                </div>
+                <div title="Elapsed wall-clock time since the run started">
+                  <span>
+                    <Timer size={14} />
+                    Elapsed
+                  </span>
+                  <strong>{totalElapsed}</strong>
                 </div>
               </div>
             </header>
 
             <InterventionBanner
               visible={waitingInput || pendingApproval != null}
+              title={
+                pendingApproval
+                  ? `Approval required · ${pendingApproval.kind.replaceAll('_', ' ')}${
+                      pendingApproval.workstreamId ? ` · ${pendingApproval.workstreamId}` : ''
+                    }`
+                  : 'Input required'
+              }
               message={
                 pendingApproval
                   ? `${pendingApproval.reason} Target: ${pendingApproval.target}`
@@ -1230,31 +1258,29 @@ export default function App() {
                 updatePrefs({ consoleOpen: true });
                 focusDirector();
               }}
+              actions={
+                pendingApproval ? (
+                  <>
+                    <button
+                      type="button"
+                      className="danger-button"
+                      disabled={busyAction}
+                      onClick={() => void decideApproval('rejected')}
+                    >
+                      Reject
+                    </button>
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={busyAction}
+                      onClick={() => void decideApproval('approved')}
+                    >
+                      Approve
+                    </button>
+                  </>
+                ) : undefined
+              }
             />
-            {pendingApproval && (
-              <div className="approval-actions" role="group" aria-label="Approval decision">
-                <span>
-                  {pendingApproval.kind.replaceAll('_', ' ')}
-                  {pendingApproval.workstreamId ? ` · ${pendingApproval.workstreamId}` : ''}
-                </span>
-                <button
-                  type="button"
-                  className="danger-button"
-                  disabled={busyAction}
-                  onClick={() => void decideApproval('rejected')}
-                >
-                  Reject
-                </button>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={busyAction}
-                  onClick={() => void decideApproval('approved')}
-                >
-                  Approve
-                </button>
-              </div>
-            )}
 
             <div className={`workspace-content${graphExpanded ? ' graph-expanded' : ''}`}>
               <TaskDashboard
@@ -1303,7 +1329,7 @@ export default function App() {
                 : 'Select a task from the rail or launch a new hierarchy run.'}
             </p>
             <div className="empty-actions">
-              <button type="button" className="primary-button" onClick={() => setCreateOpen(true)}>
+              <button type="button" className="primary-button" onClick={openCreate}>
                 <Sparkles size={14} /> New run
               </button>
               <button
@@ -1325,7 +1351,7 @@ export default function App() {
                     type="button"
                     className="launch-template"
                     role="listitem"
-                    onClick={() => setCreateOpen(true)}
+                    onClick={openCreate}
                   >
                     <strong>{template.label}</strong>
                     <span>{template.goal.slice(0, 72)}…</span>
@@ -1398,7 +1424,7 @@ export default function App() {
             <header className="settings-panel-header">
               <div>
                 <span className="eyebrow">Local preferences</span>
-                <h2>Runtime & UI</h2>
+                <h2>Settings</h2>
               </div>
               <button
                 type="button"
@@ -1413,123 +1439,17 @@ export default function App() {
             <div className="settings-panel-body">
               <section className="settings-section">
                 <header>
-                  <h3>Model defaults</h3>
-                  <p>Applied to new hierarchy runs. Live agents can still override per window.</p>
-                </header>
-                <div className="role-matrix">
-                  {(['director', 'manager', 'worker', 'tester'] as ConfigurableRole[]).map(
-                    (role) => (
-                      <RoleProfileEditor
-                        key={role}
-                        role={role}
-                        profile={settings.roleProfiles[role]}
-                        onChange={(profile) =>
-                          setSettings({
-                            ...settings,
-                            roleProfiles: { ...settings.roleProfiles, [role]: profile },
-                          })
-                        }
-                      />
-                    ),
-                  )}
-                </div>
-                <div className="preset-segment" role="group" aria-label="Quality presets">
-                  {QUALITY_PRESETS.map((preset) => (
-                    <button
-                      key={preset.id}
-                      type="button"
-                      className={selectedQualityPreset === preset.id ? 'active' : ''}
-                      aria-pressed={selectedQualityPreset === preset.id}
-                      onClick={() =>
-                        setSettings({
-                          ...settings,
-                          roleProfiles: preset.profiles,
-                        })
-                      }
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
-              </section>
-
-              <section className="settings-section">
-                <header>
-                  <h3>Execution budgets</h3>
+                  <h3>Planning capacity</h3>
                   <p>
-                    Hard task limits stop new model calls while preserving completed work and audit
-                    history.
-                  </p>
-                </header>
-                <RangeSetting
-                  label="Maximum model calls"
-                  value={settings.maxModelCalls}
-                  min={20}
-                  max={1000}
-                  onChange={(value) => setSettings({ ...settings, maxModelCalls: value })}
-                />
-                <RangeSetting
-                  label="Maximum runtime in minutes"
-                  value={Math.round(settings.maxWallClockSeconds / 60)}
-                  min={15}
-                  max={480}
-                  onChange={(value) =>
-                    setSettings({ ...settings, maxWallClockSeconds: value * 60 })
-                  }
-                />
-                <RangeSetting
-                  label="Estimated input tokens (thousands)"
-                  value={Math.round(settings.maxEstimatedInputTokens / 1000)}
-                  min={50}
-                  max={5000}
-                  onChange={(value) =>
-                    setSettings({
-                      ...settings,
-                      maxEstimatedInputTokens: value * 1000,
-                    })
-                  }
-                />
-              </section>
-
-              <section className="settings-section">
-                <header>
-                  <h3>Cookie account health</h3>
-                  <p>Durable cooldown and active lease state. Cookie values are never exposed.</p>
-                </header>
-                <div className="account-health-list">
-                  {accountHealth.length ? (
-                    accountHealth.map((account) => (
-                      <div key={`${account.provider}:${account.accountId}`}>
-                        <span className={`account-health-dot state-${account.state}`} />
-                        <strong>{account.accountId}</strong>
-                        <span>{account.state.replaceAll('_', ' ')}</span>
-                        <span>{account.activeLeases} active</span>
-                        <span>
-                          {account.cooldownActive && account.cooldownUntil
-                            ? `Cooldown until ${new Date(account.cooldownUntil * 1000).toLocaleTimeString()}`
-                            : (account.reason ?? 'Available')}
-                        </span>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="setting-hint">No durable account health events yet.</p>
-                  )}
-                </div>
-              </section>
-
-              <section className="settings-section">
-                <header>
-                  <h3>Planning caps & execution slots</h3>
-                  <p>
-                    Caps are maxima, not exact counts. Director and Managers select only the fan-out
-                    the plan needs; execution slots independently limit concurrency.
+                    Caps are maxima, never required counts. Director and Managers select only the
+                    fan-out the plan needs.
                   </p>
                 </header>
                 <div className="limit-groups">
                   <div className="limit-group">
                     <div className="limit-group-heading">
-                      <strong>Logical planning maxima</strong>
-                      <span>How many roles planners may select</span>
+                      <strong>Director fan-out</strong>
+                      <span>How many workstreams the Director may open</span>
                     </div>
                     <RangeSetting
                       label="Maximum managers"
@@ -1544,31 +1464,48 @@ export default function App() {
                         })
                       }
                     />
+                  </div>
+                  <div className="limit-group">
+                    <div className="limit-group-heading">
+                      <strong>Manager fan-out</strong>
+                      <span>Independent coder work items per Manager</span>
+                    </div>
                     <RangeSetting
-                      label="Maximum child agents per manager"
-                      value={settings.maxWorkersPerManager}
-                      min={2}
-                      max={32}
+                      label="Maximum coder tasks per manager"
+                      value={Math.max(1, settings.maxWorkersPerManager - 1)}
+                      min={1}
+                      max={31}
                       onChange={(value) =>
                         setSettings({
                           ...settings,
-                          maxWorkersPerManager: value,
+                          maxWorkersPerManager: value + 1,
                           maxParallelWorkersPerManager:
                             settings.maxParallelWorkersPerManager == null
                               ? undefined
-                              : Math.min(settings.maxParallelWorkersPerManager, value - 1),
+                              : Math.min(settings.maxParallelWorkersPerManager, value),
                         })
                       }
                     />
                     <p className="setting-hint">
-                      One child slot is reserved for the dedicated Tester; the remainder is the
-                      maximum selectable Coder count.
+                      The backend adds one dedicated Tester per Manager on top of this value.
                     </p>
                   </div>
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <header>
+                  <h3>Execution concurrency</h3>
+                  <p>
+                    Slots limit how many selected roles may run at the same time. They never change
+                    how much work is planned.
+                  </p>
+                </header>
+                <div className="limit-groups">
                   <div className="limit-group">
                     <div className="limit-group-heading">
-                      <strong>Execution concurrency</strong>
-                      <span>How many selected roles may run at once</span>
+                      <strong>Manager slots</strong>
+                      <span>Workstreams executing in parallel</span>
                     </div>
                     <RangeSetting
                       label="Parallel Manager slots"
@@ -1577,6 +1514,12 @@ export default function App() {
                       max={settings.maxManagers}
                       onChange={(value) => setSettings({ ...settings, maxParallelManagers: value })}
                     />
+                  </div>
+                  <div className="limit-group">
+                    <div className="limit-group-heading">
+                      <strong>Worker slots</strong>
+                      <span>Coders executing in parallel</span>
+                    </div>
                     <label className="toggle-setting compact-toggle">
                       <span>
                         <strong>Per-manager worker slots</strong>
@@ -1622,8 +1565,50 @@ export default function App() {
 
               <section className="settings-section">
                 <header>
+                  <h3>Role profiles</h3>
+                  <p>Applied to new hierarchy runs. Live agents can still override per window.</p>
+                </header>
+                <div className="role-matrix">
+                  {(['director', 'manager', 'worker', 'tester'] as ConfigurableRole[]).map(
+                    (role) => (
+                      <RoleProfileEditor
+                        key={role}
+                        role={role}
+                        profile={settings.roleProfiles[role]}
+                        onChange={(profile) =>
+                          setSettings({
+                            ...settings,
+                            roleProfiles: { ...settings.roleProfiles, [role]: profile },
+                          })
+                        }
+                      />
+                    ),
+                  )}
+                </div>
+                <div className="preset-segment" role="group" aria-label="Quality presets">
+                  {QUALITY_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      className={selectedQualityPreset === preset.id ? 'active' : ''}
+                      aria-pressed={selectedQualityPreset === preset.id}
+                      onClick={() =>
+                        setSettings({
+                          ...settings,
+                          roleProfiles: preset.profiles,
+                        })
+                      }
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <header>
                   <h3>Workspace</h3>
-                  <p>Local UI density and offline behavior.</p>
+                  <p>Local UI density, offline behaviour and provider account health.</p>
                 </header>
                 <label className="toggle-setting">
                   <span>
@@ -1651,6 +1636,31 @@ export default function App() {
                     }
                   />
                 </label>
+                <div className="limit-group">
+                  <div className="limit-group-heading">
+                    <strong>Cookie account health</strong>
+                    <span>Durable cooldown and lease state. Cookie values are never exposed.</span>
+                  </div>
+                  <div className="account-health-list">
+                    {accountHealth.length ? (
+                      accountHealth.map((account) => (
+                        <div key={`${account.provider}:${account.accountId}`}>
+                          <span className={`account-health-dot state-${account.state}`} />
+                          <strong>{account.accountId}</strong>
+                          <span>{account.state.replaceAll('_', ' ')}</span>
+                          <span>{account.activeLeases} active</span>
+                          <span>
+                            {account.cooldownActive && account.cooldownUntil
+                              ? `Cooldown until ${new Date(account.cooldownUntil * 1000).toLocaleTimeString()}`
+                              : (account.reason ?? 'Available')}
+                          </span>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="setting-hint">No durable account health events yet.</p>
+                    )}
+                  </div>
+                </div>
               </section>
             </div>
           </aside>
@@ -1703,6 +1713,7 @@ function RangeSetting({
       </span>
       <input
         type="range"
+        aria-label={label}
         min={min}
         max={max}
         value={value}
@@ -1788,6 +1799,10 @@ function CreateTaskWizard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
+  const plannedCoders = managers * Math.max(1, workersPerManager - 1);
+  const workerSlots = launchWorkerSlots(managers, workersPerManager, settings.maxParallelWorkers);
+  const managerSlots = launchManagerSlots(managers, settings.maxParallelManagers);
+
   const chooseFolder = async () => {
     setError('');
     try {
@@ -1822,15 +1837,19 @@ function CreateTaskWizard({
       const launchSettings: WorkspaceSettings = {
         ...settings,
         maxManagers: managers,
-        maxParallelManagers: Math.min(settings.maxParallelManagers, managers),
+        maxParallelManagers: managerSlots,
         maxWorkersPerManager: Math.max(2, workersPerManager),
         maxParallelWorkersPerManager:
           settings.maxParallelWorkersPerManager == null
             ? undefined
             : Math.min(settings.maxParallelWorkersPerManager, Math.max(1, workersPerManager - 1)),
+        // The wizard configures how wide the plan is; the global slot count has
+        // to be at least that wide or the run silently executes a fraction of
+        // the coders it just promised.
+        maxParallelWorkers: workerSlots,
       };
       const created = await api.createHierarchyTask({
-        name: name.trim() || shortTaskTitle({ id: 'new', name, prompt: task, root }),
+        name: name.trim() || taskProjectKey(root) || 'Untitled task',
         root,
         task,
         projectMode,
@@ -1872,6 +1891,7 @@ function CreateTaskWizard({
               role="tab"
               className={index === step ? 'active' : index < step ? 'done' : ''}
               aria-selected={index === step}
+              aria-label={label}
               aria-controls={`create-step-${index}`}
               tabIndex={index === step ? 0 : -1}
               onClick={() => setStep(index)}
@@ -1979,31 +1999,48 @@ function CreateTaskWizard({
             role="tabpanel"
             aria-label="Shape"
           >
-            <RangeSetting
-              label="Maximum managers"
-              value={managers}
-              min={1}
-              max={12}
-              onChange={setManagers}
-            />
-            <RangeSetting
-              label="Maximum child agents per manager"
-              value={workersPerManager}
-              min={2}
-              max={12}
-              onChange={setWorkersPerManager}
-            />
+            <div className="limit-group">
+              <div className="limit-group-heading">
+                <strong>Planning capacity</strong>
+                <span>Maxima the planners may select, not required counts</span>
+              </div>
+              <RangeSetting
+                label="Maximum managers"
+                value={managers}
+                min={1}
+                max={32}
+                onChange={setManagers}
+              />
+              <RangeSetting
+                label="Maximum coder tasks per manager"
+                value={Math.max(1, workersPerManager - 1)}
+                min={1}
+                max={31}
+                onChange={(value) => setWorkersPerManager(value + 1)}
+              />
+              <p className="setting-hint">
+                One dedicated Tester per Manager is added by the backend on top of the coder tasks.
+              </p>
+            </div>
+            <div className="limit-group">
+              <div className="limit-group-heading">
+                <strong>Execution concurrency</strong>
+                <span>Worker slots follow this fan-out</span>
+              </div>
+              <div className="estimate-panel">
+                <strong>Estimate</strong>
+                <span>
+                  Up to {managers} managers · up to {plannedCoders} coders · up to {managers}{' '}
+                  testers. This launch runs {managerSlots} managers and {workerSlots} coders at a
+                  time
+                  {workerSlots < plannedCoders
+                    ? `, so the remaining ${plannedCoders - workerSlots} queue for a slot.`
+                    : ', which covers every coder in the plan.'}
+                </span>
+              </div>
+            </div>
             <div className="create-wide">
               <HierarchyPreview managers={managers} workersPerManager={workersPerManager} />
-            </div>
-            <div className="estimate-panel create-wide">
-              <strong>Estimate</strong>
-              <span>
-                Up to {managers} managers · up to {managers * Math.max(1, workersPerManager - 1)}{' '}
-                coders · up to {managers} testers. Execution is limited to{' '}
-                {Math.min(settings.maxParallelManagers, managers)} manager and{' '}
-                {settings.maxParallelWorkers} global worker slots.
-              </span>
             </div>
             <div className="launch-contract-preview create-wide">
               <strong>Plan contract preview</strong>
@@ -2022,13 +2059,6 @@ function CreateTaskWizard({
               <div>
                 <span>Completion gate</span>
                 <b>All work and model calls reconciled</b>
-              </div>
-              <div>
-                <span>Budget</span>
-                <b>
-                  {settings.maxModelCalls} calls · {Math.round(settings.maxWallClockSeconds / 60)}{' '}
-                  minutes
-                </b>
               </div>
             </div>
           </div>

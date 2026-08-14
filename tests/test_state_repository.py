@@ -16,7 +16,7 @@ from orchestrator.models import (
     Workstream,
 )
 from orchestrator.project_workspace import ProjectLeaseLostError
-from orchestrator.state_repository import StateRepository
+from orchestrator.state_repository import CURRENT_SCHEMA_VERSION, StateRepository
 
 
 def make_plan() -> TaskPlan:
@@ -543,7 +543,7 @@ def test_v12_coordination_and_retention_migration_is_additive_and_restartable(
     connection.close()
 
     with StateRepository(database) as migrated:
-        assert migrated.current_schema_version == 14
+        assert migrated.current_schema_version == CURRENT_SCHEMA_VERSION
         assert migrated.list_log_records("legacy-task")[0]["retention_state"] == (
             "active"
         )
@@ -564,6 +564,7 @@ def test_v12_coordination_and_retention_migration_is_additive_and_restartable(
             "contract_versions",
             "agent_identities",
             "handoffs",
+            "llm_request_attempts",
         } <= tables
         assert {
             "retention_state",
@@ -574,10 +575,303 @@ def test_v12_coordination_and_retention_migration_is_additive_and_restartable(
         } <= log_columns
 
     with StateRepository(database) as restarted:
-        assert restarted.current_schema_version == 14
+        assert restarted.current_schema_version == CURRENT_SCHEMA_VERSION
         assert restarted.list_log_records("legacy-task")[0]["log_id"] == (
             "legacy-log"
         )
+
+
+def test_v16_repairs_early_request_ledger_without_agent_role(tmp_path):
+    database = tmp_path / "early-v15.sqlite3"
+    with StateRepository(database):
+        pass
+
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        ALTER TABLE llm_request_attempts DROP COLUMN agent_role;
+        DELETE FROM schema_migrations WHERE version = 16;
+        PRAGMA user_version = 15;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with StateRepository(database) as migrated:
+        assert migrated.current_schema_version == CURRENT_SCHEMA_VERSION
+        with migrated._lock:
+            columns = {
+                row["name"]
+                for row in migrated._connection.execute(
+                    "PRAGMA table_info(llm_request_attempts)"
+                ).fetchall()
+            }
+        assert "agent_role" in columns
+
+
+def test_v17_execution_recovery_migration_is_restartable(tmp_path):
+    database = tmp_path / "v16-execution-recovery.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA user_version = 16")
+    connection.commit()
+    connection.close()
+
+    with StateRepository(database) as migrated:
+        assert migrated.current_schema_version == 17
+        with migrated._lock:
+            tables = {
+                row["name"]
+                for row in migrated._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        assert {
+            "execution_epochs",
+            "execution_roster",
+            "remediation_attempts",
+            "manager_terminal_reports",
+            "director_final_reviews",
+            "terminal_dispositions",
+        } <= tables
+        assert migrated.migration_history()[-1]["name"] == (
+            "execution_recovery_records"
+        )
+
+    with StateRepository(database) as restarted:
+        assert restarted.current_schema_version == 17
+        assert [
+            row["version"]
+            for row in restarted.migration_history()
+            if row["version"] == 17
+        ] == [17]
+
+
+def test_manager_reports_and_director_review_are_exactly_once(repository):
+    epoch = repository.create_execution_epoch(
+        "task-reports",
+        "epoch-reports",
+        plan_revision=2,
+    )
+    repository.freeze_execution_roster(
+        "task-reports",
+        epoch["execution_epoch_id"],
+        (
+            {
+                "manager_agent_id": "manager-a",
+                "workstream_id": "stream-a",
+                "contract_id": "contract-a",
+                "contract_version": 2,
+            },
+            {
+                "manager_agent_id": "manager-b",
+                "workstream_id": "stream-b",
+                "contract_id": "contract-b",
+                "contract_version": 2,
+            },
+        ),
+    )
+    first_payload = {
+        "completed_items": ["item-a"],
+        "failed_items": [],
+        "reason_code": "completed",
+    }
+    first = repository.record_manager_terminal_report(
+        "task-reports",
+        "epoch-reports",
+        "manager-a",
+        "stream-a",
+        "completed",
+        report=first_payload,
+        terminal_log_refs=("logs/manager-a.jsonl",),
+    )
+    assert repository.record_manager_terminal_report(
+        "task-reports",
+        "epoch-reports",
+        "manager-a",
+        "stream-a",
+        "completed",
+        report=first_payload,
+        terminal_log_refs=("logs/manager-a.jsonl",),
+    ) == first
+    with pytest.raises(RuntimeError, match="exactly-once"):
+        repository.record_manager_terminal_report(
+            "task-reports",
+            "epoch-reports",
+            "manager-a",
+            "stream-a",
+            "partial",
+            report={"failed_items": ["item-a"]},
+        )
+    assert repository.manager_report_barrier(
+        "task-reports",
+        "epoch-reports",
+    ) == {
+        "task_id": "task-reports",
+        "execution_epoch_id": "epoch-reports",
+        "expected": 2,
+        "received": 1,
+        "missing_manager_ids": ["manager-b"],
+        "disposition_counts": {
+            "completed": 1,
+            "partial": 0,
+            "abandoned": 0,
+        },
+        "satisfied": False,
+        "all_completed": False,
+    }
+    with pytest.raises(RuntimeError, match="N/N"):
+        repository.reserve_director_final_review(
+            "task-reports",
+            "epoch-reports",
+        )
+
+    repository.record_manager_terminal_report(
+        {
+            "task_id": "task-reports",
+            "execution_epoch_id": "epoch-reports",
+            "manager_agent_id": "manager-b",
+            "workstream_id": "stream-b",
+            "disposition": "abandoned",
+            "synthesized": True,
+            "failed_items": ["item-b"],
+            "terminal_log_refs": ["logs/manager-b.jsonl"],
+        }
+    )
+    barrier = repository.manager_report_barrier(
+        "task-reports",
+        "epoch-reports",
+    )
+    assert barrier["satisfied"] is True
+    assert barrier["all_completed"] is False
+    assert barrier["disposition_counts"] == {
+        "completed": 1,
+        "partial": 0,
+        "abandoned": 1,
+    }
+
+    review = repository.reserve_director_final_review(
+        "task-reports",
+        "epoch-reports",
+        logical_request_id="director-call",
+    )
+    assert review is not None
+    assert (
+        repository.reserve_director_final_review(
+            "task-reports",
+            "epoch-reports",
+        )
+        is None
+    )
+    completed = repository.complete_director_final_review(
+        review["review_id"],
+        verdict="partial",
+        review={"summary": "one stream abandoned"},
+        terminal_disposition="partial",
+        terminal_log_refs=("logs/director.jsonl",),
+    )
+    assert repository.complete_director_final_review(
+        review["review_id"],
+        verdict="partial",
+        review={"summary": "one stream abandoned"},
+        terminal_disposition="partial",
+        terminal_log_refs=("logs/director.jsonl",),
+    ) == completed
+    with pytest.raises(RuntimeError, match="terminal record differs"):
+        repository.complete_director_final_review(
+            review["review_id"],
+            verdict="completed",
+        )
+
+
+def test_remediation_strategy_uniqueness_and_terminal_log_refs(
+    tmp_path,
+):
+    database = tmp_path / "remediation.sqlite3"
+    with StateRepository(database) as repository:
+        repository.create_execution_epoch(
+            "task-remediation",
+            "epoch-remediation",
+        )
+        first = repository.reserve_remediation_attempt(
+            "task-remediation",
+            "worker-a",
+            "signature-a",
+            "switch_account",
+            execution_epoch_id="epoch-remediation",
+            category="auth_account",
+        )
+        assert first is not None
+        assert (
+            repository.reserve_remediation_attempt(
+                "task-remediation",
+                "worker-a",
+                "signature-a",
+                "switch_account",
+                execution_epoch_id="epoch-remediation",
+            )
+            is None
+        )
+        second = repository.reserve_remediation_attempt(
+            "task-remediation",
+            "worker-a",
+            "signature-a",
+            "refresh_prompt",
+            execution_epoch_id="epoch-remediation",
+        )
+        reset = repository.reserve_remediation_attempt(
+            "task-remediation",
+            "worker-a",
+            "signature-b",
+            "switch_account",
+            execution_epoch_id="epoch-remediation",
+        )
+        assert second is not None
+        assert reset is not None
+        completed = repository.complete_remediation_attempt(
+            first["remediation_attempt_id"],
+            status="failed",
+            details={"reason": "replacement exhausted"},
+            terminal_disposition="abandoned",
+            terminal_log_refs=("logs/worker-a.jsonl",),
+        )
+        assert completed["terminal_log_refs"] == [
+            "logs/worker-a.jsonl"
+        ]
+        disposition = repository.record_terminal_disposition(
+            "task-remediation",
+            "epoch-remediation",
+            "agent",
+            "worker-a",
+            "abandoned",
+            logical_agent_id="worker-a",
+            reason_code="remediation_exhausted",
+            terminal_log_refs=("logs/worker-a.jsonl",),
+        )
+        assert disposition["terminal_log_refs"] == [
+            "logs/worker-a.jsonl"
+        ]
+
+    with StateRepository(database) as restarted:
+        assert (
+            restarted.reserve_remediation_attempt(
+                "task-remediation",
+                "worker-a",
+                "signature-a",
+                "switch_account",
+                execution_epoch_id="epoch-remediation",
+            )
+            is None
+        )
+        assert len(
+            restarted.list_remediation_attempts(
+                "task-remediation",
+                logical_agent_id="worker-a",
+            )
+        ) == 3
+        assert restarted.list_terminal_dispositions(
+            "task-remediation",
+            "epoch-remediation",
+        )[0]["reason_code"] == "remediation_exhausted"
 
 
 def test_managed_retention_claim_is_recovered_after_restart(
