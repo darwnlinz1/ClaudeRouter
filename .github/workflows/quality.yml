@@ -60,7 +60,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-traces
@@ -85,7 +85,7 @@ jobs:
       - run: npx playwright install chromium
         working-directory: frontend
       - run: python scripts/run_acceptance.py --profile full --label ci-windows --results-dir acceptance-results
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: acceptance-windows
@@ -125,7 +125,7 @@ jobs:
         working-directory: frontend
       - run: npx --yes @cyclonedx/cyclonedx-npm --output-file ../bom-frontend.json
         working-directory: frontend
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: software-bill-of-materials
           path: bom-*.json
