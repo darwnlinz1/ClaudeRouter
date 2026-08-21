@@ -13,7 +13,7 @@
     "format:check": "prettier --check ."
   },
   "dependencies": {
-    "@xyflow/react": "^12.11.2",
+    "@xyflow/react": "^12.11.3",
     "dockview-react": "latest",
     "lucide-react": "latest",
     "react": "latest",
