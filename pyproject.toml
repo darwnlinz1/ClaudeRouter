@@ -15,7 +15,7 @@ dependencies = [
   "pydantic==2.13.4",
   "requests==2.34.2",
   "starlette==1.6.0",
-  "uvicorn[standard]==0.52.1",
+  "uvicorn[standard]==0.52.3",
 ]
 
 [project.optional-dependencies]
